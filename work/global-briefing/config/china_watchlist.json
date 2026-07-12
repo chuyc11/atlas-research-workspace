@@ -1,9 +1,11 @@
 {
   "version": 1,
-  "updated": "2026-06-13",
+  "updated": "2026-07-12",
   "notes": "China market watchlist for daily briefing, market mapping, and paper trading. Codes use suffixes where possible: .SH/.SZ/.BJ for A-shares and mainland ETFs, .HK for Hong Kong.",
   "data_sources": {
-    "primary": "AKShare",
+    "primary": "Tencent quote",
+    "secondary": "Eastmoney point quote and Yahoo Finance-compatible tickers",
+    "bulk_research": "AKShare (manual full-market enrichment; not used for the latency-sensitive daily watchlist)",
     "optional_enhanced": "Tushare Pro with user token",
     "historical_fallback": "BaoStock",
     "hk_us_fallback": "Yahoo Finance-compatible tickers"
@@ -240,4 +242,3 @@
     "1211.HK"
   ]
 }
-

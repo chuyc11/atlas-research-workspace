@@ -4,12 +4,24 @@
   "blocking_severities": ["critical"],
   "auto_fix_risks": ["low"],
   "external_alerting": {
-    "enabled": false,
-    "destinations": []
+    "enabled": true,
+    "destinations": ["codex_task_inbox"],
+    "delivery_command": "python atlas.py alerts --date RUN_DATE"
   },
   "disaster_recovery": {
-    "enabled": false,
-    "maximum_backup_age_hours": 24
+    "enabled": true,
+    "maximum_backup_age_hours": 24,
+    "retention_days": 14,
+    "target_directory": "%USERPROFILE%/Documents/ATLAS-Backups",
+    "include_paths": [
+      "atlas.py",
+      "REPOSITORY_GOVERNANCE.md",
+      "work/global-briefing/config",
+      "work/global-briefing/data",
+      "work/shared/atlas",
+      "outputs",
+      "src/app/briefing.generated.json"
+    ]
   },
   "acceptance_rules": {
     "failure-asset_mapping_error": "v2_contract",

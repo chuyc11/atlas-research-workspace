@@ -294,30 +294,75 @@ class ImprovementTracker:
             passed = path.is_file() and isinstance(payload, dict) and payload.get("end") == date
             return Evaluation("pass" if passed else "fail", "每日纸面归因存在" if passed else "每日纸面归因缺失", {"path": str(path), "exists": path.exists()})
         if spec.acceptance_key == "core_version_control":
-            completed = subprocess.run(
-                ["git", "-C", str(self.root), "rev-parse", "--show-toplevel"],
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                capture_output=True,
-            )
-            top_level = Path(completed.stdout.strip()).resolve() if completed.returncode == 0 and completed.stdout.strip() else None
-            passed = top_level == self.root.resolve()
+            repositories = {
+                "control_plane": self.root,
+                "site": self.root / "src",
+                "trading_core": self.root / "work" / "trading-core",
+            }
+            evidence: dict[str, Any] = {}
+            passed = True
+            for name, repository in repositories.items():
+                completed = subprocess.run(
+                    ["git", "-C", str(repository), "rev-parse", "--show-toplevel"],
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                )
+                top_level = Path(completed.stdout.strip()).resolve() if completed.returncode == 0 and completed.stdout.strip() else None
+                workflow = repository / ".github" / "workflows" / "quality.yml"
+                valid = top_level == repository.resolve() and workflow.is_file()
+                evidence[name] = {"top_level": str(top_level) if top_level else None, "quality_workflow": str(workflow), "valid": valid}
+                passed = passed and valid
             return Evaluation(
                 "pass" if passed else "fail",
-                "核心工作区已纳入版本控制" if passed else "核心工作区缺少有效的根版本库",
-                {"returncode": completed.returncode, "top_level": str(top_level) if top_level else None},
+                "三个核心仓库均有有效版本控制与质量门禁" if passed else "核心仓库或质量门禁仍不完整",
+                evidence,
             )
         if spec.acceptance_key == "external_alerting":
             config = self.config.get("external_alerting", {})
             destinations = config.get("destinations", []) if isinstance(config, dict) else []
-            passed = config.get("enabled") is True and bool(destinations) if isinstance(config, dict) else False
-            return Evaluation("pass" if passed else "fail", "外部告警已配置" if passed else "外部告警未配置", {"destinations": destinations})
+            dispatch = read_json(self.root / "work" / "shared" / "atlas" / "alerts" / "latest.json", {})
+            routed = bool(set(destinations) & set(dispatch.get("destinations", []))) if isinstance(dispatch, dict) else False
+            passed = config.get("enabled") is True and bool(destinations) and dispatch.get("date") == date and routed if isinstance(config, dict) else False
+            return Evaluation(
+                "pass" if passed else "fail",
+                "外部告警路由已验证" if passed else "外部告警未配置或当日路由未验证",
+                {"destinations": destinations, "dispatch_date": dispatch.get("date"), "dispatch_status": dispatch.get("status"), "routed": routed},
+            )
         if spec.acceptance_key == "disaster_recovery":
             config = self.config.get("disaster_recovery", {})
             manifest = read_json(self.root / "work" / "shared" / "atlas" / "backups" / "latest.json", {})
-            passed = config.get("enabled") is True and manifest.get("verified") is True if isinstance(config, dict) and isinstance(manifest, dict) else False
-            return Evaluation("pass" if passed else "fail", "灾备快照已验证" if passed else "灾备与恢复验证未启用")
+            archive = Path(str(manifest.get("archive") or "")) if isinstance(manifest, dict) else Path()
+            outside_workspace = False
+            if archive.is_absolute():
+                try:
+                    archive.resolve().relative_to(self.root.resolve())
+                except ValueError:
+                    outside_workspace = True
+            age_hours: float | None = None
+            try:
+                created = datetime.fromisoformat(str(manifest.get("created_at")).replace("Z", "+00:00"))
+                age_hours = max(0.0, (datetime.now(UTC) - created.astimezone(UTC)).total_seconds() / 3600)
+            except (TypeError, ValueError):
+                pass
+            maximum_age = float(config.get("maximum_backup_age_hours") or 24) if isinstance(config, dict) else 24
+            passed = bool(
+                isinstance(config, dict)
+                and isinstance(manifest, dict)
+                and config.get("enabled") is True
+                and manifest.get("verified") is True
+                and manifest.get("restore_verified") is True
+                and archive.is_file()
+                and outside_workspace
+                and age_hours is not None
+                and age_hours <= maximum_age
+            )
+            return Evaluation(
+                "pass" if passed else "fail",
+                "外部灾备快照与恢复演练已验证" if passed else "灾备快照、时效或恢复演练未达标",
+                {"archive": str(archive), "outside_workspace": outside_workspace, "age_hours": age_hours, "maximum_age_hours": maximum_age, "restore_verified": manifest.get("restore_verified")},
+            )
         return Evaluation("manual", "需要人工提供执行证据")
 
     def apply_fixer(self, spec: ActionSpec, date: str) -> tuple[bool, str]:

@@ -23,6 +23,10 @@ jobs:
           atlas.py
           work/global-briefing/scripts/self_healing.py
           work/global-briefing/scripts/improvement_tracker.py
+          work/global-briefing/scripts/disaster_recovery.py
+          work/global-briefing/scripts/alert_dispatch.py
+          work/global-briefing/scripts/rss_collect.py
+          work/global-briefing/scripts/china_market.py
           work/global-briefing/scripts/research_quality.py
           work/global-briefing/scripts/sync_briefing_site.py
       - name: Run file-isolated control-plane tests
@@ -36,4 +40,5 @@ jobs:
           work.global-briefing.tests.test_paper_trading_fees
           work.global-briefing.tests.test_paper_trading_transactions
           work.global-briefing.tests.test_rss_collect_security
-
+          work.global-briefing.tests.test_source_routing
+          work.global-briefing.tests.test_resilience_controls

@@ -123,9 +123,10 @@
       "categories": ["india", "south_asia", "politics", "economy"],
       "homepage": "https://www.thehindu.com/",
       "rss": [
-        "https://www.thehindu.com/news/international/feeder/default.rss",
-        "https://www.thehindu.com/business/feeder/default.rss"
+        "https://news.google.com/rss/search?q=site%3Athehindu.com&hl=en-IN&gl=IN&ceid=IN%3Aen"
       ],
+      "discovery_provider": "Google News RSS",
+      "evidence_policy": "Discovery only; open and cite the original The Hindu article before using it as evidence.",
       "search_hint": "site:thehindu.com latest India international economy"
     },
     {
@@ -147,9 +148,9 @@
       "tier": 2,
       "categories": ["china", "economy", "markets", "technology"],
       "homepage": "https://www.caixinglobal.com/",
-      "rss": [
-        "https://www.caixinglobal.com/rss/"
-      ],
+      "rss": [],
+      "discovery_mode": "homepage",
+      "evidence_policy": "First-party homepage discovery; cite the original Caixin Global article.",
       "search_hint": "site:caixinglobal.com latest China economy markets technology"
     },
     {
@@ -234,7 +235,7 @@
       "categories": ["nuclear", "energy", "security"],
       "homepage": "https://www.iaea.org/newscenter",
       "rss": [
-        "https://www.iaea.org/newscenter/rss/news"
+        "https://www.iaea.org/feeds/news"
       ],
       "search_hint": "site:iaea.org/newscenter latest nuclear Iran Ukraine"
     }

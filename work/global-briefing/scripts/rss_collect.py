@@ -78,6 +78,9 @@ def parse_feed(xml_bytes: bytes, source: dict[str, Any], feed_url: str) -> list[
                     "published": text_of(item.find("pubDate")) or text_of(item.find("date")),
                     "summary": text_of(item.find("description")),
                     "feed_url": feed_url,
+                    "source_method": "syndicated_rss" if source.get("discovery_provider") else "rss",
+                    "discovery_provider": source.get("discovery_provider"),
+                    "evidence_policy": source.get("evidence_policy"),
                 }
             )
         return items
@@ -100,6 +103,9 @@ def parse_feed(xml_bytes: bytes, source: dict[str, Any], feed_url: str) -> list[
                 "published": text_of(entry.find("atom:updated", ns)) or text_of(entry.find("atom:published", ns)),
                 "summary": text_of(entry.find("atom:summary", ns)),
                 "feed_url": feed_url,
+                "source_method": "syndicated_rss" if source.get("discovery_provider") else "rss",
+                "discovery_provider": source.get("discovery_provider"),
+                "evidence_policy": source.get("evidence_policy"),
             }
         )
     return items
@@ -152,7 +158,13 @@ def looks_like_story(title: str, url: str) -> bool:
     return True
 
 
-def scrape_homepage(source: dict[str, Any], timeout: int, max_items: int = 30) -> list[dict[str, Any]]:
+def scrape_homepage(
+    source: dict[str, Any],
+    timeout: int,
+    max_items: int = 30,
+    *,
+    source_method: str = "homepage_fallback",
+) -> list[dict[str, Any]]:
     homepage = source.get("homepage")
     if not homepage:
         return []
@@ -184,7 +196,8 @@ def scrape_homepage(source: dict[str, Any], timeout: int, max_items: int = 30) -
                 "published": url_date,
                 "summary": "",
                 "feed_url": homepage,
-                "source_method": "homepage_fallback",
+                "source_method": source_method,
+                "evidence_policy": source.get("evidence_policy"),
             }
         )
         if len(items) >= max_items:
@@ -290,6 +303,21 @@ def collect(
     for source in sources:
         source_item_count = 0
         source_feed_errors = 0
+        if source.get("discovery_mode") == "homepage":
+            try:
+                discovery_items = scrape_homepage(source, timeout, source_method="homepage_discovery")
+            except (urllib.error.URLError, TimeoutError, OSError, UnicodeError) as exc:
+                output["errors"].append(
+                    {"source": source.get("name"), "feed_url": source.get("homepage"), "error": f"homepage discovery failed: {exc}"}
+                )
+                discovery_items = []
+            for item in discovery_items:
+                key = item.get("link") or f"{item.get('source')}|{item.get('title')}"
+                if key in seen:
+                    continue
+                seen.add(key)
+                output["items"].append(item)
+                source_item_count += 1
         for feed_url in source.get("rss", []):
             try:
                 items = parse_feed(fetch(feed_url, timeout), source, feed_url)

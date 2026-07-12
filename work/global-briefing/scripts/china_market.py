@@ -641,6 +641,27 @@ def fetch_with_akshare(config: dict[str, Any], dataset_timeout: int) -> dict[str
     return output
 
 
+def fetch_with_tencent(config: dict[str, Any], timeout: int) -> dict[str, Any]:
+    """Fetch the bounded watchlist directly instead of timing out on full-market tables."""
+    watchlist = all_watchlist_items(config)
+    quotes, errors = fetch_tencent_batch(watchlist, timeout)
+    return {
+        "provider": "Tencent quote",
+        "primary_provider": "Tencent quote",
+        "items": quotes,
+        "errors": errors,
+        "provider_attempts": [
+            {
+                "provider": "Tencent quote",
+                "role": "primary",
+                "attempted": len(watchlist),
+                "items": sum(1 for quote in quotes if quote.get("price") is not None),
+                "errors": len(errors),
+            }
+        ],
+    }
+
+
 def snapshot(
     timeout: int,
     dry_run: bool,
@@ -674,15 +695,20 @@ def snapshot(
         }
 
     bounded_dataset_timeout = max(3, min(dataset_timeout, timeout))
-    result = fetch_with_akshare(config, bounded_dataset_timeout)
-    if use_tencent:
-        result = apply_tencent_fallback(result, config, timeout=tencent_timeout)
+    configured_primary = str(config.get("data_sources", {}).get("primary") or "AKShare").lower()
+    if use_tencent and configured_primary.startswith("tencent"):
+        result = fetch_with_tencent(config, timeout=tencent_timeout)
+    else:
+        result = fetch_with_akshare(config, bounded_dataset_timeout)
+        if use_tencent:
+            result = apply_tencent_fallback(result, config, timeout=tencent_timeout)
     if use_eastmoney:
         result = apply_eastmoney_fallback(result, config, timeout=eastmoney_timeout, max_workers=eastmoney_workers)
     result = apply_yahoo_fallback(result, config, timeout=yahoo_timeout, max_workers=yahoo_workers)
     result["generated_at"] = now_utc()
     result["watchlist_path"] = str(watchlist_path)
     result["dataset_timeout_seconds"] = bounded_dataset_timeout
+    result["configured_primary_provider"] = config.get("data_sources", {}).get("primary")
     result["tencent_enabled"] = use_tencent
     result["eastmoney_enabled"] = use_eastmoney
     return result

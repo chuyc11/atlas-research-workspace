@@ -1107,6 +1107,20 @@ def command_improvements(args: argparse.Namespace) -> int:
     return run_command(command)
 
 
+def command_backup(args: argparse.Namespace) -> int:
+    command = [sys.executable, str(BRIEFING_ROOT / "scripts" / "disaster_recovery.py"), "--date", args.date]
+    if args.json:
+        command.append("--json")
+    return run_command(command)
+
+
+def command_alerts(args: argparse.Namespace) -> int:
+    command = [sys.executable, str(BRIEFING_ROOT / "scripts" / "alert_dispatch.py"), "--date", args.date]
+    if args.json:
+        command.append("--json")
+    return run_command(command)
+
+
 def process_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -1557,6 +1571,16 @@ def build_parser() -> argparse.ArgumentParser:
     improvements.add_argument("--status", action="store_true", help="Show the latest improvement report.")
     improvements.add_argument("--json", action="store_true", help="Print full machine-readable output.")
     improvements.set_defaults(handler=command_improvements)
+
+    backup = subparsers.add_parser("backup", help="Create and restore-verify an external disaster-recovery snapshot.")
+    backup.add_argument("--date", type=valid_iso_date, required=True)
+    backup.add_argument("--json", action="store_true")
+    backup.set_defaults(handler=command_backup)
+
+    alerts = subparsers.add_parser("alerts", help="Prepare the audited Codex task-inbox alert payload.")
+    alerts.add_argument("--date", type=valid_iso_date, required=True)
+    alerts.add_argument("--json", action="store_true")
+    alerts.set_defaults(handler=command_alerts)
 
     cycle = subparsers.add_parser("cycle", help="Run the gated ATLAS virtual trading/evolution cycle.")
     cycle.add_argument("--date", type=valid_iso_date, help="Cycle date; defaults to the newest dated report.")
