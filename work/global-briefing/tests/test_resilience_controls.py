@@ -75,6 +75,26 @@ class ResilienceControlTests(unittest.TestCase):
             self.assertEqual(payload["findings"][0]["id"], "A1")
             self.assertTrue((runtime / "alerts" / "latest.json").is_file())
 
+    def test_alert_payload_includes_current_self_healing_issue_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            config = root / "config.json"
+            runtime = root / "runtime"
+            write_json(config, {"external_alerting": {"enabled": True, "destinations": ["codex_task_inbox"]}})
+            write_json(runtime / "self_healing" / "latest.json", {"unresolved_issues": [{
+                "issue_id": "HEAL-1",
+                "status": "requires_approval",
+                "severity": "critical",
+                "title": "deployment integrity",
+                "summary": "payload mismatch",
+            }]})
+
+            payload = ALERTS.build_alert("2026-07-12", root=root, config_path=config, runtime_root=runtime)
+
+            self.assertEqual(payload["status"], "attention_required")
+            self.assertEqual(payload["findings"][0]["kind"], "self_healing")
+            self.assertEqual(payload["findings"][0]["id"], "HEAL-1")
+
 
 if __name__ == "__main__":
     unittest.main()

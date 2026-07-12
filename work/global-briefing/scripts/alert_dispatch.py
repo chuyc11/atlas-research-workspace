@@ -60,7 +60,8 @@ def build_alert(
             "title": spec.get("title"),
             "summary": action.get("last_evaluation", {}).get("summary"),
         })
-    for issue in healing.get("issues", []):
+    healing_issues = healing.get("unresolved_issues", healing.get("issues", []))
+    for issue in healing_issues if isinstance(healing_issues, list) else []:
         status = str(issue.get("status") or "")
         if status in {"resolved", "healthy"}:
             continue
