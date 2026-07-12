@@ -1,0 +1,243 @@
+{
+  "version": 1,
+  "updated": "2026-06-13",
+  "notes": "China market watchlist for daily briefing, market mapping, and paper trading. Codes use suffixes where possible: .SH/.SZ/.BJ for A-shares and mainland ETFs, .HK for Hong Kong.",
+  "data_sources": {
+    "primary": "AKShare",
+    "optional_enhanced": "Tushare Pro with user token",
+    "historical_fallback": "BaoStock",
+    "hk_us_fallback": "Yahoo Finance-compatible tickers"
+  },
+  "indices": [
+    {
+      "symbol": "000001.SH",
+      "name": "上证指数",
+      "market": "A_SHARE_INDEX",
+      "theme": "mainland broad market"
+    },
+    {
+      "symbol": "399001.SZ",
+      "name": "深证成指",
+      "market": "A_SHARE_INDEX",
+      "theme": "mainland broad market"
+    },
+    {
+      "symbol": "000300.SH",
+      "name": "沪深300",
+      "market": "A_SHARE_INDEX",
+      "theme": "large cap China"
+    },
+    {
+      "symbol": "399006.SZ",
+      "name": "创业板指",
+      "market": "A_SHARE_INDEX",
+      "theme": "China growth and healthcare"
+    },
+    {
+      "symbol": "000688.SH",
+      "name": "科创50",
+      "market": "A_SHARE_INDEX",
+      "theme": "China STAR technology"
+    },
+    {
+      "symbol": "HSI.HK",
+      "name": "恒生指数",
+      "market": "HK_INDEX",
+      "theme": "Hong Kong broad market"
+    },
+    {
+      "symbol": "HSTECH.HK",
+      "name": "恒生科技指数",
+      "market": "HK_INDEX",
+      "theme": "Hong Kong China technology"
+    }
+  ],
+  "etfs": [
+    {
+      "symbol": "510300.SH",
+      "name": "沪深300ETF",
+      "market": "A_SHARE_ETF",
+      "theme": "large cap China"
+    },
+    {
+      "symbol": "510050.SH",
+      "name": "上证50ETF",
+      "market": "A_SHARE_ETF",
+      "theme": "large cap China financials"
+    },
+    {
+      "symbol": "159915.SZ",
+      "name": "创业板ETF",
+      "market": "A_SHARE_ETF",
+      "theme": "China growth"
+    },
+    {
+      "symbol": "588000.SH",
+      "name": "科创50ETF",
+      "market": "A_SHARE_ETF",
+      "theme": "China hard technology"
+    },
+    {
+      "symbol": "512480.SH",
+      "name": "半导体ETF",
+      "market": "A_SHARE_ETF",
+      "theme": "China semiconductors"
+    },
+    {
+      "symbol": "512660.SH",
+      "name": "军工ETF",
+      "market": "A_SHARE_ETF",
+      "theme": "China defense"
+    },
+    {
+      "symbol": "516160.SH",
+      "name": "新能源ETF",
+      "market": "A_SHARE_ETF",
+      "theme": "China energy transition"
+    },
+    {
+      "symbol": "512880.SH",
+      "name": "证券ETF",
+      "market": "A_SHARE_ETF",
+      "theme": "China brokers and capital markets"
+    },
+    {
+      "symbol": "2800.HK",
+      "name": "盈富基金",
+      "market": "HK_ETF",
+      "theme": "Hong Kong broad market"
+    },
+    {
+      "symbol": "3033.HK",
+      "name": "南方恒生科技",
+      "market": "HK_ETF",
+      "theme": "Hong Kong China technology"
+    }
+  ],
+  "a_shares": [
+    {
+      "symbol": "600519.SH",
+      "name": "贵州茅台",
+      "market": "A_SHARE",
+      "theme": "premium consumption"
+    },
+    {
+      "symbol": "000858.SZ",
+      "name": "五粮液",
+      "market": "A_SHARE",
+      "theme": "premium consumption"
+    },
+    {
+      "symbol": "300750.SZ",
+      "name": "宁德时代",
+      "market": "A_SHARE",
+      "theme": "EV battery"
+    },
+    {
+      "symbol": "002594.SZ",
+      "name": "比亚迪",
+      "market": "A_SHARE",
+      "theme": "EV and battery"
+    },
+    {
+      "symbol": "688981.SH",
+      "name": "中芯国际",
+      "market": "A_SHARE",
+      "theme": "semiconductors"
+    },
+    {
+      "symbol": "600036.SH",
+      "name": "招商银行",
+      "market": "A_SHARE",
+      "theme": "banking"
+    },
+    {
+      "symbol": "601318.SH",
+      "name": "中国平安",
+      "market": "A_SHARE",
+      "theme": "insurance"
+    },
+    {
+      "symbol": "601899.SH",
+      "name": "紫金矿业",
+      "market": "A_SHARE",
+      "theme": "gold and copper"
+    },
+    {
+      "symbol": "600900.SH",
+      "name": "长江电力",
+      "market": "A_SHARE",
+      "theme": "defensive utility"
+    },
+    {
+      "symbol": "601088.SH",
+      "name": "中国神华",
+      "market": "A_SHARE",
+      "theme": "coal and dividend"
+    }
+  ],
+  "hong_kong": [
+    {
+      "symbol": "0700.HK",
+      "name": "腾讯控股",
+      "market": "HK",
+      "theme": "China internet and AI"
+    },
+    {
+      "symbol": "9988.HK",
+      "name": "阿里巴巴-W",
+      "market": "HK",
+      "theme": "China ecommerce and cloud"
+    },
+    {
+      "symbol": "3690.HK",
+      "name": "美团-W",
+      "market": "HK",
+      "theme": "China local services"
+    },
+    {
+      "symbol": "1810.HK",
+      "name": "小米集团-W",
+      "market": "HK",
+      "theme": "consumer electronics and EV"
+    },
+    {
+      "symbol": "1211.HK",
+      "name": "比亚迪股份",
+      "market": "HK",
+      "theme": "EV and battery"
+    },
+    {
+      "symbol": "0981.HK",
+      "name": "中芯国际",
+      "market": "HK",
+      "theme": "semiconductors"
+    },
+    {
+      "symbol": "2318.HK",
+      "name": "中国平安",
+      "market": "HK",
+      "theme": "insurance"
+    },
+    {
+      "symbol": "0883.HK",
+      "name": "中国海洋石油",
+      "market": "HK",
+      "theme": "energy"
+    }
+  ],
+  "preferred_paper_trading_instruments": [
+    "510300.SH",
+    "159915.SZ",
+    "588000.SH",
+    "512480.SH",
+    "512660.SH",
+    "516160.SH",
+    "2800.HK",
+    "3033.HK",
+    "0700.HK",
+    "9988.HK",
+    "1211.HK"
+  ]
+}
+

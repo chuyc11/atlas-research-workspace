@@ -1,0 +1,4 @@
+interface:
+  display_name: "Briefing Source Health"
+  short_description: "Evidence freshness and fallback checks"
+  default_prompt: "Use $briefing-source-health to check source freshness and evidence quality before saving the briefing."

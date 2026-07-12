@@ -1,0 +1,39 @@
+name: root-quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  briefing-control-plane:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Compile control plane
+        run: >-
+          python -m py_compile
+          atlas.py
+          work/global-briefing/scripts/self_healing.py
+          work/global-briefing/scripts/improvement_tracker.py
+          work/global-briefing/scripts/research_quality.py
+          work/global-briefing/scripts/sync_briefing_site.py
+      - name: Run file-isolated control-plane tests
+        run: >-
+          python -m unittest -v
+          tests.test_atlas_cycle
+          work.global-briefing.tests.test_self_healing
+          work.global-briefing.tests.test_improvement_tracker
+          work.global-briefing.tests.test_research_quality
+          work.global-briefing.tests.test_evolution_policy
+          work.global-briefing.tests.test_paper_trading_fees
+          work.global-briefing.tests.test_paper_trading_transactions
+          work.global-briefing.tests.test_rss_collect_security
+

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Paper Attribution Review"
+  short_description: "Virtual portfolio and P/L review"
+  default_prompt: "Use $paper-attribution-review to review virtual paper-trading accounts and attribution."

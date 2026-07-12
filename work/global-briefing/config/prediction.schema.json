@@ -1,0 +1,72 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://atlas.local/schemas/prediction-v2.json",
+  "title": "ATLAS pre-registered forecast",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "prediction_id",
+    "date",
+    "deadline",
+    "horizon",
+    "scenario",
+    "probability",
+    "status",
+    "trigger",
+    "verification_signals",
+    "falsification_signals",
+    "resolution",
+    "evidence"
+  ],
+  "properties": {
+    "schema_version": {"const": 2},
+    "prediction_id": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}-P\\d{2,}$"},
+    "date": {"type": "string", "format": "date"},
+    "deadline": {"type": "string", "format": "date"},
+    "horizon": {"enum": ["1d", "1w", "1m"]},
+    "scenario": {"type": "string", "minLength": 1},
+    "probability": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
+    "status": {"enum": ["open", "active"]},
+    "trigger": {"type": "string", "minLength": 1},
+    "verification_signals": {"type": "array", "minItems": 1},
+    "falsification_signals": {"type": "array", "minItems": 1},
+    "resolution": {
+      "type": "object",
+      "required": ["question", "success_criteria", "failure_criteria"],
+      "properties": {
+        "question": {"type": "string", "minLength": 1},
+        "success_criteria": {"type": "string", "minLength": 1},
+        "failure_criteria": {"type": "string", "minLength": 1}
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["source", "url"],
+        "properties": {
+          "source": {"type": "string", "minLength": 1},
+          "url": {"type": "string", "format": "uri"},
+          "published_at": {"type": "string"},
+          "accessed_at": {"type": "string"},
+          "tier": {"type": "integer", "minimum": 1, "maximum": 4}
+        }
+      }
+    },
+    "market_mapping": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["symbol", "direction", "benchmark", "verification_rule", "evaluation_deadline"],
+        "properties": {
+          "symbol": {"type": "string", "minLength": 1},
+          "direction": {"enum": ["up", "down", "outperform", "underperform", "neutral"]},
+          "benchmark": {"type": "string", "minLength": 1},
+          "verification_rule": {"type": "string", "minLength": 1},
+          "evaluation_deadline": {"type": "string", "format": "date"}
+        }
+      }
+    }
+  }
+}

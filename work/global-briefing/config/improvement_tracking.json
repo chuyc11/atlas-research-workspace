@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "default_due_days": 7,
+  "blocking_severities": ["critical"],
+  "auto_fix_risks": ["low"],
+  "external_alerting": {
+    "enabled": false,
+    "destinations": []
+  },
+  "disaster_recovery": {
+    "enabled": false,
+    "maximum_backup_age_hours": 24
+  },
+  "acceptance_rules": {
+    "failure-asset_mapping_error": "v2_contract",
+    "failure-insufficient_evidence": "v2_contract",
+    "failure-source_quality_issue": "source_health",
+    "failure-event_reversal": "manual_evidence",
+    "failure-time_window_too_short": "new_review_integrity",
+    "failure-data_stale": "no_stale_market_data",
+    "review-explicit-scoring": "new_review_integrity",
+    "report-decision-density": "report_quality"
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Trading Core Maintainer"
+  short_description: "Maintain trading-core release workflows"
+  default_prompt: "Use $trading-core-maintainer to continue the trading-core project to the next audited release."

@@ -1,0 +1,35 @@
+from __future__ import annotations
+
+import importlib.util
+import sys
+import unittest
+from pathlib import Path
+
+
+SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "paper_trading.py"
+SPEC = importlib.util.spec_from_file_location("paper_trading_fee_test_module", SCRIPT)
+assert SPEC and SPEC.loader
+MODULE = importlib.util.module_from_spec(SPEC)
+sys.modules[SPEC.name] = MODULE
+SPEC.loader.exec_module(MODULE)
+
+
+class PaperTradingFeeTests(unittest.TestCase):
+    def test_a_share_fee_matches_trading_core_broker_rules(self) -> None:
+        rules = {
+            "commission_rate": 0.0003,
+            "min_commission": 5.0,
+            "stamp_tax_sell_rate": 0.0005,
+        }
+        buy_fee, buy_breakdown = MODULE.calculate_fee("BUY", 10_000.0, rules)
+        sell_fee, sell_breakdown = MODULE.calculate_fee("SELL", 10_000.0, rules)
+
+        self.assertEqual(buy_fee, 5.0)
+        self.assertEqual(buy_breakdown, {"commission": 5.0, "stamp_tax": 0.0})
+        self.assertEqual(sell_fee, 10.0)
+        self.assertEqual(sell_breakdown, {"commission": 5.0, "stamp_tax": 5.0})
+
+    def test_us_fee_keeps_zero_cost_default(self) -> None:
+        fee, breakdown = MODULE.calculate_fee("BUY", 10_000.0, {}, 0.0)
+        self.assertEqual(fee, 0.0)
+        self.assertEqual(breakdown, {"commission": 0.0, "stamp_tax": 0.0})

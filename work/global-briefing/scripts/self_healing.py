@@ -1,0 +1,825 @@
+#!/usr/bin/env python3
+"""Fail-closed, file-backed self-healing control plane for ATLAS.
+
+The engine deliberately separates detection from mutation. Only allowlisted,
+low-risk derived artifacts may be repaired automatically. Source code,
+research conclusions, probabilities, virtual orders, and deployments are never
+changed by this process.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import shutil
+import subprocess
+import sys
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, date as Date, datetime, timedelta
+from pathlib import Path
+from typing import Any, Callable, Sequence
+
+
+SCRIPT_PATH = Path(__file__).resolve()
+ROOT = SCRIPT_PATH.parents[3]
+BRIEFING_ROOT = ROOT / "work" / "global-briefing"
+TRADING_ROOT = ROOT / "work" / "trading-core"
+SITE_ROOT = ROOT / "src"
+OUTPUTS_ROOT = ROOT / "outputs"
+RUNTIME_ROOT = ROOT / "work" / "shared" / "atlas" / "self_healing"
+POLICY_PATH = BRIEFING_ROOT / "config" / "self_healing.json"
+STATE_PATH = RUNTIME_ROOT / "issues.json"
+LATEST_PATH = RUNTIME_ROOT / "latest.json"
+LATEST_MARKDOWN_PATH = RUNTIME_ROOT / "LATEST_SELF_HEALING_REPORT.md"
+AUDIT_LOG_PATH = RUNTIME_ROOT / "audit.jsonl"
+LOCK_PATH = RUNTIME_ROOT / "self_healing.lock"
+
+SEVERITY_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
+
+
+def utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def stable_hash(value: Any) -> str:
+    return hashlib.sha256(stable_json(value).encode("utf-8")).hexdigest()
+
+
+def file_hash(path: Path) -> str | None:
+    if not path.is_file():
+        return None
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def read_json(path: Path, default: Any = None) -> Any:
+    try:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return default
+
+
+def atomic_write_text(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists() and path.read_text(encoding="utf-8") == text:
+        return
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(text, encoding="utf-8", newline="\n")
+    temporary.replace(path)
+
+
+def atomic_write_json(path: Path, value: Any) -> None:
+    atomic_write_text(path, json.dumps(value, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+
+
+def append_jsonl(path: Path, value: Any) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8", newline="\n") as handle:
+        handle.write(stable_json(value) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+
+
+def valid_date(value: str) -> str:
+    try:
+        canonical = Date.fromisoformat(value).isoformat()
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("date must be YYYY-MM-DD") from exc
+    if canonical != value:
+        raise argparse.ArgumentTypeError(f"date must be {canonical}")
+    return canonical
+
+
+def latest_report_date() -> str:
+    candidates: list[str] = []
+    for path in OUTPUTS_ROOT.glob("每日全球晨间简报-*.md"):
+        value = path.stem.rsplit("-", 3)[-3:]
+        candidate = "-".join(value)
+        try:
+            candidates.append(Date.fromisoformat(candidate).isoformat())
+        except ValueError:
+            continue
+    if not candidates:
+        raise FileNotFoundError("no dated global briefing report exists")
+    return max(candidates)
+
+
+@dataclass
+class ProbeResult:
+    check_id: str
+    passed: bool
+    severity: str
+    risk: str
+    resource: str
+    summary: str
+    evidence: dict[str, Any] = field(default_factory=dict)
+    fixer: str | None = None
+    executed: bool = True
+
+    @property
+    def fingerprint(self) -> str:
+        return stable_hash({"check_id": self.check_id, "resource": self.resource})[:24]
+
+
+@dataclass
+class RepairResult:
+    status: str
+    detail: str
+    changed_files: list[str] = field(default_factory=list)
+    rolled_back: bool = False
+
+
+class SelfHealingEngine:
+    def __init__(
+        self,
+        *,
+        root: Path = ROOT,
+        policy_path: Path = POLICY_PATH,
+        runtime_root: Path = RUNTIME_ROOT,
+        runner: Callable[..., subprocess.CompletedProcess[str]] | None = None,
+    ) -> None:
+        self.root = root
+        self.briefing_root = root / "work" / "global-briefing"
+        self.trading_root = root / "work" / "trading-core"
+        self.site_root = root / "src"
+        self.outputs_root = root / "outputs"
+        self.runtime_root = runtime_root
+        self.policy_path = policy_path
+        self.policy = read_json(policy_path, {})
+        if not isinstance(self.policy, dict) or self.policy.get("schema_version") != 1:
+            raise ValueError(f"invalid self-healing policy: {policy_path}")
+        self.state_path = runtime_root / "issues.json"
+        self.latest_path = runtime_root / "latest.json"
+        self.latest_markdown_path = runtime_root / "LATEST_SELF_HEALING_REPORT.md"
+        self.audit_log_path = runtime_root / "audit.jsonl"
+        self.runs_root = runtime_root / "runs"
+        self.lock_path = runtime_root / "self_healing.lock"
+        self.runner = runner or self._subprocess
+        self.executed_checks: set[str] = set()
+
+    @staticmethod
+    def _subprocess(
+        command: Sequence[str], *, cwd: Path, timeout: int = 180
+    ) -> subprocess.CompletedProcess[str]:
+        env = dict(os.environ)
+        env.setdefault("PYTHONUTF8", "1")
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        return subprocess.run(
+            list(command),
+            cwd=cwd,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+        )
+
+    def check_policy(self, check_id: str) -> tuple[str, str]:
+        config = self.policy.get("checks", {}).get(check_id, {})
+        return str(config.get("severity") or "medium"), str(config.get("risk") or "high")
+
+    def result(
+        self,
+        check_id: str,
+        passed: bool,
+        resource: Path | str,
+        summary: str,
+        *,
+        evidence: dict[str, Any] | None = None,
+        fixer: str | None = None,
+    ) -> ProbeResult:
+        self.executed_checks.add(check_id)
+        severity, risk = self.check_policy(check_id)
+        try:
+            resource_text = str(Path(resource).resolve().relative_to(self.root.resolve()))
+        except (ValueError, TypeError):
+            resource_text = str(resource)
+        return ProbeResult(
+            check_id=check_id,
+            passed=passed,
+            severity=severity,
+            risk=risk,
+            resource=resource_text,
+            summary=summary,
+            evidence=evidence or {},
+            fixer=fixer,
+        )
+
+    def command_json(
+        self, command: Sequence[str], *, cwd: Path | None = None, timeout: int = 180
+    ) -> tuple[subprocess.CompletedProcess[str], dict[str, Any] | None]:
+        completed = self.runner(command, cwd=cwd or self.root, timeout=timeout)
+        try:
+            payload = json.loads(completed.stdout)
+        except (json.JSONDecodeError, TypeError):
+            payload = None
+        return completed, payload if isinstance(payload, dict) else None
+
+    def probe_report(self, date: str) -> ProbeResult:
+        path = self.outputs_root / f"每日全球晨间简报-{date}.md"
+        exists = path.is_file() and path.stat().st_size > 0
+        return self.result(
+            "report_exists",
+            exists,
+            path,
+            "dated report is present and non-empty" if exists else "dated report is missing or empty",
+            evidence={"exists": path.exists(), "bytes": path.stat().st_size if path.exists() else 0},
+        )
+
+    def probe_research_quality(self, date: str) -> list[ProbeResult]:
+        script = self.briefing_root / "scripts" / "research_quality.py"
+        command = [sys.executable, str(script), "--date", date, "--dry-run"]
+        completed, payload = self.command_json(command)
+        operational = bool(payload and payload.get("operational_passed") is True)
+        gate = self.result(
+            "research_operational_gate",
+            operational,
+            self.outputs_root / f"每日全球晨间简报-{date}.md",
+            "research operational gate passed" if operational else "research operational gate failed",
+            evidence={
+                "returncode": completed.returncode,
+                "blocking_reasons": (payload or {}).get("blocking_reasons", []),
+                "stderr": completed.stderr[-1000:],
+            },
+        )
+        artifact = self.briefing_root / "data" / f"research-quality-{date}.json"
+        stored = read_json(artifact, {})
+        inputs = [
+            self.outputs_root / f"每日全球晨间简报-{date}.md",
+            self.briefing_root / "data" / "predictions.jsonl",
+            self.briefing_root / "config" / "settings.json",
+        ]
+        newest_input_mtime = max(
+            (path.stat().st_mtime_ns for path in inputs if path.exists()),
+            default=0,
+        )
+        artifact_ok = bool(
+            isinstance(stored, dict)
+            and stored.get("date") == date
+            and stored.get("operational_passed") == operational
+            and artifact.is_file()
+            and artifact.stat().st_mtime_ns >= newest_input_mtime
+        )
+        artifact_result = self.result(
+            "research_quality_artifact",
+            artifact_ok,
+            artifact,
+            "research quality artifact is current" if artifact_ok else "research quality artifact is missing or stale",
+            evidence={"date": date, "exists": artifact.exists(), "expected_operational_passed": operational},
+            fixer="refresh_research_quality",
+        )
+        return [gate, artifact_result]
+
+    def probe_site(self, date: str) -> list[ProbeResult]:
+        script = self.briefing_root / "scripts" / "sync_briefing_site.py"
+        completed, payload = self.command_json(
+            [sys.executable, str(script), "--date", date, "--dry-run"]
+        )
+        site_data = self.site_root / "app" / "briefing.generated.json"
+        generated = read_json(site_data, {})
+        expected_hash = str((payload or {}).get("sha256") or "")
+        actual_hash = str(generated.get("contentHash") or "") if isinstance(generated, dict) else ""
+        payload_ok = bool(
+            completed.returncode == 0
+            and expected_hash
+            and actual_hash == expected_hash
+            and generated.get("reportDate") == date
+        )
+        freshness = self.result(
+            "site_payload_freshness",
+            payload_ok,
+            site_data,
+            "site payload matches current report inputs" if payload_ok else "site payload is stale or invalid",
+            evidence={
+                "expected_hash": expected_hash,
+                "actual_hash": actual_hash,
+                "report_date": generated.get("reportDate") if isinstance(generated, dict) else None,
+                "returncode": completed.returncode,
+                "stderr": completed.stderr[-1000:],
+            },
+            fixer="regenerate_site_payload",
+        )
+        state_path = self.briefing_root / "data" / "site-sync-state.json"
+        state = read_json(state_path, {})
+        pending = str(state.get("pending_sha") or "") if isinstance(state, dict) else ""
+        deployed = str(state.get("last_deployed_sha") or "") if isinstance(state, dict) else ""
+        pending_payload = str(state.get("pending_payload_sha") or "") if isinstance(state, dict) else ""
+        deployed_payload = str(state.get("last_deployed_payload_sha") or "") if isinstance(state, dict) else ""
+        state_ok = not pending or pending != deployed or pending_payload != deployed_payload
+        consistency = self.result(
+            "site_state_consistency",
+            state_ok,
+            state_path,
+            "site state has no already-deployed pending marker" if state_ok else "site state retains an already-deployed pending marker",
+            evidence={"pending_sha": pending, "last_deployed_sha": deployed, "pending_payload_sha": pending_payload, "last_deployed_payload_sha": deployed_payload},
+            fixer="normalize_site_state",
+        )
+        return [freshness, consistency]
+
+    def probe_macro_bridge(self, date: str) -> ProbeResult:
+        source = self.briefing_root / "data" / f"macro_signals-{date}.jsonl"
+        target = self.trading_root / "data" / "macro_signals" / source.name
+        source_hash = file_hash(source)
+        target_hash = file_hash(target)
+        passed = source_hash is not None and source_hash == target_hash
+        return self.result(
+            "macro_bridge_freshness",
+            passed,
+            target,
+            "macro signal bridge is current" if passed else "macro signal bridge is missing or stale",
+            evidence={"source": str(source), "source_hash": source_hash, "target_hash": target_hash},
+            fixer="refresh_macro_bridge" if source_hash is not None else None,
+        )
+
+    @staticmethod
+    def process_is_running(pid: int) -> bool:
+        if pid <= 0:
+            return False
+        if os.name == "nt":
+            import ctypes
+
+            handle = ctypes.windll.kernel32.OpenProcess(0x00100000, False, pid)
+            if not handle:
+                return False
+            ctypes.windll.kernel32.CloseHandle(handle)
+            return True
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return False
+        return True
+
+    def lock_is_stale(self, path: Path) -> tuple[bool, dict[str, Any]]:
+        payload = read_json(path, {})
+        pid = int(payload.get("pid", 0)) if isinstance(payload, dict) else 0
+        try:
+            started = datetime.fromisoformat(str(payload.get("started_at", "")).replace("Z", "+00:00"))
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=UTC)
+        except (TypeError, ValueError):
+            started = datetime.now(UTC) - timedelta(days=2)
+        stale_after = timedelta(minutes=int(self.policy.get("lock_stale_minutes", 120)))
+        stale = not self.process_is_running(pid) or datetime.now(UTC) - started > stale_after
+        return stale, {"pid": pid, "started_at": str(payload.get("started_at") or ""), "running": self.process_is_running(pid)}
+
+    def probe_cycle_lock(self) -> ProbeResult:
+        path = self.root / "work" / "shared" / "atlas" / "cycle.lock"
+        if not path.exists():
+            return self.result("cycle_lock_health", True, path, "no stale cycle lock exists")
+        stale, evidence = self.lock_is_stale(path)
+        return self.result(
+            "cycle_lock_health",
+            not stale,
+            path,
+            "active cycle lock belongs to a running process" if not stale else "cycle lock is stale",
+            evidence=evidence,
+            fixer="remove_stale_cycle_lock" if stale else None,
+        )
+
+    def probe_cycle_audit(self, date: str) -> ProbeResult:
+        path = self.root / "work" / "shared" / "atlas" / "run_audits" / f"atlas-cycle-{date}.json"
+        payload = read_json(path, {})
+        passed = bool(isinstance(payload, dict) and payload.get("overall_passed") is True)
+        return self.result(
+            "latest_cycle_audit",
+            passed,
+            path,
+            "date-aligned cycle audit passed" if passed else "date-aligned cycle audit is missing or failed",
+            evidence={"exists": path.exists(), "blocking_reasons": payload.get("blocking_reasons", []) if isinstance(payload, dict) else []},
+        )
+
+    def probe_improvement_tracker(self, date: str) -> ProbeResult:
+        path = self.root / "work" / "shared" / "atlas" / "improvements" / "latest.json"
+        payload = read_json(path, {})
+        passed = bool(
+            isinstance(payload, dict)
+            and payload.get("date") == date
+            and int(payload.get("counts", {}).get("blocking") or 0) == 0
+        )
+        return self.result(
+            "improvement_tracker_current",
+            passed,
+            path,
+            "retrospective actions are current and nonblocking" if passed else "retrospective action tracker is missing, stale, or blocking",
+            evidence={"exists": path.exists(), "date": payload.get("date") if isinstance(payload, dict) else None, "blocking": payload.get("counts", {}).get("blocking") if isinstance(payload, dict) else None},
+            fixer="refresh_improvement_tracker",
+        )
+
+    def probe_deep(self) -> list[ProbeResult]:
+        results: list[ProbeResult] = []
+        deep_config = self.policy.get("deep_checks", {})
+        if deep_config.get("briefing_tests", True):
+            completed = self.runner(
+                [sys.executable, "-m", "unittest", "discover", str(self.briefing_root / "tests"), "-p", "test_*.py"],
+                cwd=self.root,
+                timeout=300,
+            )
+            results.append(self.result(
+                "briefing_tests",
+                completed.returncode == 0,
+                self.briefing_root / "tests",
+                "briefing test suite passed" if completed.returncode == 0 else "briefing test suite failed",
+                evidence={"returncode": completed.returncode, "stdout_tail": completed.stdout[-2000:], "stderr_tail": completed.stderr[-2000:]},
+            ))
+        if deep_config.get("site_quality", True):
+            npm = "npm.cmd" if os.name == "nt" else "npm"
+            completed = self.runner([npm, "run", "quality"], cwd=self.site_root, timeout=420)
+            results.append(self.result(
+                "site_quality",
+                completed.returncode == 0,
+                self.site_root,
+                "site quality suite passed" if completed.returncode == 0 else "site quality suite failed",
+                evidence={"returncode": completed.returncode, "stdout_tail": completed.stdout[-3000:], "stderr_tail": completed.stderr[-3000:]},
+            ))
+        return results
+
+    def detect(self, date: str, *, deep: bool) -> list[ProbeResult]:
+        results = [self.probe_report(date)]
+        if results[0].passed:
+            results.extend(self.probe_research_quality(date))
+            results.extend(self.probe_site(date))
+        results.append(self.probe_macro_bridge(date))
+        results.append(self.probe_cycle_lock())
+        results.append(self.probe_cycle_audit(date))
+        results.append(self.probe_improvement_tracker(date))
+        if deep:
+            results.extend(self.probe_deep())
+        return results
+
+    def repair_targets(self, finding: ProbeResult) -> list[Path]:
+        mapping = {
+            "refresh_research_quality": [self.briefing_root / "data" / f"research-quality-{finding.evidence.get('date', '')}.json"],
+            "regenerate_site_payload": [
+                self.site_root / "app" / "briefing.generated.json",
+                self.briefing_root / "data" / "site-sync-state.json",
+            ],
+            "normalize_site_state": [self.briefing_root / "data" / "site-sync-state.json"],
+            "refresh_macro_bridge": [self.root / finding.resource],
+            "remove_stale_cycle_lock": [self.root / finding.resource],
+            "refresh_improvement_tracker": [
+                self.root / "work" / "shared" / "atlas" / "improvements" / "actions.json",
+                self.root / "work" / "shared" / "atlas" / "improvements" / "latest.json",
+            ],
+        }
+        return mapping.get(finding.fixer or "", [])
+
+    def snapshot(self, paths: list[Path], backup_root: Path) -> dict[str, dict[str, Any]]:
+        manifest: dict[str, dict[str, Any]] = {}
+        for path in paths:
+            resolved = path.resolve()
+            try:
+                relative = resolved.relative_to(self.root.resolve())
+            except ValueError as exc:
+                raise ValueError(f"repair target escapes workspace: {resolved}") from exc
+            entry = {"existed": resolved.exists(), "sha256": file_hash(resolved), "relative": str(relative)}
+            if resolved.is_file():
+                backup = backup_root / relative
+                backup.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(resolved, backup)
+                entry["backup"] = str(backup)
+            manifest[str(relative)] = entry
+        return manifest
+
+    def restore(self, manifest: dict[str, dict[str, Any]]) -> None:
+        for relative, entry in manifest.items():
+            target = self.root / relative
+            if entry.get("existed"):
+                backup = Path(str(entry.get("backup") or ""))
+                if backup.is_file():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(backup, target)
+            elif target.exists() and target.is_file():
+                target.unlink()
+
+    def execute_fixer(self, finding: ProbeResult, date: str) -> RepairResult:
+        if finding.fixer == "refresh_research_quality":
+            script = self.briefing_root / "scripts" / "research_quality.py"
+            completed = self.runner([sys.executable, str(script), "--date", date], cwd=self.root, timeout=180)
+            return RepairResult("applied" if completed.returncode == 0 else "failed", completed.stderr[-1000:] or completed.stdout[-1000:])
+        if finding.fixer == "regenerate_site_payload":
+            script = self.briefing_root / "scripts" / "sync_briefing_site.py"
+            completed = self.runner([sys.executable, str(script), "--date", date], cwd=self.root, timeout=180)
+            return RepairResult("applied" if completed.returncode == 0 else "failed", completed.stderr[-1000:] or completed.stdout[-1000:])
+        if finding.fixer == "normalize_site_state":
+            path = self.briefing_root / "data" / "site-sync-state.json"
+            state = read_json(path, {})
+            if (
+                not isinstance(state, dict)
+                or state.get("pending_sha") != state.get("last_deployed_sha")
+                or str(state.get("pending_payload_sha") or "") != str(state.get("last_deployed_payload_sha") or "")
+            ):
+                return RepairResult("noop", "site state no longer needs normalization")
+            for key in ("pending_sha", "pending_payload_sha", "pending_report", "pending_date"):
+                state.pop(key, None)
+            atomic_write_json(path, state)
+            return RepairResult("applied", "removed already-deployed pending markers", [str(path.relative_to(self.root))])
+        if finding.fixer == "refresh_macro_bridge":
+            source = self.briefing_root / "data" / f"macro_signals-{date}.jsonl"
+            target = self.trading_root / "data" / "macro_signals" / source.name
+            if not source.is_file():
+                return RepairResult("failed", "source macro signal file is missing")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+            shutil.copy2(source, temporary)
+            temporary.replace(target)
+            return RepairResult("applied", "refreshed derived macro signal bridge", [str(target.relative_to(self.root))])
+        if finding.fixer == "remove_stale_cycle_lock":
+            path = self.root / finding.resource
+            stale, _ = self.lock_is_stale(path)
+            if path.exists() and stale:
+                path.unlink()
+                return RepairResult("applied", "removed stale cycle lock", [finding.resource])
+            return RepairResult("noop", "cycle lock is no longer stale")
+        if finding.fixer == "refresh_improvement_tracker":
+            script = self.briefing_root / "scripts" / "improvement_tracker.py"
+            completed = self.runner(
+                [sys.executable, str(script), "--date", date, "--apply-safe", "--strict"],
+                cwd=self.root,
+                timeout=180,
+            )
+            return RepairResult("applied" if completed.returncode == 0 else "failed", completed.stderr[-1000:] or completed.stdout[-1000:])
+        return RepairResult("blocked", "no allowlisted fixer")
+
+    def verify_finding(self, finding: ProbeResult, date: str) -> bool:
+        if finding.check_id == "research_quality_artifact":
+            return self.probe_research_quality(date)[1].passed
+        if finding.check_id == "site_payload_freshness":
+            return self.probe_site(date)[0].passed
+        if finding.check_id == "site_state_consistency":
+            return self.probe_site(date)[1].passed
+        if finding.check_id == "macro_bridge_freshness":
+            return self.probe_macro_bridge(date).passed
+        if finding.check_id == "cycle_lock_health":
+            return self.probe_cycle_lock().passed
+        if finding.check_id == "improvement_tracker_current":
+            return self.probe_improvement_tracker(date).passed
+        return False
+
+    def can_auto_fix(self, finding: ProbeResult, issue: dict[str, Any]) -> tuple[bool, str]:
+        if not finding.fixer:
+            return False, "no allowlisted fixer"
+        if finding.risk not in set(self.policy.get("auto_fix_risks", [])):
+            return False, f"risk {finding.risk} requires approval"
+        if finding.risk != "low":
+            return False, "only low-risk repairs are eligible"
+        max_attempts = int(self.policy.get("max_attempts_per_issue", 3))
+        if int(issue.get("repair_attempts", 0)) >= max_attempts:
+            return False, "circuit breaker: maximum repair attempts reached"
+        last_attempt = issue.get("last_repair_at")
+        if last_attempt:
+            try:
+                timestamp = datetime.fromisoformat(str(last_attempt).replace("Z", "+00:00"))
+                cooldown = timedelta(minutes=int(self.policy.get("cooldown_minutes", 60)))
+                if datetime.now(UTC) - timestamp < cooldown and issue.get("last_repair_status") == "failed":
+                    return False, "circuit breaker: failed repair is cooling down"
+            except ValueError:
+                pass
+        return True, "eligible"
+
+    def reconcile_issues(self, results: list[ProbeResult]) -> dict[str, Any]:
+        state = read_json(self.state_path, {"schema_version": 1, "issues": {}})
+        if not isinstance(state, dict):
+            state = {"schema_version": 1, "issues": {}}
+        issues = state.setdefault("issues", {})
+        now = utc_now()
+        for result in results:
+            issue = issues.get(result.fingerprint)
+            if result.passed:
+                if isinstance(issue, dict) and issue.get("status") not in {"resolved", "closed"}:
+                    issue.update({"status": "resolved", "resolved_at": now, "last_seen": now, "resolution": "probe passed"})
+                continue
+            if not isinstance(issue, dict):
+                issue = {
+                    "issue_id": f"ATLAS-{result.fingerprint.upper()}",
+                    "fingerprint": result.fingerprint,
+                    "first_seen": now,
+                    "occurrences": 0,
+                    "repair_attempts": 0,
+                }
+                issues[result.fingerprint] = issue
+            issue.update({
+                "check_id": result.check_id,
+                "resource": result.resource,
+                "severity": result.severity,
+                "risk": result.risk,
+                "summary": result.summary,
+                "evidence": result.evidence,
+                "fixer": result.fixer,
+                "last_seen": now,
+                "status": "open",
+                "resolved_at": None,
+            })
+            issue["occurrences"] = int(issue.get("occurrences", 0)) + 1
+        state["updated_at"] = now
+        return state
+
+    def run(self, date: str, *, apply_safe: bool, deep: bool, strict: bool) -> tuple[int, dict[str, Any]]:
+        run_id = f"ATLAS-HEAL-{date.replace('-', '')}-{datetime.now(UTC).strftime('%Y%m%dT%H%M%S%fZ')}"
+        started_at = utc_now()
+        results = self.detect(date, deep=deep)
+        state = self.reconcile_issues(results)
+        issues = state["issues"]
+        repair_records: list[dict[str, Any]] = []
+        repair_budget = int(self.policy.get("max_repairs_per_run", 4))
+        run_root = self.runs_root / date / run_id
+
+        if apply_safe:
+            for finding in [item for item in results if not item.passed]:
+                if len(repair_records) >= repair_budget:
+                    break
+                issue = issues[finding.fingerprint]
+                eligible, reason = self.can_auto_fix(finding, issue)
+                if not eligible:
+                    issue["status"] = "requires_approval" if "approval" in reason or "no allowlisted" in reason else "quarantined"
+                    issue["automation_decision"] = reason
+                    continue
+                issue["status"] = "healing"
+                issue["repair_attempts"] = int(issue.get("repair_attempts", 0)) + 1
+                issue["last_repair_at"] = utc_now()
+                targets = self.repair_targets(finding)
+                backup_root = run_root / "backups" / finding.fingerprint
+                manifest = self.snapshot(targets, backup_root)
+                repair = self.execute_fixer(finding, date)
+                verified = repair.status in {"applied", "noop"} and self.verify_finding(finding, date)
+                rolled_back = False
+                if not verified and self.policy.get("rollback_on_verification_failure", True):
+                    self.restore(manifest)
+                    rolled_back = True
+                repair.rolled_back = rolled_back
+                issue["last_repair_status"] = "verified" if verified else "failed"
+                issue["automation_decision"] = repair.detail
+                if verified:
+                    issue.update({"status": "resolved", "resolved_at": utc_now(), "resolution": "automatic repair verified"})
+                elif int(issue.get("repair_attempts", 0)) >= int(self.policy.get("max_attempts_per_issue", 3)):
+                    issue["status"] = "quarantined"
+                else:
+                    issue["status"] = "open"
+                repair_records.append({
+                    "issue_id": issue["issue_id"],
+                    "check_id": finding.check_id,
+                    "fixer": finding.fixer,
+                    "status": issue["last_repair_status"],
+                    "detail": repair.detail,
+                    "rolled_back": rolled_back,
+                    "manifest": manifest,
+                })
+
+        atomic_write_json(self.state_path, state)
+        unresolved = [
+            issue for issue in issues.values()
+            if issue.get("status") not in {"resolved", "closed"}
+        ]
+        unresolved.sort(key=lambda item: (-SEVERITY_ORDER.get(str(item.get("severity")), 0), str(item.get("issue_id"))))
+        blocking_levels = set(self.policy.get("blocking_severities", ["critical"]))
+        blocking = [issue for issue in unresolved if issue.get("severity") in blocking_levels]
+        detected_failures = sum(not item.passed for item in results)
+        verified_repairs = sum(item["status"] == "verified" for item in repair_records)
+        remaining_failures = max(0, detected_failures - verified_repairs)
+        report = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "date": date,
+            "started_at": started_at,
+            "finished_at": utc_now(),
+            "mode": "apply_safe" if apply_safe else "detect_only",
+            "deep": deep,
+            "strict": strict,
+            "overall_status": "blocked" if blocking else "degraded" if unresolved else "healthy",
+            "checks": [asdict(item) | {"fingerprint": item.fingerprint} for item in results],
+            "repairs": repair_records,
+            "counts": {
+                "checks": len(results),
+                "passed": len(results) - remaining_failures,
+                "failed": remaining_failures,
+                "detected_failures": detected_failures,
+                "repairs_attempted": len(repair_records),
+                "repairs_verified": verified_repairs,
+                "unresolved": len(unresolved),
+                "blocking": len(blocking),
+            },
+            "unresolved_issues": unresolved,
+            "boundaries": self.policy.get("boundaries", {}),
+        }
+        atomic_write_json(run_root / "run.json", report)
+        atomic_write_json(self.latest_path, report)
+        atomic_write_text(self.latest_markdown_path, render_markdown(report))
+        append_jsonl(self.audit_log_path, {
+            "run_id": run_id,
+            "date": date,
+            "finished_at": report["finished_at"],
+            "overall_status": report["overall_status"],
+            "counts": report["counts"],
+            "report": str((run_root / "run.json").relative_to(self.root)),
+        })
+        return (1 if strict and blocking else 0), report
+
+
+def render_markdown(report: dict[str, Any]) -> str:
+    lines = [
+        "# ATLAS Self-Healing Report",
+        "",
+        f"- run_id: {report['run_id']}",
+        f"- date: {report['date']}",
+        f"- status: {report['overall_status']}",
+        f"- mode: {report['mode']}",
+        f"- checks: {report['counts']['passed']}/{report['counts']['checks']} passed",
+        f"- repairs: {report['counts']['repairs_verified']}/{report['counts']['repairs_attempted']} verified",
+        f"- unresolved: {report['counts']['unresolved']}",
+        "",
+        "## Unresolved issues",
+    ]
+    unresolved = report.get("unresolved_issues", [])
+    if not unresolved:
+        lines.append("- None")
+    for issue in unresolved:
+        lines.append(
+            f"- {issue.get('issue_id')} [{issue.get('severity')}/{issue.get('risk')}] "
+            f"{issue.get('summary')} — status={issue.get('status')}"
+        )
+    lines.extend([
+        "",
+        "## Safety boundaries",
+        "- Auto-repair is restricted to allowlisted low-risk derived artifacts.",
+        "- Source code, research conclusions, probabilities, virtual orders, production deployment, and real orders are not auto-modified.",
+        "- Every attempted repair is snapshotted, verified, audited, and rolled back on verification failure.",
+        "",
+    ])
+    return "\n".join(lines)
+
+
+@contextmanager
+def self_healing_lock(engine: SelfHealingEngine):
+    path = engine.lock_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"pid": os.getpid(), "started_at": utc_now()}
+    for _ in range(2):
+        try:
+            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            stale, _evidence = engine.lock_is_stale(path)
+            if stale:
+                path.unlink(missing_ok=True)
+                continue
+            raise RuntimeError("self-healing run already active")
+        else:
+            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            break
+    else:
+        raise RuntimeError("unable to acquire self-healing lock")
+    try:
+        yield
+    finally:
+        current = read_json(path, {})
+        if isinstance(current, dict) and current.get("pid") == os.getpid():
+            path.unlink(missing_ok=True)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description="ATLAS closed-loop self-healing control plane")
+    parser.add_argument("--date", type=valid_date)
+    parser.add_argument("--apply-safe", action="store_true", help="Apply allowlisted low-risk repairs")
+    parser.add_argument("--deep", action="store_true", help="Run briefing and website test suites")
+    parser.add_argument("--strict", action="store_true", help="Fail when a blocking issue remains")
+    parser.add_argument("--status", action="store_true", help="Print the most recent self-healing report")
+    parser.add_argument("--json", action="store_true", help="Print full machine-readable output")
+    args = parser.parse_args(argv)
+    try:
+        engine = SelfHealingEngine()
+        if args.status:
+            payload = read_json(engine.latest_path, {})
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0 if payload else 2
+        date = args.date or latest_report_date()
+        with self_healing_lock(engine):
+            returncode, report = engine.run(date, apply_safe=args.apply_safe, deep=args.deep, strict=args.strict)
+    except (FileNotFoundError, OSError, ValueError, RuntimeError, subprocess.TimeoutExpired) as exc:
+        print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
+        return 2
+    if args.json:
+        print(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True))
+    else:
+        print(json.dumps({
+            "status": report["overall_status"],
+            "run_id": report["run_id"],
+            "date": report["date"],
+            "counts": report["counts"],
+            "latest_report": str(engine.latest_markdown_path),
+        }, ensure_ascii=False))
+    return returncode
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,0 +1,82 @@
+{
+  "version": 1,
+  "updated": "2026-06-13",
+  "purpose": "Structured forecast-review and paper-trading attribution policy for the global briefing automation.",
+  "metric_boundary": {
+    "legacy_component_score": "Subjective diagnostic rubric only; must not be described as calibration or proper forecast accuracy.",
+    "research_metrics": ["brier_score", "log_loss", "expected_calibration_error"],
+    "research_eligibility": "Numeric ex-ante probability, pre-registered deadline/criteria, binary observed outcome, resolution evidence, and no premature closure."
+  },
+  "prediction_review_fields": {
+    "score": {
+      "direction": "0.0-1.0: did the causal direction happen?",
+      "timing": "0.0-1.0: did it happen inside the stated horizon?",
+      "transmission": "0.0-1.0: did the forecast map to the named industry/asset/theme?",
+      "calibration": "0.0-1.0: was the assigned probability appropriate?",
+      "total": "0-100 weighted composite score"
+    },
+    "failure_reasons": [
+      "already_priced_in",
+      "time_window_too_short",
+      "time_window_too_long",
+      "source_lag",
+      "source_quality_issue",
+      "asset_mapping_error",
+      "policy_reversal",
+      "event_reversal",
+      "liquidity_or_valuation_override",
+      "correlation_mistake",
+      "data_stale",
+      "insufficient_evidence"
+    ],
+    "falsification_signals": "Concrete signals that would make the prediction wrong or lower confidence."
+  },
+  "default_score_by_status": {
+    "validated": {
+      "direction": 1.0,
+      "timing": 1.0,
+      "transmission": 1.0,
+      "calibration": 0.9,
+      "total": 95
+    },
+    "partial": {
+      "direction": 0.7,
+      "timing": 0.6,
+      "transmission": 0.45,
+      "calibration": 0.5,
+      "total": 56
+    },
+    "wrong": {
+      "direction": 0.0,
+      "timing": 0.0,
+      "transmission": 0.0,
+      "calibration": 0.1,
+      "total": 5
+    },
+    "expired": {
+      "direction": 0.0,
+      "timing": 0.0,
+      "transmission": 0.0,
+      "calibration": 0.2,
+      "total": 10
+    }
+  },
+  "scoring_weights": {
+    "direction": 0.35,
+    "timing": 0.2,
+    "transmission": 0.3,
+    "calibration": 0.15
+  },
+  "summary_outputs": {
+    "daily_scorecard": "work/global-briefing/data/scorecard-YYYY-MM-DD.json",
+    "weekly_scorecard": "outputs/每周预测复盘-YYYY-Www.md",
+    "monthly_scorecard": "outputs/每月预测复盘-YYYY-MM.md",
+    "paper_attribution": "work/global-briefing/data/paper_attribution-YYYY-MM-DD.json"
+  },
+  "operating_rules": [
+    "New predictions should include falsification_signals whenever possible.",
+    "Review records should include score and failure_reasons when status is partial, wrong, or expired.",
+    "Weekly and monthly summaries should report hit rate, average score, dominant failure reasons, and paper-trading attribution.",
+    "Paper-trading attribution is diagnostic only and must not become real-money trading advice."
+  ]
+}

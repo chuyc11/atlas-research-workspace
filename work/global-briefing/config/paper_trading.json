@@ -1,0 +1,154 @@
+{
+  "account_id": "global-briefing-paper-trading",
+  "mode_name": "进攻型虚拟炒股模式",
+  "initial_cash": 100000.0,
+  "base_unit": "积分",
+  "allow_fractional_shares": true,
+  "allow_short": false,
+  "allow_leverage": false,
+  "allow_options": false,
+  "default_fee_rate": 0.0,
+  "max_position_pct": 0.35,
+  "max_daily_turnover_pct": 0.65,
+  "min_cash_pct": 0.02,
+  "max_new_positions_per_day": 8,
+  "strategy_profile": {
+    "name": "aggressive_event_momentum_v1",
+    "enabled": true,
+    "paper_trading_only": true,
+    "objective": "Use fresh event, trend, breadth, liquidity and forecast evidence to raise virtual capital utilization while keeping hard portfolio limits.",
+    "target_invested_pct": {
+      "minimum": 0.7,
+      "preferred": 0.82,
+      "maximum": 0.98
+    },
+    "target_cash_pct": {
+      "preferred_minimum": 0.05,
+      "preferred_maximum": 0.18,
+      "hard_minimum": 0.02
+    },
+    "position_sizing": {
+      "starter_position_pct": 0.1,
+      "high_confidence_position_pct": 0.15,
+      "maximum_adds_per_position": 2,
+      "add_on_confirmation_pct": 0.06
+    },
+    "signal_score": {
+      "buy_threshold": 70,
+      "add_threshold": 82,
+      "reduce_threshold": 48,
+      "exit_threshold": 38,
+      "components": {
+        "evidence_quality": 25,
+        "price_trend": 25,
+        "breadth_confirmation": 20,
+        "catalyst_strength": 15,
+        "liquidity_quality": 15
+      }
+    },
+    "decision_policy": {
+      "maximum_actions_per_account_per_day": 4,
+      "prefer_action_over_hold_when_signal_qualifies": true,
+      "hold_requires_explicit_blocker": true,
+      "allowed_hold_blockers": [
+        "stale_price",
+        "source_quality_failure",
+        "conflicting_signals",
+        "risk_limit_breach",
+        "market_closed_without_fresh_close",
+        "no_candidate_above_buy_threshold"
+      ]
+    },
+    "risk_overlays": {
+      "maximum_theme_exposure_pct": 0.5,
+      "daily_loss_circuit_breaker_pct": 0.04,
+      "portfolio_drawdown_derisk_pct": 0.08,
+      "thesis_failure_requires_reduce_or_exit": true,
+      "no_averaging_down_without_new_confirming_evidence": true
+    }
+  },
+  "default_account": "US",
+  "accounts": {
+    "US": {
+      "account_id": "global-briefing-us-paper-trading",
+      "market_scope": "US",
+      "base_currency": "USD",
+      "fx_rates_to_base": {
+        "USD": 1.0
+      },
+      "initial_cash": 100000.0,
+      "base_unit": "积分",
+      "allowed_market_types": ["US"],
+      "portfolio_file": "work/global-briefing/data/paper_portfolio_us.json",
+      "trades_file": "work/global-briefing/data/paper_trades_us.jsonl",
+      "valuations_file": "work/global-briefing/data/paper_valuations_us.jsonl"
+    },
+    "CHINA": {
+      "account_id": "global-briefing-china-paper-trading",
+      "market_scope": "CHINA",
+      "base_currency": "CNY",
+      "fx_rates_to_base": {
+        "CNY": 1.0,
+        "HKD": 0.92
+      },
+      "initial_cash": 100000.0,
+      "base_unit": "积分",
+      "allowed_market_types": ["A_SHARE", "HK"],
+      "portfolio_file": "work/global-briefing/data/paper_portfolio_china.json",
+      "trades_file": "work/global-briefing/data/paper_trades_china.jsonl",
+      "valuations_file": "work/global-briefing/data/paper_valuations_china.jsonl"
+    }
+  },
+  "market_rules": {
+    "A_SHARE": {
+      "exchanges": ["SH", "SSE", "SHSE", "SHANGHAI", "SZ", "SZSE", "SHENZHEN", "BJ", "BSE", "BEIJING"],
+      "currency": "CNY",
+      "integer_quantity": true,
+      "buy_lot_size": 100,
+      "partial_sell_lot_size": 100,
+      "allow_same_day_sell": false,
+      "default_price_limit_pct": 0.1,
+      "star_market_price_limit_pct": 0.2,
+      "chinext_price_limit_pct": 0.2,
+      "st_price_limit_pct": 0.05,
+      "commission_rate": 0.0003,
+      "min_commission": 5.0,
+      "stamp_tax_sell_rate": 0.0005
+    },
+    "HK": {
+      "exchanges": ["HK", "HKEX", "SEHK", "HONG KONG"],
+      "currency": "HKD",
+      "integer_quantity": true,
+      "allow_same_day_sell": true,
+      "commission_rate": 0.0003,
+      "min_commission": 5.0,
+      "stamp_tax_sell_rate": 0.001
+    },
+    "US": {
+      "exchanges": ["NYSE", "NASDAQ", "NYSE ARCA", "AMEX", "ARCA", "US", "USA"],
+      "currency": "USD",
+      "integer_quantity": false,
+      "allow_same_day_sell": true
+    }
+  },
+  "portfolio_file": "work/global-briefing/data/paper_portfolio.json",
+  "trades_file": "work/global-briefing/data/paper_trades.jsonl",
+  "valuations_file": "work/global-briefing/data/paper_valuations.jsonl",
+  "rules": [
+    "This is a virtual paper-trading account only and must never place real broker orders.",
+    "US and China markets are tracked in separate paper-trading accounts, each with 100000 initial virtual points.",
+    "The US account may trade US market instruments; the China account may trade A-share and Hong Kong market instruments.",
+    "The daily briefing may record BUY, SELL, or HOLD decisions for simulation, but these are not personalized financial advice.",
+    "Each virtual trade must include a ticker, exchange or market, execution price source, thesis, risk, and linked prediction or scenario when possible.",
+    "No leverage, short selling, options, or derivatives are allowed by default.",
+    "A-share BUY orders are rounded down to 100-share lots and same-day A-share sells are blocked.",
+    "A-share and Hong Kong virtual trades apply the same commission minimum and sell-side stamp tax assumptions as trading-core broker_rules.yaml.",
+    "All account equity, cash, turnover, and performance are measured in the account base currency; HKD holdings in the CHINA account use the explicitly configured virtual HKD-to-CNY conversion rate unless a dated quote supplies fx_to_base.",
+    "Hong Kong paper trades use integer shares; board-lot differences are recorded as a limitation unless explicitly configured.",
+    "Do not exceed max_position_pct in one instrument or max_daily_turnover_pct of portfolio equity in one day.",
+    "Keep at least min_cash_pct of initial capital as cash unless the user explicitly changes the rule.",
+    "When strategy_profile.enabled is true, use the configured signal score and target exposure to favor qualified virtual BUY, ADD, REDUCE, or SELL decisions over passive HOLD.",
+    "HOLD is not the default in aggressive mode and must name an allowed blocker from strategy_profile.decision_policy.",
+    "The aggressive profile remains simulation-only: it must not enable leverage, short selling, options, derivatives, or real broker connectivity."
+  ]
+}

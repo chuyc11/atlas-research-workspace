@@ -1,0 +1,4 @@
+interface:
+  display_name: "Forecast Scorecard"
+  short_description: "Prediction review and scoring loop"
+  default_prompt: "Use $forecast-scorecard to score recent predictions and update the forecast review."

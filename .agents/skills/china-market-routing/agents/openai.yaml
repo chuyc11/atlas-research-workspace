@@ -1,0 +1,4 @@
+interface:
+  display_name: "China Market Routing"
+  short_description: "China market data and candidate routing"
+  default_prompt: "Use $china-market-routing to prepare China market mapping and paper-trading candidates."

@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Node / ATLAS site
+src/
+src/node_modules/
+src/dist/
+src/.next/
+src/.vinext/
+src/.wrangler/
+src/.dev.*
+
+# Generated scratch files
+outputs/
+work/shared/
+work/global-briefing/data/
+work/skill-repos/
+work/trading-core/
+work/audits/
+work/site-design-options/
+work/site-package-stage/
+work/*.tgz
+.site-build-*/
+*.tmp
+work/global-briefing/tmp/
+work/global-briefing/data/tmp-*
+
+# Local environment and editor files
+.env*
+!.env.example
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.codex/

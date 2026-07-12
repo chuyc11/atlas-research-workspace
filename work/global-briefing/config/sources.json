@@ -1,0 +1,242 @@
+{
+  "version": 2,
+  "updated": "2026-07-11",
+  "notes": "Deep-research multi-country source matrix. RSS is discovery only; high-impact stories require primary-source and independent regional verification.",
+  "verification_sources": [
+    {"name":"US Federal Reserve","region":"US","tier":1,"categories":["macro","rates","finance"],"homepage":"https://www.federalreserve.gov/newsevents.htm","search_hint":"site:federalreserve.gov/newsevents latest statement data"},
+    {"name":"US SEC","region":"US","tier":1,"categories":["markets","regulation","companies"],"homepage":"https://www.sec.gov/newsroom","search_hint":"site:sec.gov/newsroom latest filing enforcement rule"},
+    {"name":"US EIA","region":"US","tier":1,"categories":["energy","oil","gas","electricity"],"homepage":"https://www.eia.gov/todayinenergy/","search_hint":"site:eia.gov latest oil gas inventory electricity"},
+    {"name":"European Commission","region":"EU","tier":1,"categories":["policy","trade","technology","sanctions"],"homepage":"https://ec.europa.eu/commission/presscorner/home/en","search_hint":"site:ec.europa.eu/commission/presscorner latest policy trade technology"},
+    {"name":"European Central Bank","region":"EU","tier":1,"categories":["macro","rates","finance"],"homepage":"https://www.ecb.europa.eu/press/html/index.en.html","search_hint":"site:ecb.europa.eu/press latest monetary policy economy"},
+    {"name":"Eurostat","region":"EU","tier":1,"categories":["macro","inflation","labor","industry"],"homepage":"https://ec.europa.eu/eurostat/web/main/news","search_hint":"site:ec.europa.eu/eurostat latest inflation employment industry"},
+    {"name":"People's Bank of China","region":"China","tier":1,"categories":["macro","rates","liquidity","finance"],"homepage":"https://www.pbc.gov.cn/en/3688110/index.html","search_hint":"site:pbc.gov.cn latest monetary policy liquidity"},
+    {"name":"National Bureau of Statistics of China","region":"China","tier":1,"categories":["macro","consumption","industry","property"],"homepage":"https://www.stats.gov.cn/english/PressRelease/","search_hint":"site:stats.gov.cn/english/PressRelease latest China data"},
+    {"name":"China Securities Regulatory Commission","region":"China","tier":1,"categories":["markets","regulation"],"homepage":"http://www.csrc.gov.cn/csrc_en/index.shtml","search_hint":"site:csrc.gov.cn/csrc_en latest market regulation"},
+    {"name":"Shanghai Stock Exchange","region":"China","tier":1,"categories":["markets","companies"],"homepage":"https://english.sse.com.cn/news/newsrelease/","search_hint":"site:english.sse.com.cn latest announcement"},
+    {"name":"Bank of Japan","region":"Japan","tier":1,"categories":["macro","rates","finance"],"homepage":"https://www.boj.or.jp/en/announcements/","search_hint":"site:boj.or.jp/en/announcements latest monetary policy"},
+    {"name":"Reserve Bank of India","region":"India","tier":1,"categories":["macro","rates","finance"],"homepage":"https://www.rbi.org.in/Scripts/BS_PressReleaseDisplay.aspx","search_hint":"site:rbi.org.in latest monetary policy press release"},
+    {"name":"Copernicus Climate Change Service","region":"EU/Global","tier":1,"categories":["climate","environment"],"homepage":"https://climate.copernicus.eu/news","search_hint":"site:climate.copernicus.eu/news latest climate bulletin"},
+    {"name":"NOAA","region":"US/Global","tier":1,"categories":["climate","oceans","weather"],"homepage":"https://www.noaa.gov/news","search_hint":"site:noaa.gov/news latest climate ocean weather"},
+    {"name":"ECDC","region":"EU","tier":1,"categories":["health","outbreaks"],"homepage":"https://www.ecdc.europa.eu/en/news-events","search_hint":"site:ecdc.europa.eu latest outbreak surveillance"},
+    {"name":"International Maritime Organization","region":"International","tier":1,"categories":["shipping","security","energy"],"homepage":"https://www.imo.org/en/MediaCentre/Pages/Default.aspx","search_hint":"site:imo.org/en/MediaCentre latest shipping security"}
+  ],
+  "sources": [
+    {
+      "name": "Reuters",
+      "country_or_region": "Global/UK",
+      "language": "en",
+      "tier": 2,
+      "categories": ["politics", "economy", "energy", "military", "technology"],
+      "homepage": "https://www.reuters.com/",
+      "rss": [],
+      "search_hint": "site:reuters.com latest world politics economy technology climate military"
+    },
+    {
+      "name": "Associated Press",
+      "country_or_region": "Global/US",
+      "language": "en",
+      "tier": 2,
+      "categories": ["politics", "society", "military", "health", "climate"],
+      "homepage": "https://apnews.com/",
+      "rss": [],
+      "search_hint": "site:apnews.com latest world politics climate military health"
+    },
+    {
+      "name": "BBC World",
+      "country_or_region": "UK/Global",
+      "language": "en",
+      "tier": 2,
+      "categories": ["politics", "technology", "climate", "society"],
+      "homepage": "https://www.bbc.com/news/world",
+      "rss": [
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://feeds.bbci.co.uk/news/technology/rss.xml",
+        "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml"
+      ],
+      "search_hint": "site:bbc.com/news latest world technology climate"
+    },
+    {
+      "name": "The Guardian",
+      "country_or_region": "UK/Global",
+      "language": "en",
+      "tier": 2,
+      "categories": ["politics", "climate", "technology", "society"],
+      "homepage": "https://www.theguardian.com/international",
+      "rss": [
+        "https://www.theguardian.com/world/rss",
+        "https://www.theguardian.com/environment/rss",
+        "https://www.theguardian.com/technology/rss"
+      ],
+      "search_hint": "site:theguardian.com world environment technology latest"
+    },
+    {
+      "name": "Deutsche Welle",
+      "country_or_region": "Germany/Europe",
+      "language": "en",
+      "tier": 2,
+      "categories": ["politics", "europe", "military", "society"],
+      "homepage": "https://www.dw.com/en/top-stories/s-9097",
+      "rss": [
+        "https://rss.dw.com/xml/rss-en-all"
+      ],
+      "search_hint": "site:dw.com latest Europe Ukraine Germany world"
+    },
+    {
+      "name": "France 24",
+      "country_or_region": "France/Global",
+      "language": "en",
+      "tier": 2,
+      "categories": ["politics", "military", "africa", "middle_east"],
+      "homepage": "https://www.france24.com/en/",
+      "rss": [
+        "https://www.france24.com/en/rss"
+      ],
+      "search_hint": "site:france24.com/en latest world Africa Middle East"
+    },
+    {
+      "name": "Al Jazeera",
+      "country_or_region": "Qatar/Middle East/Global",
+      "language": "en",
+      "tier": 2,
+      "categories": ["middle_east", "politics", "military", "energy"],
+      "homepage": "https://www.aljazeera.com/",
+      "rss": [
+        "https://www.aljazeera.com/xml/rss/all.xml"
+      ],
+      "search_hint": "site:aljazeera.com latest Middle East world energy"
+    },
+    {
+      "name": "Nikkei Asia",
+      "country_or_region": "Japan/Asia",
+      "language": "en",
+      "tier": 2,
+      "categories": ["asia", "technology", "economy", "supply_chain"],
+      "homepage": "https://asia.nikkei.com/",
+      "rss": [],
+      "search_hint": "site:asia.nikkei.com latest Asia technology economy chips"
+    },
+    {
+      "name": "The Hindu",
+      "country_or_region": "India/South Asia",
+      "language": "en",
+      "tier": 2,
+      "categories": ["india", "south_asia", "politics", "economy"],
+      "homepage": "https://www.thehindu.com/",
+      "rss": [
+        "https://www.thehindu.com/news/international/feeder/default.rss",
+        "https://www.thehindu.com/business/feeder/default.rss"
+      ],
+      "search_hint": "site:thehindu.com latest India international economy"
+    },
+    {
+      "name": "South China Morning Post",
+      "country_or_region": "Hong Kong/China/Asia",
+      "language": "en",
+      "tier": 2,
+      "categories": ["china", "asia", "technology", "geopolitics"],
+      "homepage": "https://www.scmp.com/",
+      "rss": [
+        "https://www.scmp.com/rss/91/feed"
+      ],
+      "search_hint": "site:scmp.com latest China Asia technology geopolitics"
+    },
+    {
+      "name": "Caixin Global",
+      "country_or_region": "China",
+      "language": "en",
+      "tier": 2,
+      "categories": ["china", "economy", "markets", "technology"],
+      "homepage": "https://www.caixinglobal.com/",
+      "rss": [
+        "https://www.caixinglobal.com/rss/"
+      ],
+      "search_hint": "site:caixinglobal.com latest China economy markets technology"
+    },
+    {
+      "name": "UN News",
+      "country_or_region": "International",
+      "language": "en",
+      "tier": 1,
+      "categories": ["politics", "humanitarian", "climate", "health"],
+      "homepage": "https://news.un.org/en/",
+      "rss": [
+        "https://news.un.org/feed/subscribe/en/news/all/rss.xml"
+      ],
+      "search_hint": "site:news.un.org latest humanitarian climate health"
+    },
+    {
+      "name": "World Health Organization",
+      "country_or_region": "International",
+      "language": "en",
+      "tier": 1,
+      "categories": ["health", "public_health"],
+      "homepage": "https://www.who.int/news",
+      "rss": [
+        "https://www.who.int/rss-feeds/news-english.xml"
+      ],
+      "search_hint": "site:who.int/news latest outbreak public health"
+    },
+    {
+      "name": "World Meteorological Organization",
+      "country_or_region": "International",
+      "language": "en",
+      "tier": 1,
+      "categories": ["climate", "environment"],
+      "homepage": "https://wmo.int/news",
+      "rss": [],
+      "search_hint": "site:wmo.int/news latest climate El Nino weather"
+    },
+    {
+      "name": "International Energy Agency",
+      "country_or_region": "International",
+      "language": "en",
+      "tier": 1,
+      "categories": ["energy", "economy", "climate"],
+      "homepage": "https://www.iea.org/news",
+      "rss": [],
+      "search_hint": "site:iea.org/news latest oil gas electricity energy"
+    },
+    {
+      "name": "World Bank",
+      "country_or_region": "International",
+      "language": "en",
+      "tier": 1,
+      "categories": ["economy", "development", "macro"],
+      "homepage": "https://www.worldbank.org/en/news",
+      "rss": [],
+      "search_hint": "site:worldbank.org/en/news latest global growth economy"
+    },
+    {
+      "name": "International Monetary Fund",
+      "country_or_region": "International",
+      "language": "en",
+      "tier": 1,
+      "categories": ["economy", "macro", "finance"],
+      "homepage": "https://www.imf.org/en/News",
+      "rss": [],
+      "search_hint": "site:imf.org/en/News latest global economy inflation"
+    },
+    {
+      "name": "NATO",
+      "country_or_region": "International",
+      "language": "en",
+      "tier": 1,
+      "categories": ["military", "security", "europe"],
+      "homepage": "https://www.nato.int/cps/en/natohq/news.htm",
+      "rss": [],
+      "search_hint": "site:nato.int/cps/en/natohq/news latest security defence"
+    },
+    {
+      "name": "IAEA",
+      "country_or_region": "International",
+      "language": "en",
+      "tier": 1,
+      "categories": ["nuclear", "energy", "security"],
+      "homepage": "https://www.iaea.org/newscenter",
+      "rss": [
+        "https://www.iaea.org/newscenter/rss/news"
+      ],
+      "search_hint": "site:iaea.org/newscenter latest nuclear Iran Ukraine"
+    }
+  ]
+}

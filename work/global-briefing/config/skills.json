@@ -1,0 +1,286 @@
+{
+  "version": 2,
+  "updated": "2026-06-13",
+  "routing_policy": {
+    "daily": "Use lightweight evidence, market-context, sentiment, risk, forecast-review, and report-quality skills during the daily briefing.",
+    "conditional": "Use heavier charting, notebook, ML, walk-forward, visualization, or external-credential skills only for weekly/monthly validation, explicit user requests, or when the needed inputs are already available.",
+    "safety": "Skills support evidence, critique, scenario analysis, and virtual paper-trading records only. They must not produce real-money instructions."
+  },
+  "daily_default_skills": [
+    {
+      "name": "global-briefing-runbook",
+      "use_for": "project-specific orchestration of the daily briefing, dated storage, required setup commands, prediction recording, and final write step"
+    },
+    {
+      "name": "briefing-source-health",
+      "use_for": "source freshness, fallback quality, citation diversity, quote limitations, and pre-save evidence-quality checks"
+    },
+    {
+      "name": "forecast-scorecard",
+      "use_for": "review prior predictions, generate scorecards, validate prediction records, and update forecast self-iteration"
+    },
+    {
+      "name": "paper-attribution-review",
+      "use_for": "US and CHINA virtual paper-trading state, risk limits, virtual order records, mark-to-market, and attribution review"
+    },
+    {
+      "name": "china-market-routing",
+      "use_for": "A-share, Hong Kong, China ETF/index mapping, China quote-source limitations, and CHINA paper-trading candidate routing"
+    },
+    {
+      "name": "alphaear-news",
+      "use_for": "multi-source financial news and trend discovery, especially China/US/HK market-moving news"
+    },
+    {
+      "name": "alphaear-stock",
+      "use_for": "A-share, HK, and US ticker lookup plus recent price-history context"
+    },
+    {
+      "name": "alphaear-sentiment",
+      "use_for": "financial text sentiment scoring for headlines, policy news, and market narratives"
+    },
+    {
+      "name": "alphaear-signal-tracker",
+      "use_for": "track whether prior forecast and trade signals are strengthening, weakening, or falsified"
+    },
+    {
+      "name": "alphaear-search",
+      "use_for": "finance-focused web/local search when ordinary browsing needs a focused retrieval pass"
+    },
+    {
+      "name": "alphaear-reporter",
+      "use_for": "turn research notes into a structured finance report and chart plan"
+    },
+    {
+      "name": "market-news-analyst",
+      "use_for": "rank recent market-moving news by likely impact on equities, rates, commodities, and FX"
+    },
+    {
+      "name": "market-environment-analysis",
+      "use_for": "daily global market environment, risk-on/risk-off tone, sectors, forex, commodities, and technical backdrop"
+    },
+    {
+      "name": "macro-regime-detector",
+      "use_for": "detect medium-term macro regime changes and broadening/concentration signals"
+    },
+    {
+      "name": "scenario-analyzer",
+      "use_for": "translate major geopolitical, macro, technology, climate, and military events into explicit scenarios"
+    },
+    {
+      "name": "theme-detector",
+      "use_for": "identify hot/cold market themes, lifecycle stage, and bullish/bearish narrative pressure"
+    },
+    {
+      "name": "sector-analyst",
+      "use_for": "sector rotation, cyclical/defensive positioning, and market-cycle context"
+    },
+    {
+      "name": "market-breadth-analyzer",
+      "use_for": "US market breadth and rally-health checks using public breadth data"
+    },
+    {
+      "name": "data-quality-checker",
+      "use_for": "pre-publication checks for ticker, date, unit, allocation, and price-scale mistakes"
+    },
+    {
+      "name": "risk-management",
+      "use_for": "portfolio risk guardrails, drawdown controls, exposure limits, and circuit-breaker thinking for virtual accounts"
+    },
+    {
+      "name": "portfolio-analytics",
+      "use_for": "paper-account return, risk, exposure, rolling-performance, and drawdown summaries when data is available"
+    },
+    {
+      "name": "trade-journal",
+      "use_for": "structured paper-trade logging, attribution, and behavioral/error-pattern review"
+    },
+    {
+      "name": "signal-classification",
+      "use_for": "classify forecast/trade signals by evidence quality, trend, regime fit, and falsification risk"
+    },
+    {
+      "name": "regime-detection",
+      "use_for": "shorter-term volatility/trend regime classification for adaptive forecast framing"
+    },
+    {
+      "name": "yfinance-data",
+      "use_for": "ticker price context, historical movement, financial statements, options chain, dividends, earnings, and analyst data"
+    },
+    {
+      "name": "stock-correlation",
+      "use_for": "peer mapping, sector baskets, related-ticker discovery, and scenario-to-theme validation"
+    },
+    {
+      "name": "stock-liquidity",
+      "use_for": "liquidity and tradability checks before naming a stock or ETF as an observation candidate"
+    },
+    {
+      "name": "finance-sentiment",
+      "use_for": "sentiment and attention checks when social or prediction-market heat is relevant"
+    },
+    {
+      "name": "funda-data",
+      "use_for": "institutional-style research synthesis, filings, transcripts, sector and supply-chain research when available"
+    },
+    {
+      "name": "tradingview-reader",
+      "use_for": "read-only market quotes, screeners, news, options chains, watchlists, alerts, and TradingView context when available"
+    },
+    {
+      "name": "hormuz-strait",
+      "use_for": "Middle East shipping, Gulf energy chokepoint risk, tanker traffic, oil-risk premium, and insurance risk"
+    },
+    {
+      "name": "earnings-preview",
+      "use_for": "upcoming earnings catalysts for named stock candidates"
+    },
+    {
+      "name": "earnings-recap",
+      "use_for": "post-earnings verification and explanation for candidate moves"
+    },
+    {
+      "name": "estimate-analysis",
+      "use_for": "analyst estimate revision trends and growth expectation changes"
+    },
+    {
+      "name": "company-valuation",
+      "use_for": "valuation context when a single-stock candidate needs fundamental support"
+    },
+    {
+      "name": "etf-premium",
+      "use_for": "ETF premium/discount checks for ETF candidates or unusual ETF moves"
+    },
+    {
+      "name": "saas-valuation-compression",
+      "use_for": "SaaS valuation multiple compression or funding-round valuation shifts"
+    }
+  ],
+  "conditional_skills": [
+    {
+      "name": "jupyter-notebook",
+      "use_when": "weekly/monthly forecast scorecards, notebook-based backtests, portfolio analytics notebooks, or user-requested research notebooks"
+    },
+    {
+      "name": "alphaear-predictor",
+      "use_when": "time-series forecast adjustment is needed and data quality is adequate; label outputs as model-assisted hypotheses"
+    },
+    {
+      "name": "alphaear-logic-visualizer",
+      "use_when": "the user asks for a logic-chain diagram or the weekly/monthly review needs a transmission-chain artifact"
+    },
+    {
+      "name": "technical-analyst",
+      "use_when": "chart images or weekly technical chart context are available; avoid chart-only conclusions in the daily briefing"
+    },
+    {
+      "name": "breadth-chart-analyst",
+      "use_when": "market breadth charts or public breadth CSVs are needed for tactical/strategic breadth review"
+    },
+    {
+      "name": "us-stock-analysis",
+      "use_when": "a US single-stock candidate needs a deeper combined fundamental/technical report"
+    },
+    {
+      "name": "institutional-flow-tracker",
+      "use_when": "13F ownership or institutional accumulation/distribution context matters for a US equity thesis"
+    },
+    {
+      "name": "earnings-calendar",
+      "use_when": "weekly earnings calendar is needed and FMP API credentials/data are available"
+    },
+    {
+      "name": "economic-calendar-fetcher",
+      "use_when": "upcoming central bank, inflation, jobs, GDP, or other economic-calendar events are needed and FMP API credentials/data are available"
+    },
+    {
+      "name": "earnings-trade-analyzer",
+      "use_when": "post-earnings momentum or earnings-gap scoring is relevant to a candidate"
+    },
+    {
+      "name": "trade-performance-coach",
+      "use_when": "weekly/monthly review of paper-trading decision quality, misses, false positives, and process errors"
+    },
+    {
+      "name": "ohlcv-processing",
+      "use_when": "market data needs resampling, gap handling, anomaly detection, normalization, or multi-source merging"
+    },
+    {
+      "name": "trading-visualization",
+      "use_when": "the user asks for charts or weekly/monthly reports need candlesticks, equity curves, drawdowns, heatmaps, or distributions"
+    },
+    {
+      "name": "volatility-modeling",
+      "use_when": "volatility regime, volatility cone, EWMA/GARCH-style analysis, or risk forecast is needed"
+    },
+    {
+      "name": "walk-forward-validation",
+      "use_when": "strategy, forecast, or ML-signal validation needs time-series-aware walk-forward evaluation"
+    },
+    {
+      "name": "feature-engineering",
+      "use_when": "building ML-style forecast features from price, volume, macro, news, or microstructure data"
+    },
+    {
+      "name": "market-microstructure-traditional",
+      "use_when": "execution quality, order-book, spread, liquidity, or market-structure context is relevant"
+    },
+    {
+      "name": "fixed-income",
+      "use_when": "bond pricing, yield-curve, duration, convexity, or rates-market context is explicitly needed; this installed skill is a stub, so use cautiously"
+    },
+    {
+      "name": "options-payoff",
+      "use_when": "the report discusses explicit options structures or needs payoff visualization; do not use for ordinary stock observation lists"
+    },
+    {
+      "name": "sepa-strategy",
+      "use_when": "the user explicitly asks for SEPA/Minervini/growth-stock setup analysis; do not let it create real-money buy instructions in the daily briefing"
+    },
+    {
+      "name": "vectorbt-expert",
+      "use_when": "weekly/monthly forecast validation, historical event-study design, strategy backtesting, or hypothesis testing"
+    },
+    {
+      "name": "quick-stats",
+      "use_when": "fast lightweight check of a ticker or ETF candidate against a benchmark"
+    },
+    {
+      "name": "backtest",
+      "use_when": "the user explicitly asks to generate a full backtest script or the automation is running a scheduled weekly validation report"
+    },
+    {
+      "name": "optimize",
+      "use_when": "the user explicitly asks to optimize a strategy or compare parameters"
+    },
+    {
+      "name": "strategy-compare",
+      "use_when": "the user explicitly asks to compare several strategies on the same ticker"
+    },
+    {
+      "name": "setup",
+      "use_when": "the user explicitly asks to set up the vectorbt Python environment; do not run during daily briefing automation"
+    }
+  ],
+  "deferred_or_not_enabled": [
+    {
+      "source": "daloopa/daloopa-plugin-codex",
+      "reason": "Potentially useful for institutional US fundamental data, but it depends on Daloopa MCP/data access; do not add to daily automation until credentials and connector are configured."
+    },
+    {
+      "source": "agiprolabs crypto/DeFi execution skills",
+      "reason": "Most are crypto/DeFi execution-specific and outside the current US/China equity paper-trading scope."
+    },
+    {
+      "source": "official Notion/Sentry/speech/transcribe skills",
+      "reason": "Useful only if the user asks for Notion publishing, Sentry integration, audio ingestion, or transcription workflows."
+    }
+  ],
+  "guardrails": [
+    "Use these skills for evidence, context, and hypothesis testing, not as automatic real trade execution logic.",
+    "Daily stock/ETF output remains informational research and virtual-paper-trading records, not personalized advice.",
+    "Do not provide real-money position sizing, target prices, stop losses, or buy/sell instructions in automated briefings.",
+    "For paper trading, keep US and CHINA accounts separate and respect paper_trading.json risk limits.",
+    "If a skill requires unavailable credentials, desktop app state, or heavy local dependencies, note that limitation in the saved report and continue using cited public sources."
+  ]
+}

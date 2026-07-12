@@ -1,0 +1,2 @@
+-r work/global-briefing/requirements.txt
+-e work/trading-core

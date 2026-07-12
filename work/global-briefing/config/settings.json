@@ -1,0 +1,171 @@
+{
+  "timezone": "Asia/Shanghai",
+  "report_file": "outputs/每日全球晨间简报-YYYY-MM-DD.md",
+  "legacy_combined_report_file": "outputs/每日全球晨间简报.md",
+  "weekly_summary_file": "outputs/每周全球简报总结-YYYY-Www.md",
+  "monthly_summary_file": "outputs/每月全球简报总结-YYYY-MM.md",
+  "evolution_config": "work/global-briefing/config/evolution.json",
+  "self_healing_config": "work/global-briefing/config/self_healing.json",
+  "improvement_tracking_config": "work/global-briefing/config/improvement_tracking.json",
+  "self_healing_commands": [
+    "python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict",
+    "python atlas.py heal --date YYYY-MM-DD --apply-safe --deep --strict",
+    "python atlas.py heal --status --json"
+  ],
+  "evolution_outputs": {
+    "daily_scorecard": "work/global-briefing/data/scorecard-day-YYYY-MM-DD.json",
+    "weekly_scorecard": "work/global-briefing/data/scorecard-week-YYYY-MM-DD.json",
+    "monthly_scorecard": "work/global-briefing/data/scorecard-month-YYYY-MM-DD.json",
+    "paper_attribution": "work/global-briefing/data/paper-attribution-PERIOD-YYYY-MM-DD.json",
+    "weekly_review": "outputs/每周预测复盘-YYYY-Www.md",
+    "monthly_review": "outputs/每月预测复盘-YYYY-MM.md"
+  },
+  "evolution_commands": [
+    "python work/global-briefing/scripts/evolution.py update-policy --period month --date YYYY-MM-DD",
+    "python work/global-briefing/scripts/evolution.py scorecard --period day --date YYYY-MM-DD --write",
+    "python work/global-briefing/scripts/evolution.py paper-attribution --period day --date YYYY-MM-DD --write",
+    "python work/global-briefing/scripts/evolution.py validate-records --period day --date YYYY-MM-DD",
+    "python work/global-briefing/scripts/evolution.py write-review --period week --date YYYY-MM-DD",
+    "python work/global-briefing/scripts/evolution.py write-review --period month --date YYYY-MM-DD"
+  ],
+  "storage_policy": [
+    "Each daily briefing is saved as a separate dated Markdown file.",
+    "Do not append daily reports into a combined Markdown file.",
+    "Before generating a daily briefing, read the previous day's dated report with briefing_store.py previous --date YYYY-MM-DD.",
+    "Generate separate weekly and monthly summary Markdown files with write-summary."
+  ],
+  "predictions_file": "work/global-briefing/data/predictions.jsonl",
+  "prediction_contract": {
+    "schema_version": 2,
+    "enforce_from_date": "2026-07-12",
+    "probability_format": "numeric_open_interval_0_1",
+    "required_original_fields": [
+      "prediction_id",
+      "date",
+      "deadline",
+      "horizon",
+      "scenario",
+      "probability",
+      "trigger",
+      "verification_signals",
+      "falsification_signals",
+      "resolution",
+      "evidence"
+    ],
+    "required_resolution_fields": [
+      "question",
+      "success_criteria",
+      "failure_criteria"
+    ],
+    "market_mapping_rule": "When tickers are named, every ticker needs symbol, direction, benchmark, verification_rule, and an evaluation_deadline aligned to an observable market session.",
+    "review_rule": "Proper scoring requires review.observed_outcome in {0,1}, review_date at/after deadline unless terminal_evidence=true, and resolution evidence."
+  },
+  "research_evaluation": {
+    "proper_scoring": ["brier_score", "log_loss", "expected_calibration_error"],
+    "minimum_sample": 30,
+    "minimum_resolved_coverage_pct": 80.0,
+    "maximum_brier": 0.25,
+    "maximum_expected_calibration_error": 0.15,
+    "legacy_status_scores_are_research_metrics": false,
+    "promotion_requires_all_gates": true
+  },
+  "paper_trading_config": "work/global-briefing/config/paper_trading.json",
+  "china_watchlist": "work/global-briefing/config/china_watchlist.json",
+  "china_market_snapshot": "work/global-briefing/data/china-market-snapshot-YYYY-MM-DD.json",
+  "paper_accounts": {
+    "US": {
+      "initial_cash": 100000,
+      "portfolio_file": "work/global-briefing/data/paper_portfolio_us.json",
+      "trades_file": "work/global-briefing/data/paper_trades_us.jsonl",
+      "valuations_file": "work/global-briefing/data/paper_valuations_us.jsonl"
+    },
+    "CHINA": {
+      "initial_cash": 100000,
+      "portfolio_file": "work/global-briefing/data/paper_portfolio_china.json",
+      "trades_file": "work/global-briefing/data/paper_trades_china.jsonl",
+      "valuations_file": "work/global-briefing/data/paper_valuations_china.jsonl"
+    }
+  },
+  "paper_portfolio_file": "work/global-briefing/data/paper_portfolio.json",
+  "paper_trades_file": "work/global-briefing/data/paper_trades.jsonl",
+  "paper_valuations_file": "work/global-briefing/data/paper_valuations.jsonl",
+  "rss_cache_dir": "work/global-briefing/data",
+  "news_research_policy": {
+    "mode": "deep",
+    "enforce_from_date": "2026-07-12",
+    "collection_lookback_hours": 72,
+    "core_story_count": 5,
+    "secondary_story_count": 5,
+    "minimum_sources_per_core_story": 3,
+    "minimum_independent_domains_per_core_story": 2,
+    "minimum_regions_per_geopolitical_story": 2,
+    "require_primary_source_for_high_impact_story": true,
+    "require_event_region_source": true,
+    "require_external_verification_source": true,
+    "required_story_layers": [
+      "confirmed_facts",
+      "claims_and_attribution",
+      "chronology",
+      "actors_and_incentives",
+      "causal_chain",
+      "counterevidence",
+      "market_transmission",
+      "second_order_effects",
+      "verification_signals"
+    ],
+    "quality_gate": {
+      "minimum_report_characters": 5000,
+      "maximum_report_characters": 12000,
+      "minimum_distinct_links": 12,
+      "minimum_distinct_domains": 8,
+      "minimum_topic_characters": 180,
+      "minimum_topic_links": 1
+    },
+    "ranking_weights": {
+      "source_quality": 0.25,
+      "cross_source_confirmation": 0.2,
+      "freshness": 0.15,
+      "global_impact": 0.15,
+      "market_relevance": 0.15,
+      "novelty": 0.1
+    },
+    "anti_shallow_rules": [
+      "Do not promote a headline to a core story without a causal mechanism and an explicit falsification signal.",
+      "Do not treat multiple outlets repeating one wire story as independent confirmation.",
+      "For conflict claims, record the claimant, verification status, and the strongest known counterclaim.",
+      "Separate event correctness from market-mapping correctness.",
+      "Explain at least one second-order effect for every core story."
+    ]
+  },
+  "news_research_commands": [
+    "python work/global-briefing/scripts/rss_collect.py --timeout 10 --lookback-hours 72",
+    "python work/global-briefing/scripts/news_intelligence.py --input work/global-briefing/data/rss-items-YYYY-MM-DD.json --output work/global-briefing/data/news-intelligence-YYYY-MM-DD.json"
+  ],
+  "deep_briefing_workflow": [
+    "Read news-intelligence-YYYY-MM-DD.json before web verification and use core_research_queue as the starting research backlog, not as confirmed facts.",
+    "For each core story, close primary_source_missing, independent_confirmation_missing, and cross_region_perspective_missing gaps with fresh web verification when feasible.",
+    "Open and verify source pages; do not write from RSS titles or snippets alone.",
+    "Use at least three genuinely independent sources for high-impact stories: one primary or institutional source, one event-region source, and one external wire or major outlet.",
+    "Write chronology, actors and incentives, causal mechanism, counterevidence, second-order effects, market transmission, and falsification signals for every core story.",
+    "If a required gap cannot be closed, label the claim attributed or provisional and reduce confidence instead of filling the section with generic context."
+  ],
+  "report_title_suffix": "每日全球晨间简报",
+  "chat_reply_policy": "After saving the report, reply only with a short confirmation and the report path unless the user explicitly asks to display the full briefing.",
+  "finance_guardrails": [
+    "Stock and ETF ideas are informational research observations only.",
+    "Do not provide personalized financial advice, portfolio sizing, target prices, or guaranteed returns.",
+    "Every ticker must include thesis, risk, and verification signal."
+  ],
+  "paper_trading_guardrails": [
+    "Paper trading uses virtual points only and never places real orders.",
+    "US and China markets use separate paper-trading accounts, each with 100000 initial virtual points.",
+    "Do not merge US and China account cash, positions, buying power, or performance.",
+    "Daily paper-trading actions may include BUY, SELL, or HOLD, but remain simulation records.",
+    "No leverage, shorts, options, derivatives, or real-money execution unless the user explicitly changes the rules.",
+    "Each virtual order must include ticker, exchange or market, price source, thesis, risk, and reason.",
+    "Read strategy_profile in paper_trading.json before each daily decision and apply its aggressive signal thresholds and target invested range.",
+    "When fresh prices and a candidate score meet the configured threshold, prefer a small number of virtual BUY, ADD, REDUCE, or SELL actions over passive HOLD.",
+    "In aggressive mode, HOLD must cite an explicit allowed blocker; generic uncertainty is not sufficient.",
+    "Hard risk limits, account separation, market routing, A-share lot/T+1 rules, and the simulation-only boundary always override the aggressive decision preference."
+  ]
+}

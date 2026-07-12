@@ -1,0 +1,38 @@
+{
+  "schema_version": 1,
+  "mode": "safe_closed_loop",
+  "max_repairs_per_run": 4,
+  "max_attempts_per_issue": 3,
+  "cooldown_minutes": 60,
+  "lock_stale_minutes": 120,
+  "rollback_on_verification_failure": true,
+  "auto_fix_risks": ["low"],
+  "blocking_severities": ["critical"],
+  "deep_checks": {
+    "briefing_tests": true,
+    "site_quality": true,
+    "dependency_audit": false
+  },
+  "boundaries": {
+    "may_change_derived_artifacts": true,
+    "may_change_source_code": false,
+    "may_change_research_conclusions": false,
+    "may_change_prediction_probabilities": false,
+    "may_change_paper_trading_orders": false,
+    "may_deploy_production": false,
+    "may_place_real_orders": false
+  },
+  "checks": {
+    "report_exists": {"severity": "critical", "risk": "high"},
+    "research_operational_gate": {"severity": "critical", "risk": "high"},
+    "research_quality_artifact": {"severity": "medium", "risk": "low"},
+    "site_payload_freshness": {"severity": "high", "risk": "low"},
+    "site_state_consistency": {"severity": "medium", "risk": "low"},
+    "macro_bridge_freshness": {"severity": "medium", "risk": "low"},
+    "cycle_lock_health": {"severity": "high", "risk": "low"},
+    "latest_cycle_audit": {"severity": "high", "risk": "high"},
+    "briefing_tests": {"severity": "critical", "risk": "high"},
+    "site_quality": {"severity": "critical", "risk": "high"}
+    ,"improvement_tracker_current": {"severity": "critical", "risk": "low"}
+  }
+}
