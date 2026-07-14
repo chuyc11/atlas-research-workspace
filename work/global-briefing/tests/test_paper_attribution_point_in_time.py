@@ -26,6 +26,7 @@ class PaperAttributionPointInTimeTests(unittest.TestCase):
         config = {
             "initial_cash": 100000,
             "base_unit": "points",
+            "theme_registry_file": "paper_theme_registry.json",
             "accounts": {
                 "US": {
                     "account_id": "us-test",
@@ -48,10 +49,18 @@ class PaperAttributionPointInTimeTests(unittest.TestCase):
             },
         }
         MODULE.PAPER_CONFIG_PATH.write_text(json.dumps(config), encoding="utf-8")
+        (self.root / "paper_theme_registry.json").write_text(json.dumps({
+            "schema_version": 1,
+            "allowed_themes": ["test_theme", "china_technology"],
+            "entries": [
+                {"account": "US", "symbol": "OLD", "exchange": "NASDAQ", "primary_theme": "test_theme", "secondary_themes": [], "status": "verified", "effective_from": "2026-06-01", "evidence": ["test"]},
+                {"account": "CHINA", "symbol": "3033.HK", "exchange": "HK", "primary_theme": "china_technology", "secondary_themes": [], "status": "verified", "effective_from": "2026-06-01", "evidence": ["test"]},
+            ],
+        }), encoding="utf-8")
         (self.root / "data").mkdir()
         (self.root / "data" / "us-trades.jsonl").write_text(
             "".join(json.dumps(row) + "\n" for row in [
-                {"date": "2026-06-12", "action": "BUY", "symbol": "OLD", "exchange": "NASDAQ", "currency": "USD", "quantity": 10, "price": 100, "gross_value": 1000, "fee": 0, "prediction_id": "P-OLD"},
+                {"date": "2026-06-12", "price_date": "2026-06-11", "action": "BUY", "symbol": "OLD", "exchange": "NASDAQ", "currency": "USD", "quantity": 10, "price": 100, "gross_value": 1000, "fee": 0, "prediction_id": "P-OLD"},
                 {"date": "2026-06-16", "action": "BUY", "symbol": "FUTURE", "exchange": "NASDAQ", "currency": "USD", "quantity": 10, "price": 50, "gross_value": 500, "fee": 0, "prediction_id": "P-FUTURE"},
             ]),
             encoding="utf-8",
@@ -75,9 +84,60 @@ class PaperAttributionPointInTimeTests(unittest.TestCase):
 
         self.assertEqual([item["symbol"] for item in us["positions"]], ["OLD"])
         self.assertEqual(us["latest_valuation"]["valuation_source"], "reconstructed_point_in_time_from_trades")
+        self.assertEqual(us["positions"][0]["last_price_date"], "2026-06-11")
+        self.assertEqual(us["positions"][0]["last_price_date_provenance"], "explicit_ledger_field")
+        self.assertEqual(us["positions"][0]["theme"], "test_theme")
+        self.assertEqual(us["positions"][0]["theme_source"], "verified_registry")
         self.assertAlmostEqual(china["positions"][0]["market_value"], 4600.0)
         self.assertEqual(china["positions"][0]["base_currency"], "CNY")
         self.assertEqual({item["account"] for item in result["by_prediction"]}, {"US", "CHINA"})
+
+    def test_daily_attribution_uses_previous_valuation_and_reports_period_not_lifetime_pnl(self) -> None:
+        valuations = [
+            {
+                "date": "2026-06-13",
+                "price_snapshot": [{"key": "NASDAQ:OLD", "price": 100, "price_date": "2026-06-13", "currency": "USD", "fx_to_base": 1}],
+            },
+            {
+                "date": "2026-06-14",
+                "price_snapshot": [{"key": "NASDAQ:OLD", "price": 110, "price_date": "2026-06-14", "currency": "USD", "fx_to_base": 1}],
+            },
+        ]
+        (self.root / "data" / "us-valuations.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in valuations), encoding="utf-8"
+        )
+
+        result = MODULE.paper_attribution("day", "2026-06-14")
+        us = next(item for item in result["accounts"] if item["account"] == "US")
+        prediction = next(item for item in result["by_prediction"] if item["account"] == "US")
+
+        self.assertEqual(us["attribution_window"]["start_exclusive"], "2026-06-13")
+        self.assertEqual(us["attribution_window"]["basis"], "previous_recorded_valuation")
+        self.assertAlmostEqual(us["period_performance"]["period_pnl"], 100.0)
+        self.assertAlmostEqual(us["period_performance"]["reconciliation_difference"], 0.0)
+        self.assertAlmostEqual(prediction["period_pnl"], 100.0)
+        self.assertAlmostEqual(prediction["unrealized_pnl"], 100.0)
+
+    def test_legacy_account_equity_difference_is_exposed_not_hidden_in_position_attribution(self) -> None:
+        valuations = [
+            {"date": "2026-06-13", "equity": 99950.0},
+            {
+                "date": "2026-06-14",
+                "equity": 100100.0,
+                "price_snapshot": [{"key": "NASDAQ:OLD", "price": 110, "price_date": "2026-06-14", "currency": "USD", "fx_to_base": 1}],
+            },
+        ]
+        (self.root / "data" / "us-valuations.jsonl").write_text(
+            "".join(json.dumps(row) + "\n" for row in valuations), encoding="utf-8"
+        )
+
+        result = MODULE.paper_attribution("day", "2026-06-14")
+        us = next(item for item in result["accounts"] if item["account"] == "US")
+
+        self.assertAlmostEqual(us["period_performance"]["period_pnl"], 150.0)
+        self.assertAlmostEqual(us["period_performance"]["attributed_period_pnl"], 100.0)
+        self.assertAlmostEqual(us["period_performance"]["reconciliation_difference"], 50.0)
+        self.assertEqual(us["period_performance"]["reconciliation_status"], "legacy_position_mark_gap")
 
 
 if __name__ == "__main__":

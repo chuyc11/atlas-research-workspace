@@ -38,6 +38,11 @@ HORIZON_DAYS = {"1d": 1, "1w": 7, "1m": 30}
 CLOSED_STATUSES = {"validated", "partial", "wrong", "expired"}
 LINK_RE = re.compile(r"\[[^\]]+\]\((https?://[^)\s]+)\)")
 PREDICTION_ID_RE = re.compile(r"^\d{4}-\d{2}-\d{2}-P\d{2,}$")
+SHA256_RE = re.compile(r"^[a-fA-F0-9]{64}$")
+DIRECT_MARKET_SOURCE_TERMS = (
+    "market data", "quote", "snapshot", "tencent", "yahoo", "finance",
+    "行情", "报价", "收盘", "快照",
+)
 
 
 def parse_date(value: Any) -> date_type:
@@ -56,6 +61,26 @@ def read_json(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ValueError(f"Expected a JSON object: {path}")
     return value
+
+
+def prediction_family_indexes(registry: dict[str, Any] | None) -> tuple[dict[str, str], dict[str, str]]:
+    """Return prediction and mapping lookup tables from the append-only family sidecar."""
+    event_index: dict[str, str] = {}
+    market_index: dict[str, str] = {}
+    for family_id, prediction_ids in (registry or {}).get("event_families", {}).items():
+        if isinstance(prediction_ids, list):
+            for prediction_id in prediction_ids:
+                event_index[str(prediction_id)] = str(family_id)
+    for thesis_id, mapping_ids in (registry or {}).get("market_theses", {}).items():
+        if isinstance(mapping_ids, list):
+            for mapping_id in mapping_ids:
+                market_index[str(mapping_id).upper()] = str(thesis_id)
+    return event_index, market_index
+
+
+def direct_auditable_url(value: Any) -> bool:
+    parsed = urlparse(str(value or ""))
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and parsed.path not in {"", "/"}
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -132,10 +157,18 @@ def market_mapping_key(prediction_id: str, mapping: dict[str, Any]) -> str:
     )
 
 
-def canonical_market_thesis_key(prediction_id: str, mapping: dict[str, Any]) -> str:
-    """Collapse reciprocal A-vs-B/B-vs-A rows into one independent thesis."""
+def canonical_market_thesis_key(
+    prediction_id: str,
+    mapping: dict[str, Any],
+    market_family_index: dict[str, str] | None = None,
+) -> str:
+    """Collapse reciprocal rows and rolling re-statements into one independent thesis."""
     symbol = str(mapping.get("symbol") or "").strip().upper()
     benchmark = str(mapping.get("benchmark") or "").strip().upper()
+    explicit = str(mapping.get("market_thesis_id") or "").strip()
+    registered = (market_family_index or {}).get(f"{prediction_id}|{symbol}".upper())
+    if explicit or registered:
+        return explicit or str(registered)
     evaluation = mapping.get("evaluation") if isinstance(mapping.get("evaluation"), dict) else {}
     return "|".join(
         (
@@ -328,6 +361,8 @@ def validate_v2_prediction(
     *,
     machine_evaluation_enforce_from_date: str | None = None,
     event_asset_separation_enforce_from_date: str | None = None,
+    independence_enforce_from_date: str | None = None,
+    evidence_reproducibility_enforce_from_date: str | None = None,
 ) -> list[str]:
     """Validate the pre-registered v2 prediction contract."""
     errors: list[str] = []
@@ -341,6 +376,20 @@ def validate_v2_prediction(
     except (TypeError, ValueError):
         prediction_day = None
         errors.append(f"{prediction_id}: date must be YYYY-MM-DD")
+    enforce_independence = bool(
+        independence_enforce_from_date
+        and prediction_day
+        and date_on_or_after(prediction_day, parse_date(independence_enforce_from_date))
+    )
+    enforce_reproducibility = bool(
+        evidence_reproducibility_enforce_from_date
+        and prediction_day
+        and date_on_or_after(prediction_day, parse_date(evidence_reproducibility_enforce_from_date))
+    )
+    if enforce_independence:
+        for field in ("event_family_id", "baseline_state", "novelty_delta", "independence_rationale"):
+            if len(str(record.get(field) or "").strip()) < (6 if field == "event_family_id" else 20):
+                errors.append(f"{prediction_id}: {field} is required for independent-sample governance")
     if str(record.get("horizon") or "").lower() not in HORIZON_DAYS:
         errors.append(f"{prediction_id}: horizon must be one of {sorted(HORIZON_DAYS)}")
     try:
@@ -371,6 +420,20 @@ def validate_v2_prediction(
         for index, item in enumerate(evidence):
             if not isinstance(item, dict) or not str(item.get("source") or "").strip() or not str(item.get("url") or "").startswith("http"):
                 errors.append(f"{prediction_id}: evidence[{index}] requires source and http(s) url")
+                continue
+            if enforce_reproducibility and not direct_auditable_url(item.get("url")):
+                errors.append(f"{prediction_id}: evidence[{index}].url must identify a direct auditable page")
+            if enforce_reproducibility and not str(item.get("retrieved_at") or "").strip():
+                errors.append(f"{prediction_id}: evidence[{index}].retrieved_at is required")
+            source_name = str(item.get("source") or "").lower()
+            is_market_snapshot = any(term in source_name for term in DIRECT_MARKET_SOURCE_TERMS)
+            if enforce_reproducibility and is_market_snapshot:
+                if not str(item.get("artifact_path") or "").strip():
+                    errors.append(f"{prediction_id}: evidence[{index}].artifact_path is required for market data")
+                if not SHA256_RE.fullmatch(str(item.get("artifact_sha256") or "")):
+                    errors.append(f"{prediction_id}: evidence[{index}].artifact_sha256 must be a SHA-256 digest")
+                if not str(item.get("query") or "").strip():
+                    errors.append(f"{prediction_id}: evidence[{index}].query is required for market data")
     mappings = record.get("market_mapping")
     tickers = record.get("tickers")
     ticker_symbols = {
@@ -397,6 +460,8 @@ def validate_v2_prediction(
             for field in ("symbol", "direction", "benchmark", "verification_rule", "evaluation_deadline"):
                 if not str(item.get(field) or "").strip():
                     errors.append(f"{prediction_id}: market_mapping[{index}].{field} is required")
+            if enforce_independence and len(str(item.get("market_thesis_id") or "").strip()) < 6:
+                errors.append(f"{prediction_id}: market_mapping[{index}].market_thesis_id is required")
             symbol = str(item.get("symbol") or "").strip().upper()
             if symbol:
                 mapped_symbols.add(symbol)
@@ -548,6 +613,7 @@ def proper_scoring_metrics(
     minimum_sample: int = 30,
     maximum_brier: float = 0.25,
     maximum_ece: float = 0.15,
+    family_registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     cutoff_day = parse_date(cutoff)
     originals = original_records(records)
@@ -572,6 +638,7 @@ def proper_scoring_metrics(
     legacy_matured_count = len(all_matured) - len(matured_v2)
     samples: list[dict[str, Any]] = []
     exclusion_counts: Counter[str] = Counter()
+    event_family_index, _market_family_index = prediction_family_indexes(family_registry)
     if asset_only_matured:
         exclusion_counts["asset_only_prediction"] = len(asset_only_matured)
 
@@ -607,6 +674,7 @@ def proper_scoring_metrics(
         samples.append(
             {
                 "prediction_id": prediction_id,
+                "event_family_id": str(original.get("event_family_id") or event_family_index.get(prediction_id) or prediction_id),
                 "probability": probability,
                 "observed_outcome": outcome,
                 "brier": round(brier, 6),
@@ -614,10 +682,23 @@ def proper_scoring_metrics(
             }
         )
 
+    family_sample_counts = Counter(item["event_family_id"] for item in samples)
+    for item in samples:
+        item["independence_weight"] = round(1.0 / family_sample_counts[item["event_family_id"]], 8)
+    independent_family_count = len(family_sample_counts)
+    matured_family_ids = {
+        str(row.get("event_family_id") or event_family_index.get(prediction_id) or prediction_id)
+        for prediction_id, row in matured.items()
+    }
+    repeated_sample_count = len(samples) - independent_family_count
+    if repeated_sample_count:
+        exclusion_counts["rolling_family_restatement_downweighted"] = repeated_sample_count
+
     calibration_bins = []
     ece = None
     if samples:
         weighted_gap = 0.0
+        total_weight = sum(float(item["independence_weight"]) for item in samples)
         for lower in (0.0, 0.2, 0.4, 0.6, 0.8):
             upper = lower + 0.2
             members = [
@@ -626,14 +707,16 @@ def proper_scoring_metrics(
             ]
             if not members:
                 continue
-            mean_probability = sum(item["probability"] for item in members) / len(members)
-            outcome_rate = sum(item["observed_outcome"] for item in members) / len(members)
+            bin_weight = sum(float(item["independence_weight"]) for item in members)
+            mean_probability = sum(item["probability"] * float(item["independence_weight"]) for item in members) / bin_weight
+            outcome_rate = sum(item["observed_outcome"] * float(item["independence_weight"]) for item in members) / bin_weight
             gap = abs(mean_probability - outcome_rate)
-            weighted_gap += gap * len(members) / len(samples)
+            weighted_gap += gap * bin_weight / total_weight
             calibration_bins.append(
                 {
                     "range": [round(lower, 1), round(upper, 1)],
                     "count": len(members),
+                    "independence_weight": round(bin_weight, 6),
                     "mean_probability": round(mean_probability, 4),
                     "observed_rate": round(outcome_rate, 4),
                     "absolute_gap": round(gap, 4),
@@ -641,24 +724,28 @@ def proper_scoring_metrics(
             )
         ece = round(weighted_gap, 6)
 
-    mean_brier = round(sum(item["brier"] for item in samples) / len(samples), 6) if samples else None
-    mean_log_loss = round(sum(item["log_loss"] for item in samples) / len(samples), 6) if samples else None
-    resolved_coverage = len(samples) / len(matured) if matured else 0.0
+    total_weight = sum(float(item.get("independence_weight", 0.0)) for item in samples)
+    mean_brier = round(sum(item["brier"] * float(item["independence_weight"]) for item in samples) / total_weight, 6) if total_weight else None
+    mean_log_loss = round(sum(item["log_loss"] * float(item["independence_weight"]) for item in samples) / total_weight, 6) if total_weight else None
+    resolved_coverage = independent_family_count / len(matured_family_ids) if matured_family_ids else 0.0
     gates = {
-        "minimum_sample": len(samples) >= minimum_sample,
+        "minimum_sample": independent_family_count >= minimum_sample,
         "resolved_coverage_at_least_80pct": resolved_coverage >= 0.8,
         "brier_at_or_below_threshold": mean_brier is not None and mean_brier <= maximum_brier,
         "ece_at_or_below_threshold": ece is not None and ece <= maximum_ece,
     }
     return {
-        "metric_standard": "binary proper scoring; lower is better",
+        "metric_standard": "binary proper scoring with unit weight per independent event family; lower is better",
         "cutoff": cutoff,
         "matured_prediction_count": len(matured),
+        "matured_independent_event_family_count": len(matured_family_ids),
         "matured_v2_prediction_count": len(matured_v2),
         "asset_only_matured_prediction_count_excluded": len(asset_only_matured),
         "legacy_matured_prediction_count_excluded": legacy_matured_count,
         "total_matured_prediction_count": len(all_matured),
         "eligible_sample_count": len(samples),
+        "independent_event_family_count": independent_family_count,
+        "rolling_restatement_count_downweighted": repeated_sample_count,
         "resolved_coverage_pct": round(resolved_coverage * 100, 2),
         "brier_score": mean_brier,
         "log_loss": mean_log_loss,
@@ -667,6 +754,7 @@ def proper_scoring_metrics(
         "exclusion_counts": dict(sorted(exclusion_counts.items())),
         "thresholds": {
             "minimum_sample": minimum_sample,
+            "minimum_sample_unit": "independent_event_family",
             "maximum_brier": maximum_brier,
             "maximum_expected_calibration_error": maximum_ece,
             "minimum_resolved_coverage_pct": 80.0,
@@ -677,11 +765,17 @@ def proper_scoring_metrics(
     }
 
 
-def market_mapping_metrics(records: list[dict[str, Any]], *, cutoff: str) -> dict[str, Any]:
+def market_mapping_metrics(
+    records: list[dict[str, Any]],
+    *,
+    cutoff: str,
+    family_registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     """Score asset mappings independently from probabilistic event forecasts."""
     cutoff_day = parse_date(cutoff)
     originals = original_records(records)
     matured_groups: dict[str, list[dict[str, Any]]] = {}
+    _event_family_index, market_family_index = prediction_family_indexes(family_registry)
     for original in originals:
         if original.get("schema_version") != 2:
             continue
@@ -694,7 +788,7 @@ def market_mapping_metrics(records: list[dict[str, Any]], *, cutoff: str) -> dic
             except (TypeError, ValueError):
                 continue
             if evaluation_day < cutoff_day:
-                canonical_key = canonical_market_thesis_key(prediction_id, mapping)
+                canonical_key = canonical_market_thesis_key(prediction_id, mapping, market_family_index)
                 matured_groups.setdefault(canonical_key, []).append({
                     "prediction_id": prediction_id,
                     "mapping": mapping,
@@ -784,6 +878,8 @@ def audit_prediction_records(
     enforce_from_date: str,
     evaluation_config: dict[str, Any] | None = None,
     review_policy: dict[str, Any] | None = None,
+    prediction_contract: dict[str, Any] | None = None,
+    family_registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     originals = original_records(records)
     reviews = latest_reviews(records)
@@ -819,6 +915,12 @@ def audit_prediction_records(
                 ) or None,
                 event_asset_separation_enforce_from_date=str(
                     (review_policy or {}).get("event_asset_separation_enforce_from_date") or ""
+                ) or None,
+                independence_enforce_from_date=str(
+                    (prediction_contract or {}).get("independence_enforce_from_date") or ""
+                ) or None,
+                evidence_reproducibility_enforce_from_date=str(
+                    (prediction_contract or {}).get("evidence_reproducibility_enforce_from_date") or ""
                 ) or None,
             ))
     for review_row in all_review_rows:
@@ -877,7 +979,7 @@ def audit_prediction_records(
         for prediction_id, original in matured_v2.items()
         if not review_is_valid_for_resolution(original, reviews.get(prediction_id))
     )
-    mapping_metrics = market_mapping_metrics(records, cutoff=cutoff)
+    mapping_metrics = market_mapping_metrics(records, cutoff=cutoff, family_registry=family_registry)
     resolved_mapping_keys = set(resolved_market_mapping_index(records))
     unresolved_matured_v2_mappings: list[str] = []
     for prediction_id, original in original_by_id.items():
@@ -902,6 +1004,7 @@ def audit_prediction_records(
         minimum_sample=int(eval_config.get("minimum_sample", 30)),
         maximum_brier=float(eval_config.get("maximum_brier", 0.25)),
         maximum_ece=float(eval_config.get("maximum_expected_calibration_error", 0.15)),
+        family_registry=family_registry,
     )
     operational_errors = []
     if v2_duplicate_ids:
@@ -914,7 +1017,15 @@ def audit_prediction_records(
         operational_errors.append(
             "matured v2 predictions require valid resolution reviews: " + ", ".join(unresolved_matured_v2)
         )
-    if (review_policy or {}).get("block_deployment_on_unresolved_due_v2_market") is True and unresolved_matured_v2_mappings:
+    market_block_from = str(
+        (review_policy or {}).get("block_deployment_on_unresolved_due_v2_market_from_date") or "0001-01-01"
+    )
+    enforce_market_debt = date_on_or_after(cutoff, parse_date(market_block_from))
+    if (
+        (review_policy or {}).get("block_deployment_on_unresolved_due_v2_market") is True
+        and enforce_market_debt
+        and unresolved_matured_v2_mappings
+    ):
         operational_errors.append(
             "matured v2 market mappings require valid independent resolutions: "
             + ", ".join(unresolved_matured_v2_mappings)
@@ -956,6 +1067,74 @@ def audit_prediction_records(
     }
 
 
+def core_story_blocks(text: str) -> list[dict[str, str]]:
+    matches = list(re.finditer(r"^###\s+核心主线[：:]\s*(.+?)\s*$", text, re.MULTILINE))
+    blocks: list[dict[str, str]] = []
+    for index, match in enumerate(matches):
+        next_heading = re.search(r"^#{1,3}\s+", text[match.end():], re.MULTILINE)
+        end = match.end() + next_heading.start() if next_heading else len(text)
+        blocks.append({"title": match.group(1).strip(), "body": text[match.end():end]})
+    return blocks
+
+
+def audit_core_story(block: dict[str, str], policy: dict[str, Any], *, enforce_roles: bool) -> dict[str, Any]:
+    body = block["body"]
+    links = {link for link in LINK_RE.findall(body) if direct_auditable_url(link)}
+    domains = sorted({urlparse(link).netloc.lower().removeprefix("www.") for link in links})
+    required_layers = {
+        "conclusion": "结论",
+        "hard_evidence": "硬证据",
+        "causal_mechanism": "机制",
+        "counterevidence": "反证",
+        "falsification_signal": "证伪",
+    }
+    missing_layers = [name for name, label in required_layers.items() if not re.search(rf"(?:\*\*)?{label}[：:]", body)]
+    primary_suffixes = tuple(policy.get("quality_gate", {}).get("primary_domain_suffixes", []))
+    primary_allowlist = {
+        str(domain).lower().removeprefix("www.")
+        for domain in policy.get("quality_gate", {}).get("primary_domain_allowlist", [])
+    }
+    primary_links = [
+        link for link in links
+        if any(urlparse(link).netloc.lower().endswith(suffix) for suffix in primary_suffixes)
+        or urlparse(link).netloc.lower().removeprefix("www.") in primary_allowlist
+    ]
+    role_match = re.search(r"(?:\*\*)?证据角色[：:]([^\n]+)", body)
+    role_text = role_match.group(1) if role_match else ""
+    role_links = set(LINK_RE.findall(role_text))
+    role_coverage = {
+        "primary": bool(re.search(r"一手来源\s*=", role_text)) and bool(role_links & links),
+        "event_region": bool(re.search(r"事件地区来源\s*=", role_text)) and bool(role_links & links),
+        "external_verification": bool(re.search(r"外部核验\s*=", role_text)) and bool(role_links & links),
+    }
+    errors: list[str] = []
+    minimum_sources = int(policy.get("minimum_sources_per_core_story", 0))
+    minimum_domains = int(policy.get("minimum_independent_domains_per_core_story", 0))
+    if len(links) < minimum_sources:
+        errors.append(f"needs {minimum_sources} direct sources; found {len(links)}")
+    if len(domains) < minimum_domains:
+        errors.append(f"needs {minimum_domains} independent domains; found {len(domains)}")
+    if policy.get("require_primary_source_for_high_impact_story") is True and not primary_links:
+        errors.append("needs a primary/institutional source")
+    if missing_layers:
+        errors.append("missing thesis layers: " + ", ".join(missing_layers))
+    if enforce_roles:
+        missing_roles = [name for name, present in role_coverage.items() if not present]
+        if missing_roles:
+            errors.append("missing linked evidence roles: " + ", ".join(missing_roles))
+    return {
+        "title": block["title"],
+        "direct_source_count": len(links),
+        "independent_domain_count": len(domains),
+        "primary_source_count": len(primary_links),
+        "missing_layers": missing_layers,
+        "role_coverage": role_coverage,
+        "roles_enforced": enforce_roles,
+        "errors": errors,
+        "passed": not errors,
+    }
+
+
 def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) -> dict[str, Any]:
     errors: list[str] = []
     warnings: list[str] = []
@@ -968,6 +1147,8 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
             "passed": False,
         }
     text = report_path.read_text(encoding="utf-8")
+    research_policy = policy if isinstance(policy.get("quality_gate"), dict) else {}
+    quality_policy = research_policy.get("quality_gate", policy)
     links = LINK_RE.findall(text)
     auditable_links = {
         link for link in links
@@ -977,10 +1158,10 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
     }
     domains = sorted({urlparse(link).netloc.lower().removeprefix("www.") for link in auditable_links})
     requirements = {
-        "minimum_report_characters": int(policy.get("minimum_report_characters", 0)),
-        "maximum_report_characters": int(policy.get("maximum_report_characters", 10**9)),
-        "minimum_distinct_links": int(policy.get("minimum_distinct_links", 0)),
-        "minimum_distinct_domains": int(policy.get("minimum_distinct_domains", 0)),
+        "minimum_report_characters": int(quality_policy.get("minimum_report_characters", 0)),
+        "maximum_report_characters": int(quality_policy.get("maximum_report_characters", 10**9)),
+        "minimum_distinct_links": int(quality_policy.get("minimum_distinct_links", 0)),
+        "minimum_distinct_domains": int(quality_policy.get("minimum_distinct_domains", 0)),
     }
     if len(text) < requirements["minimum_report_characters"]:
         errors.append("report is shorter than the configured minimum")
@@ -1011,6 +1192,29 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
     thin_layers = [name for name, count in layer_counts.items() if count < 3]
     if thin_layers:
         warnings.append(f"fewer than three explicit thesis layers: {', '.join(thin_layers)}")
+    report_date_match = re.search(r"20\d{2}-\d{2}-\d{2}", text[:500])
+    report_date = report_date_match.group(0) if report_date_match else "9999-12-31"
+    role_enforce_from = str(research_policy.get("story_evidence_enforce_from_date") or "9999-12-31")
+    enforce_story_evidence = bool(research_policy) and date_on_or_after(report_date, parse_date(role_enforce_from))
+    story_blocks = core_story_blocks(text)
+    story_audits = [
+        audit_core_story(block, research_policy, enforce_roles=enforce_story_evidence)
+        for block in story_blocks
+    ]
+    primary_min = int(research_policy.get("primary_thesis_min_items", 0))
+    primary_max = int(research_policy.get("primary_thesis_max_items", 5))
+    if enforce_story_evidence and len(story_blocks) < primary_min:
+        errors.append(f"report needs at least {primary_min} explicitly marked core thesis block(s)")
+    if len(story_blocks) > primary_max:
+        errors.append(f"report exceeds the {primary_max}-thesis maximum")
+    if enforce_story_evidence:
+        errors.extend(
+            f"core story '{item['title']}': {error}"
+            for item in story_audits
+            for error in item["errors"]
+        )
+    role_slots = len(story_audits) * 3
+    covered_role_slots = sum(sum(bool(value) for value in item["role_coverage"].values()) for item in story_audits)
     return {
         "path": str(report_path),
         "exists": True,
@@ -1021,6 +1225,12 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
         "domains": domains,
         "required_sections_missing": missing_sections,
         "thesis_layer_counts": layer_counts,
+        "primary_thesis_count": len(story_blocks),
+        "primary_thesis_maximum": primary_max,
+        "core_story_audits": story_audits,
+        "all_core_stories_passed": bool(story_audits) and all(item["passed"] for item in story_audits),
+        "story_evidence_enforced": enforce_story_evidence,
+        "source_role_coverage_pct": round(covered_role_slots / role_slots * 100, 2) if role_slots else 0.0,
         "requirements": requirements,
         "enforced": enforce,
         "errors": errors,
@@ -1040,17 +1250,24 @@ def build_quality_report(
     contract = settings.get("prediction_contract", {})
     enforce_from = str(contract.get("enforce_from_date") or "9999-12-31")
     research_config = settings.get("research_evaluation", {})
+    registry_file = str(contract.get("family_registry_file") or "").strip()
+    family_registry = read_json(ROOT / registry_file) if registry_file and (ROOT / registry_file).exists() else {}
+    research_config = dict(research_config)
+    research_config["minimum_sample"] = int(
+        research_config.get("minimum_independent_event_families", research_config.get("minimum_sample", 30))
+    )
     prediction_audit = audit_prediction_records(
         records,
         cutoff=date,
         enforce_from_date=enforce_from,
         evaluation_config=research_config,
         review_policy=settings.get("review_queue", {}),
+        prediction_contract=contract,
+        family_registry=family_registry,
     )
     news_policy = settings.get("news_research_policy", {})
-    quality_policy = news_policy.get("quality_gate", {})
     content_enforce_from = str(news_policy.get("enforce_from_date") or "9999-12-31")
-    report_audit = audit_report(report_path, quality_policy, enforce=parse_date(date) >= parse_date(content_enforce_from))
+    report_audit = audit_report(report_path, news_policy, enforce=parse_date(date) >= parse_date(content_enforce_from))
     operational_passed = prediction_audit["operational_passed"] and report_audit["passed"]
     research_ready = operational_passed and prediction_audit["proper_scoring"]["is_research_ready"]
     blockers = list(prediction_audit["operational_errors"])

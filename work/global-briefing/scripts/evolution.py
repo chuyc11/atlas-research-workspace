@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 from collections import Counter, defaultdict
 from datetime import date as date_type
@@ -18,7 +19,15 @@ SCRIPT_PATH = Path(__file__).resolve()
 if str(SCRIPT_PATH.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT_PATH.parent))
 
-from research_quality import audit_prediction_records
+from research_quality import (
+    audit_prediction_records,
+    is_matured_as_of,
+    maturity_date,
+    review_is_valid_for_resolution,
+    review_scope,
+)
+from paper_theme_registry import assignment_for as registry_theme_assignment
+from paper_theme_registry import load_registry as load_theme_registry
 
 ROOT = SCRIPT_PATH.parents[3]
 CONFIG_PATH = ROOT / "work" / "global-briefing" / "config" / "evolution.json"
@@ -137,7 +146,12 @@ def review_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for record in records:
         prediction_id = record.get("prediction_id")
-        if not prediction_id or not isinstance(record.get("review"), dict) or record.get("status") == "open":
+        if (
+            not prediction_id
+            or not isinstance(record.get("review"), dict)
+            or record.get("status") == "open"
+            or review_scope(record) not in {"event", "combined"}
+        ):
             continue
         latest[str(prediction_id)] = record
     return list(latest.values())
@@ -160,8 +174,7 @@ def review_day(record: dict[str, Any]) -> date_type:
 
 
 def maturity_day(record: dict[str, Any]) -> date_type:
-    horizon = str(record.get("horizon") or "1d").lower()
-    return parse_date(str(record.get("date"))[:10]) + timedelta(days=HORIZON_DAYS.get(horizon, 1))
+    return maturity_date(record)
 
 
 def record_integrity(date: str) -> dict[str, Any]:
@@ -173,9 +186,14 @@ def record_integrity(date: str) -> dict[str, Any]:
     matured = {
         prediction_id: original
         for prediction_id, original in originals.items()
-        if maturity_day(original) <= cutoff
+        if is_matured_as_of(original, cutoff)
     }
-    overdue = sorted(prediction_id for prediction_id in matured if prediction_id not in reviews)
+    valid_reviews = {
+        prediction_id: review
+        for prediction_id, review in reviews.items()
+        if prediction_id in originals and review_is_valid_for_resolution(originals[prediction_id], review)
+    }
+    overdue = sorted(prediction_id for prediction_id in matured if prediction_id not in valid_reviews)
     early_closed: list[str] = []
     nonvalidated = []
     explicit_scores = 0
@@ -186,7 +204,7 @@ def record_integrity(date: str) -> dict[str, Any]:
         review = review_record.get("review") if isinstance(review_record.get("review"), dict) else {}
         status = str(review_record.get("status") or "unknown").lower()
         status_counts[status] += 1
-        if original and review_day(review_record) < maturity_day(original) and review.get("terminal_evidence") is not True:
+        if original and not review_is_valid_for_resolution(original, review_record):
             early_closed.append(prediction_id)
         if isinstance(review.get("score") or review_record.get("score"), dict):
             explicit_scores += 1
@@ -212,6 +230,7 @@ def record_integrity(date: str) -> dict[str, Any]:
         "as_of": cutoff.isoformat(),
         "original_prediction_count": len(originals),
         "review_count": review_count,
+        "valid_review_count": len(valid_reviews),
         "matured_prediction_count": len(matured),
         "overdue_unreviewed_prediction_ids": overdue,
         "early_closed_without_terminal_evidence": sorted(early_closed),
@@ -334,13 +353,23 @@ def prediction_scorecard(period: str, date: str) -> dict[str, Any]:
     wrong = status_counts.get("wrong", 0) + status_counts.get("expired", 0)
     settings = read_json(SETTINGS_PATH) if SETTINGS_PATH.exists() else {}
     contract = settings.get("prediction_contract", {})
+    registry_file = str(contract.get("family_registry_file") or "").strip()
+    family_registry = read_json(ROOT / registry_file) if registry_file and (ROOT / registry_file).exists() else {}
+    evaluation_config = dict(settings.get("research_evaluation", {}))
+    evaluation_config["minimum_sample"] = int(
+        evaluation_config.get("minimum_independent_event_families", evaluation_config.get("minimum_sample", 30))
+    )
     research_audit = audit_prediction_records(
         records,
         cutoff=date,
         enforce_from_date=str(contract.get("enforce_from_date") or "9999-12-31"),
-        evaluation_config=settings.get("research_evaluation", {}),
+        evaluation_config=evaluation_config,
+        review_policy=settings.get("review_queue", {}),
+        prediction_contract=contract,
+        family_registry=family_registry,
     )
     proper_metrics = research_audit["proper_scoring"]
+    market_metrics = research_audit.get("market_mapping_scoring", {})
     return {
         "period": period,
         "start": start.isoformat(),
@@ -359,8 +388,10 @@ def prediction_scorecard(period: str, date: str) -> dict[str, Any]:
         "scored_reviews": scored,
         "integrity": record_integrity(date),
         "proper_scoring": proper_metrics,
+        "event_scoring": proper_metrics,
+        "market_mapping_scoring": market_metrics,
         "research_audit": research_audit,
-        "schema_note": "Component scores are a subjective diagnostic rubric. Legacy status defaults are compatibility-only; Brier/log loss/ECE are the research metrics.",
+        "schema_note": "Event Brier/log loss/ECE and benchmark-relative asset mapping results are separate research tracks. Component scores remain a subjective diagnostic rubric.",
     }
 
 
@@ -459,6 +490,28 @@ def latest_valuation(valuations: list[dict[str, Any]], end: date_type) -> dict[s
     return candidates[-1]
 
 
+def previous_valuation(valuations: list[dict[str, Any]], start: date_type) -> dict[str, Any] | None:
+    """Return the most recent recorded run strictly before the attribution period."""
+    candidates = [
+        record for record in valuations
+        if record.get("date") and parse_date(str(record["date"])[:10]) < start
+    ]
+    return candidates[-1] if candidates else None
+
+
+def marked_position_value(
+    position: dict[str, Any] | None,
+    price_book: dict[str, dict[str, Any]],
+    key: str,
+) -> float:
+    if not position:
+        return 0.0
+    mark = price_book.get(key, {})
+    price = float(mark.get("price", position.get("avg_cost", 0.0)))
+    fx_to_base = float(mark.get("fx_to_base", position.get("fx_to_base", 1.0)) or position.get("fx_to_base", 1.0))
+    return float(position.get("quantity", 0.0)) * price * fx_to_base
+
+
 def attribution_fx_rate(config: dict[str, Any], currency: Any, explicit: Any = None) -> float:
     if explicit not in (None, ""):
         rate = float(explicit)
@@ -471,6 +524,51 @@ def attribution_fx_rate(config: dict[str, Any], currency: Any, explicit: Any = N
     if rate <= 0:
         raise ValueError(f"Missing positive fx_to_base for {currency!r} in {config.get('account')} attribution.")
     return rate
+
+
+PRICE_DATE_PATTERNS = (
+    re.compile(r"price[_ -]?date\s*[:=]?\s*(\d{4}-\d{2}-\d{2})", re.IGNORECASE),
+    re.compile(r"last complete close\s*(\d{4}-\d{2}-\d{2})", re.IGNORECASE),
+    re.compile(r"(?:yfinance|tencent|yahoo)[^;\n]*?close\s*(\d{4}-\d{2}-\d{2})", re.IGNORECASE),
+)
+
+
+def trade_price_date(trade: dict[str, Any], decision_date: str) -> tuple[str, str]:
+    explicit = str(trade.get("price_date") or "")[:10]
+    if explicit:
+        return explicit, "explicit_ledger_field"
+    source = str(trade.get("source") or "")
+    for pattern in PRICE_DATE_PATTERNS:
+        match = pattern.search(source)
+        if match:
+            return match.group(1), "reconstructed_from_legacy_source_text"
+    return decision_date, "assumed_decision_date_legacy"
+
+
+def valuation_price_book(valuations: list[dict[str, Any]], end: date_type) -> dict[str, dict[str, Any]]:
+    """Recover position-level marks from dated valuation snapshots without future leakage."""
+    result: dict[str, dict[str, Any]] = {}
+    for valuation in valuations:
+        raw_date = str(valuation.get("date") or "")[:10]
+        if not raw_date or parse_date(raw_date) > end:
+            continue
+        for item in valuation.get("price_snapshot", []) if isinstance(valuation.get("price_snapshot"), list) else []:
+            if not isinstance(item, dict):
+                continue
+            key = str(item.get("key") or position_key(str(item.get("symbol") or ""), str(item.get("exchange") or "")))
+            price = item.get("price")
+            if not key or price in (None, "") or float(price) <= 0:
+                continue
+            result[key] = {
+                "price": float(price),
+                "date": str(item.get("price_date") or raw_date)[:10],
+                "recorded_on": raw_date,
+                "source": item.get("source"),
+                "currency": item.get("currency"),
+                "fx_to_base": item.get("fx_to_base"),
+                "price_date_provenance": "valuation_price_snapshot",
+            }
+    return result
 
 
 def reconstruct_account_at_date(
@@ -494,12 +592,15 @@ def reconstruct_account_at_date(
         fx_to_base = attribution_fx_rate(config, currency, trade.get("fx_to_base"))
         price_raw = trade.get("price")
         if price_raw not in (None, "") and float(price_raw) > 0:
+            price_date, price_date_provenance = trade_price_date(trade, raw_date)
             price_book[key] = {
                 "price": float(price_raw),
-                "date": raw_date,
+                "date": price_date,
+                "recorded_on": raw_date,
                 "source": trade.get("source"),
                 "currency": currency,
                 "fx_to_base": fx_to_base,
+                "price_date_provenance": price_date_provenance,
             }
         if action not in {"BUY", "SELL"}:
             continue
@@ -520,6 +621,7 @@ def reconstruct_account_at_date(
                     "avg_cost": 0.0,
                     "prediction_id": str(trade.get("prediction_id") or "unlinked"),
                     "scenario": str(trade.get("scenario") or ""),
+                    "theme": trade.get("theme"),
                 },
             )
             old_qty = float(position["quantity"])
@@ -528,6 +630,8 @@ def reconstruct_account_at_date(
             position["quantity"] = new_qty
             position["avg_cost"] = (old_cost_native + gross_native + fee_native) / new_qty if new_qty else 0.0
             position["fx_to_base"] = fx_to_base
+            if trade.get("theme") and not position.get("theme"):
+                position["theme"] = trade.get("theme")
             cash -= gross_base + fee_base
         else:
             position = positions.get(key)
@@ -549,6 +653,7 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
     start, end = period_bounds(period, date)
     end = min(end, parse_date(date))
     accounts = account_configs()
+    theme_registry = load_theme_registry(read_json(PAPER_CONFIG_PATH), ROOT, strict=False)
     account_results = []
     by_prediction: dict[str, dict[str, Any]] = {}
     for account, config in accounts.items():
@@ -557,12 +662,57 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
         trades = read_jsonl(trades_path)
         valuations = read_jsonl(valuations_path)
         recorded_valuation = latest_valuation(valuations, end)
+        baseline_valuation = previous_valuation(valuations, start)
+        baseline_day = (
+            parse_date(str(baseline_valuation.get("date"))[:10])
+            if baseline_valuation else start - timedelta(days=1)
+        )
+        start_positions, start_prices, _start_realized_by_key, start_cash, _start_realized_total = reconstruct_account_at_date(
+            config, trades, baseline_day
+        )
+        for key, price_item in valuation_price_book(valuations, baseline_day).items():
+            existing = start_prices.get(key, {})
+            if str(price_item.get("recorded_on") or "") >= str(existing.get("recorded_on") or ""):
+                start_prices[key] = price_item
         positions, last_prices, realized_by_key, cash, realized_total = reconstruct_account_at_date(config, trades, end)
+        for key, price_item in valuation_price_book(valuations, end).items():
+            existing = last_prices.get(key, {})
+            if str(price_item.get("recorded_on") or "") >= str(existing.get("recorded_on") or ""):
+                last_prices[key] = price_item
         period_actions: list[dict[str, Any]] = []
         for trade in trades:
             trade_date = trade.get("date")
-            if trade_date and start <= parse_date(str(trade_date)[:10]) <= end:
+            if trade_date and baseline_day < parse_date(str(trade_date)[:10]) <= end:
                 period_actions.append(trade)
+
+        cash_flows_by_key: defaultdict[str, float] = defaultdict(float)
+        prediction_by_key: dict[str, str] = {}
+        for trade in period_actions:
+            action = str(trade.get("action") or "").upper()
+            if action not in {"BUY", "SELL"}:
+                continue
+            key = position_key(str(trade.get("symbol") or ""), str(trade.get("exchange") or ""))
+            currency = str(trade.get("currency") or config.get("base_currency") or "").upper()
+            fx_to_base = attribution_fx_rate(config, currency, trade.get("fx_to_base"))
+            quantity = float(trade.get("quantity", 0.0))
+            price = float(trade.get("price", 0.0))
+            gross_native = float(trade.get("gross_value", quantity * price))
+            fee_native = float(trade.get("fee", 0.0))
+            gross_base = float(trade.get("gross_value_base", gross_native * fx_to_base))
+            fee_base = float(trade.get("fee_base", fee_native * fx_to_base))
+            cash_flows_by_key[key] += (gross_base - fee_base) if action == "SELL" else -(gross_base + fee_base)
+            prediction_by_key[key] = str(trade.get("prediction_id") or "unlinked")
+        all_position_keys = set(start_positions) | set(positions) | set(cash_flows_by_key)
+        period_pnl_by_key = {
+            key: marked_position_value(positions.get(key), last_prices, key)
+            - marked_position_value(start_positions.get(key), start_prices, key)
+            + cash_flows_by_key.get(key, 0.0)
+            for key in all_position_keys
+        }
+        start_positions_value = sum(
+            marked_position_value(position, start_prices, key)
+            for key, position in start_positions.items()
+        )
 
         positions_out = []
         for key, position in sorted(positions.items()):
@@ -575,6 +725,17 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
             cost_basis = cost_basis_native * fx_to_base
             unrealized = market_value - cost_basis
             prediction_id = str(position.get("prediction_id") or "unlinked")
+            registry_assignment = registry_theme_assignment(
+                theme_registry,
+                account,
+                position.get("symbol"),
+                position.get("exchange"),
+                end.isoformat(),
+            )
+            ledger_theme = str(position.get("theme") or "").strip() or None
+            registered_theme = str(registry_assignment.get("primary_theme")) if registry_assignment else None
+            theme = ledger_theme or registered_theme
+            theme_source = "explicit_order_ledger" if ledger_theme else "verified_registry" if registered_theme else None
             row = {
                 "account": account,
                 "key": key,
@@ -582,18 +743,26 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
                 "exchange": position.get("exchange"),
                 "prediction_id": prediction_id,
                 "scenario": position.get("scenario"),
+                "theme": theme,
+                "theme_source": theme_source,
+                "secondary_themes": list(registry_assignment.get("secondary_themes", [])) if registry_assignment else [],
+                "theme_conflict": bool(ledger_theme and registered_theme and ledger_theme != registered_theme),
                 "currency": position.get("currency"),
                 "base_currency": config.get("base_currency"),
                 "fx_to_base": fx_to_base,
                 "quantity": quantity,
                 "avg_cost": float(position.get("avg_cost", 0.0)),
                 "last_price": price,
+                "last_price_date": last_prices.get(key, {}).get("date"),
+                "last_price_source": last_prices.get(key, {}).get("source"),
+                "last_price_date_provenance": last_prices.get(key, {}).get("price_date_provenance"),
                 "market_value": market_value,
                 "market_value_native": market_value_native,
                 "cost_basis": cost_basis,
                 "cost_basis_native": cost_basis_native,
                 "unrealized_pnl": unrealized,
                 "realized_pnl": realized_by_key.get(key, 0.0),
+                "period_pnl": period_pnl_by_key.get(key, 0.0),
                 "return_pct": round((unrealized / cost_basis) * 100, 4) if cost_basis else None,
             }
             positions_out.append(row)
@@ -608,6 +777,8 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
                     "cost_basis": 0.0,
                     "unrealized_pnl": 0.0,
                     "realized_pnl": 0.0,
+                    "period_pnl": 0.0,
+                    "starting_market_value": 0.0,
                     "positions": [],
                 },
             )
@@ -615,7 +786,33 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
             pred["cost_basis"] += cost_basis
             pred["unrealized_pnl"] += unrealized
             pred["realized_pnl"] += realized_by_key.get(key, 0.0)
+            pred["period_pnl"] += period_pnl_by_key.get(key, 0.0)
+            pred["starting_market_value"] += marked_position_value(start_positions.get(key), start_prices, key)
             pred["positions"].append({"account": account, "symbol": row["symbol"], "exchange": row["exchange"]})
+
+        for key in sorted(all_position_keys - set(positions)):
+            start_position = start_positions.get(key, {})
+            prediction_id = str(
+                start_position.get("prediction_id") or prediction_by_key.get(key) or "unlinked"
+            )
+            attribution_key = f"{account}:{prediction_id}"
+            pred = by_prediction.setdefault(
+                attribution_key,
+                {
+                    "prediction_id": prediction_id,
+                    "account": account,
+                    "base_currency": config.get("base_currency"),
+                    "market_value": 0.0,
+                    "cost_basis": 0.0,
+                    "unrealized_pnl": 0.0,
+                    "realized_pnl": 0.0,
+                    "period_pnl": 0.0,
+                    "starting_market_value": 0.0,
+                    "positions": [],
+                },
+            )
+            pred["period_pnl"] += period_pnl_by_key.get(key, 0.0)
+            pred["starting_market_value"] += marked_position_value(start_position, start_prices, key)
 
         positions_value = sum(float(item["market_value"]) for item in positions_out)
         initial_cash = float(config.get("initial_cash", 0.0))
@@ -632,12 +829,50 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
             "valuation_source": "reconstructed_point_in_time_from_trades",
             "paper_trading_only": True,
         }
+        reconstructed_starting_equity = start_cash + start_positions_value
+        reconstructed_ending_equity = cash + positions_value
+        starting_equity = (
+            float(baseline_valuation["equity"])
+            if baseline_valuation and isinstance(baseline_valuation.get("equity"), (int, float))
+            else reconstructed_starting_equity
+        )
+        ending_equity = (
+            float(recorded_valuation["equity"])
+            if recorded_valuation and isinstance(recorded_valuation.get("equity"), (int, float))
+            else reconstructed_ending_equity
+        )
+        period_pnl = ending_equity - starting_equity
+        attributed_period_pnl = sum(period_pnl_by_key.values())
 
         account_results.append(
             {
                 "account": account,
                 "latest_valuation": reconstructed_valuation,
                 "recorded_valuation": recorded_valuation,
+                "baseline_valuation": baseline_valuation,
+                "attribution_window": {
+                    "start_exclusive": baseline_day.isoformat(),
+                    "end_inclusive": end.isoformat(),
+                    "basis": "previous_recorded_valuation" if baseline_valuation else "reconstructed_pre_period_state",
+                },
+                "period_performance": {
+                    "starting_equity": starting_equity,
+                    "ending_equity": ending_equity,
+                    "reconstructed_starting_equity": reconstructed_starting_equity,
+                    "reconstructed_ending_equity": reconstructed_ending_equity,
+                    "period_pnl": period_pnl,
+                    "period_return_pct": round(period_pnl / starting_equity * 100, 6) if starting_equity else None,
+                    "attributed_period_pnl": attributed_period_pnl,
+                    "reconciliation_difference": round(period_pnl - attributed_period_pnl, 8),
+                    "reconciliation_status": (
+                        "matched" if abs(period_pnl - attributed_period_pnl) < 1e-6
+                        else "legacy_position_mark_gap"
+                    ),
+                    "reconciliation_limitation": (
+                        None if abs(period_pnl - attributed_period_pnl) < 1e-6
+                        else "Recorded account equity predates complete position-level valuation snapshots; do not allocate the residual to a thesis."
+                    ),
+                },
                 "positions": positions_out,
                 "period_actions": period_actions,
             }
@@ -648,7 +883,7 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
         cost_basis = float(value["cost_basis"])
         value["return_pct"] = round((float(value["unrealized_pnl"]) / cost_basis) * 100, 4) if cost_basis else None
         prediction_rows.append(value)
-    prediction_rows.sort(key=lambda item: float(item.get("unrealized_pnl", 0.0)))
+    prediction_rows.sort(key=lambda item: float(item.get("period_pnl", 0.0)))
     return {
         "period": period,
         "start": start.isoformat(),
@@ -742,6 +977,8 @@ def build_evolution_state(period: str, date: str) -> dict[str, Any]:
             "failure_reasons": failure_reasons,
         },
         "proper_scoring": proper_scoring,
+        "event_scoring": proper_scoring,
+        "market_mapping_scoring": scorecard.get("market_mapping_scoring", {}),
         "integrity": integrity,
         "active_rules": learned_rules,
         "report_contract": {
@@ -771,6 +1008,7 @@ def update_evolution_state(period: str, date: str, *, write: bool = True) -> tup
 
 
 def markdown_scorecard(scorecard: dict[str, Any], attribution: dict[str, Any] | None = None) -> str:
+    market_metrics = scorecard.get("market_mapping_scoring", {})
     lines = [
         f"# 预测复盘 {scorecard['start']} 至 {scorecard['end']}",
         "",
@@ -781,6 +1019,12 @@ def markdown_scorecard(scorecard: dict[str, Any], attribution: dict[str, Any] | 
         f"- 有用率（validated+partial）：{scorecard['useful_rate_pct'] if scorecard['useful_rate_pct'] is not None else 'N/A'}%",
         f"- 平均分：{scorecard['average_score'] if scorecard['average_score'] is not None else 'N/A'}",
         f"- 状态分布：{json.dumps(scorecard['status_counts'], ensure_ascii=False)}",
+        "",
+        "## 事件与资产映射分轨评分",
+        "",
+        f"- 事件有效样本：{scorecard.get('event_scoring', {}).get('eligible_sample_count', 0)}；Brier={scorecard.get('event_scoring', {}).get('brier_score')}",
+        f"- 资产映射已到期/已解析：{market_metrics.get('matured_mapping_count', 0)}/{market_metrics.get('resolved_mapping_count', 0)}；命中率={market_metrics.get('hit_rate_pct')}",
+        "- 事件概率不复用于资产映射；资产只按预注册基准和回报规则评分。",
         "",
         "## 主要失败原因",
         "",

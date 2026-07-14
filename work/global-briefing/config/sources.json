@@ -137,7 +137,7 @@
       "categories": ["china", "asia", "technology", "geopolitics"],
       "homepage": "https://www.scmp.com/",
       "rss": [
-        "https://www.scmp.com/rss/91/feed"
+        "https://www.scmp.com/rss/91/feed/"
       ],
       "search_hint": "site:scmp.com latest China Asia technology geopolitics"
     },

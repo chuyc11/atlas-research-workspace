@@ -12,6 +12,17 @@
   "max_daily_turnover_pct": 0.65,
   "min_cash_pct": 0.02,
   "max_new_positions_per_day": 8,
+  "theme_registry_file": "work/global-briefing/config/paper_theme_registry.json",
+  "theme_registry_history_file": "work/shared/atlas/paper_theme_registry/history.jsonl",
+  "theme_registry_snapshot_dir": "work/shared/atlas/paper_theme_registry/snapshots",
+  "order_contract": {
+    "price_date_required_from_date": "2026-07-14",
+    "price_date_must_not_follow_decision_date": true,
+    "theme_required_from_date": "2026-07-14",
+    "maximum_theme_exposure_enforce_from_date": "2026-07-14",
+    "theme_registry_history_required_from_date": "2026-07-14",
+    "explicit_theme_gate_mode": "enforced_after_verified_registry_reaches_full_open-position_coverage"
+  },
   "strategy_profile": {
     "name": "aggressive_event_momentum_v1",
     "enabled": true,
@@ -146,6 +157,8 @@
     "All account equity, cash, turnover, and performance are measured in the account base currency; HKD holdings in the CHINA account use the explicitly configured virtual HKD-to-CNY conversion rate unless a dated quote supplies fx_to_base.",
     "Hong Kong paper trades use integer shares; board-lot differences are recorded as a limitation unless explicitly configured.",
     "Do not exceed max_position_pct in one instrument or max_daily_turnover_pct of portfolio equity in one day.",
+    "Every BUY on or after the configured theme enforcement date must resolve to a verified canonical primary theme and must not push that account above maximum_theme_exposure_pct; US and CHINA theme exposures are never merged.",
+    "Every BUY on or after the registry-history enforcement date must embed the current audited registry revision ID and SHA-256; unrecorded registry changes fail closed while SELL and HOLD remain available.",
     "Keep at least min_cash_pct of initial capital as cash unless the user explicitly changes the rule.",
     "When strategy_profile.enabled is true, use the configured signal score and target exposure to favor qualified virtual BUY, ADD, REDUCE, or SELL decisions over passive HOLD.",
     "HOLD is not the default in aggressive mode and must name an allowed blocker from strategy_profile.decision_policy.",

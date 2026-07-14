@@ -27,6 +27,10 @@
     "scenario": {"type": "string", "minLength": 1},
     "probability": {"type": "number", "exclusiveMinimum": 0, "exclusiveMaximum": 1},
     "status": {"enum": ["open", "active"]},
+    "event_family_id": {"type": "string", "pattern": "^[A-Z0-9][A-Z0-9._-]{5,}$"},
+    "baseline_state": {"type": "string", "minLength": 20},
+    "novelty_delta": {"type": "string", "minLength": 20},
+    "independence_rationale": {"type": "string", "minLength": 20},
     "trigger": {"type": "string", "minLength": 1},
     "verification_signals": {"type": "array", "minItems": 1},
     "falsification_signals": {"type": "array", "minItems": 1},
@@ -50,7 +54,11 @@
           "url": {"type": "string", "format": "uri"},
           "published_at": {"type": "string"},
           "accessed_at": {"type": "string"},
-          "tier": {"type": "integer", "minimum": 1, "maximum": 4}
+          "retrieved_at": {"type": "string", "format": "date-time"},
+          "tier": {"type": "integer", "minimum": 1, "maximum": 4},
+          "artifact_path": {"type": "string", "minLength": 1},
+          "artifact_sha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"},
+          "query": {"type": "string", "minLength": 1}
         }
       }
     },
@@ -64,7 +72,27 @@
           "direction": {"enum": ["up", "down", "outperform", "underperform", "neutral"]},
           "benchmark": {"type": "string", "minLength": 1},
           "verification_rule": {"type": "string", "minLength": 1},
-          "evaluation_deadline": {"type": "string", "format": "date"}
+          "evaluation_deadline": {"type": "string", "format": "date"},
+          "market_thesis_id": {"type": "string", "pattern": "^[A-Z0-9][A-Z0-9._-]{5,}$"},
+          "evaluation": {
+            "type": "object",
+            "required": ["metric", "window_start", "price_field", "comparison"],
+            "properties": {
+              "metric": {"const": "total_return"},
+              "window_start": {"type": "string", "format": "date"},
+              "price_field": {"enum": ["adjusted_close", "close"]},
+              "comparison": {
+                "enum": [
+                  "symbol_gt_benchmark",
+                  "symbol_lt_benchmark",
+                  "symbol_return_gt",
+                  "symbol_return_lt",
+                  "abs_symbol_return_lte"
+                ]
+              },
+              "threshold_pct": {"type": "number"}
+            }
+          }
         }
       }
     }

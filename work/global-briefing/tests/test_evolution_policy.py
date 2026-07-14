@@ -149,11 +149,11 @@ class EvolutionPolicyTests(unittest.TestCase):
                         "evidence": [{"source": "Official", "url": "https://official.example/input"}],
                     },
                     {
-                        "date": "2026-07-13",
+                        "date": "2026-07-14",
                         "prediction_id": prediction_id,
                         "status": "validated",
                         "review": {
-                            "review_date": "2026-07-13",
+                            "review_date": "2026-07-14",
                             "observed_outcome": 1,
                             "evidence": [{"source": "Official", "url": "https://official.example/result"}],
                         },

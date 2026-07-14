@@ -18,6 +18,7 @@ Read these files before a full run:
 - `work/global-briefing/config/skills.json`
 - `work/global-briefing/config/china_watchlist.json`
 - `work/global-briefing/config/paper_trading.json`
+- `work/global-briefing/config/paper_theme_registry.json`
 - Prior dated report through `briefing_store.py previous --date YYYY-MM-DD`
 - Active gated evolution policy in `work/global-briefing/data/evolution_state.json` (also printed by `briefing_store.py previous`)
 - Prior paper-trading state through `paper_trading.py previous`
@@ -33,8 +34,31 @@ python work\global-briefing\scripts\briefing_store.py init
 python work\global-briefing\scripts\briefing_store.py previous --date YYYY-MM-DD
 python work\global-briefing\scripts\paper_trading.py init
 python work\global-briefing\scripts\paper_trading.py previous
+python work\global-briefing\scripts\paper_theme_registry.py audit --date YYYY-MM-DD
 python work\global-briefing\scripts\evolution.py update-policy --period month --date YYYY-MM-DD
 ```
+
+`previous` must be the first analytical context step. It scans the entire prediction
+ledger, writes `work/global-briefing/data/review-queue-YYYY-MM-DD.json`, and prints the
+bounded `review_now` set before the prior report. Work through that set before creating
+new forecasts. Do not limit review discovery to yesterday or the last N ledger rows.
+Date-only forecast and market deadlines cover the full named day in the configured
+report timezone; an ordinary review is valid on a later date, while same-day closure
+requires explicit `terminal_evidence=true`.
+
+`previous --date` automatically prepares a no-network version of the bounded resolution
+workbench so startup cannot forget prior review debt. During evidence collection, refresh
+it with market access when useful:
+
+```powershell
+python work\global-briefing\scripts\resolution_evidence.py prepare --date YYYY-MM-DD --timeout 8 --workers 4
+python work\global-briefing\scripts\drift_diagnostics.py --date YYYY-MM-DD --write
+```
+
+Read `data/resolution-evidence-YYYY-MM-DD.json` before web research. It turns every
+`review_now` item into an explicit resolution question and may produce objective
+market-price candidates, but it never appends outcomes. Verify event evidence on the
+web and independently verify any price candidate before recording a review.
 
 Collect baseline evidence when relevant:
 
@@ -71,6 +95,8 @@ Clearly separate confirmed facts, analysis, and virtual simulation. Use multi-co
 
 Optimize for decision density, not length. Follow `evolution_state.json.report_contract`: keep at most five primary theses, state background once, and give each thesis exactly the useful layers—conclusion, hard evidence, causal mechanism, counterevidence, and falsification signal. Remove generic transitions, repeated risk disclaimers, and stock lists that are not tied to a verification rule.
 
+Mark each primary thesis with `### 核心主线：...`. Coverage sections may be shorter and must not be padded into six artificial theses. For reports dated 2026-07-15 onward, every core thesis must include a `证据角色` line with linked `一手来源=...；事件地区来源=...；外部核验=...`; repeated syndication does not count as independent confirmation.
+
 ## Predictions And Storage
 
 Before writing the report, save structured prediction records:
@@ -87,6 +113,25 @@ criteria, evidence snapshots, and benchmarked market-mapping rules. Do not trans
 Every named ticker also needs its own `market_mapping.evaluation_deadline` aligned
 to an observable market session. Event and asset deadlines may differ; never use a
 stale weekend/holiday close to resolve a new asset forecast.
+For predictions dated 2026-07-14 or later, each mapping also requires a machine-readable
+`evaluation` object: `metric=total_return`, `window_start`, `price_field`, and an explicit
+comparison. This freezes the measurement window before the result is known and prevents
+post-hoc interpretation of prose rules.
+For predictions dated 2026-07-15 or later, preregister `event_family_id`,
+`baseline_state`, `novelty_delta`, and `independence_rationale`. A rolled deadline or
+paraphrase stays in the same family unless the baseline evidence or causal proposition
+materially changes. Every asset mapping also needs a stable `market_thesis_id`.
+Market quotes must use a direct auditable URL or a content-addressed local artifact
+with retrieval time, query, and SHA-256.
+The storage layer idempotently skips an existing review with the same
+`prediction_id`, `status`, and `review.review_date`. Never rewrite the original.
+An unresolved matured v2 forecast blocks the operational deployment gate until a
+valid resolution review is appended or the run is explicitly saved as partial.
+Event reviews use `review.resolution_scope=event` (or `combined`) and feed Brier/log-loss/ECE.
+Market-only reviews use `status=active`, `review.resolution_scope=market`, and a
+`market_resolution` list. They never close or score the event. Conversely, an event
+review does not remove unresolved asset mappings from the queue. Publish event-scoring
+and benchmark-relative mapping coverage separately.
 
 Write the report as a dated Markdown file:
 
@@ -118,6 +163,15 @@ requires a pre-change snapshot, post-change verification, audit record, circuit
 breaker, and rollback on verification failure. A remaining critical issue blocks
 deployment; a high or medium issue must be disclosed and routed for review.
 
+After the final alert and verified external backup artifacts exist, the normal site
+sync freezes `work/shared/atlas/publication_snapshots/atlas-publication-YYYY-MM-DD.json`.
+The snapshot contains the exact validated site payload plus date-aligned cycle,
+self-healing, improvement, alert, and recovery evidence. Deployment retries must reuse
+that payload byte-for-byte and must not rerun Phase A. A report, prediction, or telemetry
+change after freezing fails closed; create a same-day revision only with
+`--refresh-publication-snapshot` after rerunning every prerequisite gate. The prior
+revision is retained in snapshot history.
+
 Treat `atlas.py quality --strict` as the research-promotion gate. A normal daily run
 may remain operational while strict mode stays blocked for insufficient resolved
 samples; report that state as `shadow`, never as calibrated.
@@ -139,6 +193,11 @@ python work\global-briefing\scripts\evolution.py write-review --period month --d
 
 - Never place or imply real broker orders.
 - Keep US and CHINA paper-trading accounts independent.
+- Keep `date` (decision/ledger date) and `price_date` (the actual quoted market session) separate. From the configured enforcement date, every priced order must provide `price_date`; a stale close recorded today is never treated as today's close.
+- Resolve every BUY to one verified primary theme and enforce the account-local theme cap before append. The sidecar registry may classify legacy positions without rewriting historical orders; conflicts, unknown themes, or incomplete open-position coverage fail closed.
+- Never edit the theme registry silently. Record each intentional change with `paper_theme_registry.py record-revision --date YYYY-MM-DD --reason "..."`, then require `audit` to pass. From the configured date, BUY embeds the current revision ID and SHA-256; an unrecorded change blocks BUY while SELL and HOLD remain available.
+- Treat `drift-diagnostics-YYYY-MM-DD.json` as a shadow control plane with four separate states: source concentration, event-calibration drift, theme/instrument crowding, and account-separated paper attribution. Do not combine them into one score or let an insufficient sample become a quality conclusion.
+- Self-healing may refresh the deterministic drift artifact, but must never respond to it by changing sources, probabilities, reviews, themes, or virtual orders automatically.
 - Use BUY/SELL/HOLD only as virtual simulation records.
 - Do not give personalized real-money advice, target prices, stop losses, or guaranteed returns.
 - If data is stale, low-confidence, or limit-breaching, prefer HOLD or skip the virtual trade.

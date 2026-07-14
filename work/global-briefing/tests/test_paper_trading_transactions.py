@@ -161,7 +161,27 @@ class PaperTradingTransactionTests(unittest.TestCase):
         self.assertTrue(second[0]["idempotent_replay"])
         self.assertEqual(first_bytes, valuation_path.read_bytes())
         self.assertEqual(len(MODULE.read_jsonl(valuation_path)), 1)
+        self.assertEqual(MODULE.read_jsonl(valuation_path)[0]["price_snapshot"][0]["price_date"], "2026-07-10")
         self.assertFalse((self.root / "data" / "valuations.transaction.json").exists())
+
+    def test_price_date_contract_separates_quote_date_from_decision_date(self) -> None:
+        self.config["order_contract"] = {"price_date_required_from_date": "2026-07-14"}
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+        missing = self.order("ORDER-NO-PRICE-DATE")
+
+        with self.assertRaisesRegex(ValueError, "requires price_date"):
+            MODULE.apply_orders(self.write_orders([missing]), "2026-07-14", account="US")
+
+        dated = self.order("ORDER-WITH-PRICE-DATE")
+        dated["price_date"] = "2026-07-13"
+        dated["theme"] = "ai_semiconductors"
+        applied = MODULE.apply_orders(self.write_orders([dated]), "2026-07-14", account="US")
+        state = MODULE.load_state("US")
+
+        self.assertEqual(applied[0]["date"], "2026-07-14")
+        self.assertEqual(applied[0]["price_date"], "2026-07-13")
+        self.assertEqual(state["last_prices"]["NASDAQ:AAA"]["date"], "2026-07-13")
+        self.assertEqual(state["positions"]["NASDAQ:AAA"]["theme"], "ai_semiconductors")
 
     def test_mixed_currency_positions_are_converted_to_account_base_currency(self) -> None:
         state = {
@@ -249,6 +269,101 @@ class PaperTradingTransactionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "action count"):
             MODULE.apply_orders(self.write_orders(orders), "2026-07-10", account="US")
+
+    def test_verified_registry_theme_is_recorded_and_hard_theme_cap_fails_closed(self) -> None:
+        self.config["max_position_pct"] = 1.0
+        self.config["max_daily_turnover_pct"] = 1.0
+        self.config["theme_registry_file"] = "config/paper_theme_registry.json"
+        self.config["theme_registry_history_file"] = "audit/paper_theme_registry/history.jsonl"
+        self.config["theme_registry_snapshot_dir"] = "audit/paper_theme_registry/snapshots"
+        self.config["order_contract"] = {
+            "price_date_required_from_date": "2026-07-14",
+            "theme_required_from_date": "2026-07-14",
+            "maximum_theme_exposure_enforce_from_date": "2026-07-14",
+            "theme_registry_history_required_from_date": "2026-07-14",
+        }
+        self.config["strategy_profile"] = {
+            "enabled": True,
+            "target_invested_pct": {"minimum": 0.7, "preferred": 0.82, "maximum": 0.98},
+            "target_cash_pct": {"hard_minimum": 0.05, "preferred_minimum": 0.08, "preferred_maximum": 0.2},
+            "signal_score": {
+                "exit_threshold": 38,
+                "reduce_threshold": 48,
+                "buy_threshold": 70,
+                "add_threshold": 82,
+                "components": {"evidence": 25, "trend": 25, "breadth": 20, "catalyst": 15, "liquidity": 15},
+            },
+            "decision_policy": {"maximum_actions_per_account_per_day": 4, "hold_requires_explicit_blocker": False},
+            "risk_overlays": {"maximum_theme_exposure_pct": 0.5},
+        }
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+        registry = {
+            "schema_version": 1,
+            "allowed_themes": ["ai_semiconductors"],
+            "entries": [
+                {"account": "US", "symbol": symbol, "exchange": "NASDAQ", "primary_theme": "ai_semiconductors", "secondary_themes": [], "status": "verified", "effective_from": "2026-07-01", "evidence": ["test"]}
+                for symbol in ("AAA", "BBB")
+            ],
+        }
+        write_path = self.root / "config" / "paper_theme_registry.json"
+        write_path.write_text(json.dumps(registry), encoding="utf-8")
+        first = self.order("ORDER-THEME-A", symbol="AAA", notional=40000)
+        first["price_date"] = "2026-07-14"
+
+        with self.assertRaisesRegex(ValueError, "registry history gate"):
+            MODULE.apply_orders(self.write_orders([first]), "2026-07-14", account="US")
+
+        registry_module = sys.modules["paper_theme_registry"]
+        revision = registry_module.record_revision(
+            self.config,
+            self.root,
+            "2026-07-14",
+            "Initial audited test registry baseline",
+        )
+
+        applied = MODULE.apply_orders(self.write_orders([first]), "2026-07-14", account="US")
+
+        self.assertEqual(applied[0]["theme"], "ai_semiconductors")
+        self.assertEqual(applied[0]["theme_source"], "verified_registry")
+        self.assertEqual(applied[0]["theme_registry_revision_id"], revision["current_revision_id"])
+        self.assertEqual(applied[0]["theme_registry_sha256"], revision["current_registry_sha256"])
+        self.assertAlmostEqual(applied[0]["theme_exposure_pct_after"], 0.4)
+
+        second = self.order("ORDER-THEME-B", symbol="BBB", notional=15000)
+        second["price_date"] = "2026-07-15"
+        with self.assertRaisesRegex(ValueError, "maximum theme exposure"):
+            MODULE.apply_orders(self.write_orders([second]), "2026-07-15", account="US")
+
+    def test_missing_registry_history_blocks_buy_but_not_hold(self) -> None:
+        self.config["theme_registry_file"] = "config/paper_theme_registry.json"
+        self.config["theme_registry_history_file"] = "audit/history.jsonl"
+        self.config["theme_registry_snapshot_dir"] = "audit/snapshots"
+        self.config["order_contract"] = {"theme_registry_history_required_from_date": "2026-07-14"}
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+        registry_path = self.root / "config" / "paper_theme_registry.json"
+        registry_path.write_text(json.dumps({
+            "schema_version": 1,
+            "allowed_themes": ["theme_a"],
+            "entries": [{
+                "account": "US",
+                "symbol": "AAA",
+                "exchange": "NASDAQ",
+                "primary_theme": "theme_a",
+                "secondary_themes": [],
+                "status": "verified",
+                "effective_from": "2026-07-01",
+                "evidence": ["test mandate"],
+            }],
+        }), encoding="utf-8")
+        hold = self.order("ORDER-HISTORY-HOLD")
+        hold["action"] = "HOLD"
+
+        applied = MODULE.apply_orders(self.write_orders([hold]), "2026-07-14", account="US")
+
+        self.assertEqual(applied[0]["action"], "HOLD")
+        buy = self.order("ORDER-HISTORY-BUY")
+        with self.assertRaisesRegex(ValueError, "registry history gate"):
+            MODULE.apply_orders(self.write_orders([buy]), "2026-07-14", account="US")
 
 
 if __name__ == "__main__":

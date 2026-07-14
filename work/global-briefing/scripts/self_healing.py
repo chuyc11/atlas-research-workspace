@@ -282,6 +282,168 @@ class SelfHealingEngine:
         )
         return [gate, artifact_result]
 
+    def probe_review_queue(self, date: str) -> ProbeResult:
+        artifact = self.briefing_root / "data" / f"review-queue-{date}.json"
+        payload = read_json(artifact, {})
+        counts = payload.get("counts", {}) if isinstance(payload, dict) else {}
+        predictions = self.briefing_root / "data" / "predictions.jsonl"
+        settings = read_json(self.briefing_root / "config" / "settings.json", {})
+        contract = settings.get("prediction_contract", {}) if isinstance(settings, dict) else {}
+        queue_policy = settings.get("review_queue", {}) if isinstance(settings, dict) else {}
+        expected_fingerprint = stable_hash({
+            "predictions_sha256": file_hash(predictions),
+            "deadline_semantics": contract.get("deadline_semantics") if isinstance(contract, dict) else None,
+            "mature_for_daily_review_when": contract.get("mature_for_daily_review_when") if isinstance(contract, dict) else None,
+            "review_queue": queue_policy if isinstance(queue_policy, dict) else {},
+        })
+        passed = bool(
+            isinstance(payload, dict)
+            and payload.get("run_date") == date
+            and isinstance(payload.get("review_now"), list)
+            and isinstance(payload.get("review_backlog"), list)
+            and isinstance(counts, dict)
+            and int(counts.get("due_reviews") or 0)
+            == int(counts.get("review_now") or 0) + int(counts.get("review_backlog") or 0)
+            and payload.get("input_fingerprint") == expected_fingerprint
+            and artifact.is_file()
+        )
+        return self.result(
+            "review_queue_freshness",
+            passed,
+            artifact,
+            "full-ledger review queue is current" if passed else "full-ledger review queue is missing, stale, or inconsistent",
+            evidence={
+                "date": date,
+                "exists": artifact.exists(),
+                "due_reviews": counts.get("due_reviews") if isinstance(counts, dict) else None,
+                "review_now": counts.get("review_now") if isinstance(counts, dict) else None,
+                "review_backlog": counts.get("review_backlog") if isinstance(counts, dict) else None,
+                "fingerprint_matches": payload.get("input_fingerprint") == expected_fingerprint if isinstance(payload, dict) else False,
+            },
+            fixer="refresh_review_queue",
+        )
+
+    def probe_resolution_evidence(self, date: str) -> ProbeResult:
+        artifact = self.briefing_root / "data" / f"resolution-evidence-{date}.json"
+        payload = read_json(artifact, {})
+        queue = read_json(self.briefing_root / "data" / f"review-queue-{date}.json", {})
+        settings = read_json(self.briefing_root / "config" / "settings.json", {})
+        policy = settings.get("resolution_evidence", {}) if isinstance(settings, dict) else {}
+        expected_fingerprint = stable_hash({
+            "schema_version": 1,
+            "run_date": date,
+            "review_queue_input_fingerprint": queue.get("input_fingerprint") if isinstance(queue, dict) else None,
+            "resolution_evidence_policy": policy if isinstance(policy, dict) else {},
+        })
+        counts = payload.get("counts", {}) if isinstance(payload, dict) else {}
+        passed = bool(
+            isinstance(payload, dict)
+            and payload.get("date") == date
+            and payload.get("input_fingerprint") == expected_fingerprint
+            and isinstance(payload.get("items"), list)
+            and isinstance(counts, dict)
+            and int(counts.get("prediction_work_items") or 0) == len(payload.get("items", []))
+            and artifact.is_file()
+        )
+        return self.result(
+            "resolution_evidence_freshness",
+            passed,
+            artifact,
+            "resolution evidence workbench is current" if passed else "resolution evidence workbench is missing, stale, or inconsistent",
+            evidence={
+                "date": date,
+                "exists": artifact.exists(),
+                "fingerprint_matches": payload.get("input_fingerprint") == expected_fingerprint if isinstance(payload, dict) else False,
+                "prediction_work_items": counts.get("prediction_work_items") if isinstance(counts, dict) else None,
+                "automatic_ledger_append": False,
+            },
+            fixer="refresh_resolution_evidence",
+        )
+
+    def probe_drift_diagnostics(self, date: str) -> ProbeResult:
+        script = self.briefing_root / "scripts" / "drift_diagnostics.py"
+        completed, expected = self.command_json([sys.executable, str(script), "--date", date])
+        artifact = self.briefing_root / "data" / f"drift-diagnostics-{date}.json"
+        stored = read_json(artifact, {})
+        required_dimensions = {
+            "source_concentration",
+            "forecast_calibration",
+            "theme_crowding",
+            "paper_account_attribution",
+        }
+        statuses = stored.get("dimension_statuses", {}) if isinstance(stored, dict) else {}
+        passed = bool(
+            completed.returncode == 0
+            and isinstance(expected, dict)
+            and isinstance(stored, dict)
+            and stored.get("date") == date
+            and stored.get("input_fingerprint") == expected.get("input_fingerprint")
+            and set(statuses) == required_dimensions
+            and stored.get("no_opaque_composite_score") is True
+            and stored.get("deployment_blocking") is False
+            and artifact.is_file()
+        )
+        return self.result(
+            "drift_diagnostics_freshness",
+            passed,
+            artifact,
+            "point-in-time drift diagnostics are current" if passed else "point-in-time drift diagnostics are missing, stale, or structurally invalid",
+            evidence={
+                "date": date,
+                "exists": artifact.exists(),
+                "returncode": completed.returncode,
+                "fingerprint_matches": stored.get("input_fingerprint") == (expected or {}).get("input_fingerprint") if isinstance(stored, dict) else False,
+                "dimension_statuses": statuses,
+                "gate_mode": stored.get("gate_mode") if isinstance(stored, dict) else None,
+                "deployment_blocking": False,
+                "stderr": completed.stderr[-1000:],
+            },
+            fixer="refresh_drift_diagnostics",
+        )
+
+    def probe_paper_theme_registry(self, date: str) -> ProbeResult:
+        script = self.briefing_root / "scripts" / "paper_theme_registry.py"
+        completed, payload = self.command_json([sys.executable, str(script), "audit", "--date", date])
+        registry = self.briefing_root / "config" / "paper_theme_registry.json"
+        coverage = payload.get("coverage", {}) if isinstance(payload, dict) else {}
+        accounts = coverage.get("accounts", []) if isinstance(coverage, dict) else []
+        passed = bool(
+            completed.returncode == 0
+            and isinstance(payload, dict)
+            and payload.get("date") == date
+            and payload.get("valid") is True
+            and payload.get("audit_passed") is True
+            and payload.get("history_current") is True
+            and payload.get("chain_valid") is True
+            and payload.get("snapshots_valid") is True
+            and coverage.get("all_accounts_fully_covered") is True
+            and len(accounts) == 2
+            and all(float(row.get("position_value_coverage_pct", 0.0)) == 100.0 for row in accounts if isinstance(row, dict))
+            and registry.is_file()
+        )
+        return self.result(
+            "paper_theme_registry_validity",
+            passed,
+            registry,
+            "paper theme registry has a current audited revision chain and covers every open position" if passed else "paper theme registry is invalid, unrecorded, tampered, or leaves open positions unclassified",
+            evidence={
+                "date": date,
+                "returncode": completed.returncode,
+                "valid": payload.get("valid") if isinstance(payload, dict) else False,
+                "audit_passed": payload.get("audit_passed") if isinstance(payload, dict) else False,
+                "current_revision_id": payload.get("current_revision_id") if isinstance(payload, dict) else None,
+                "history_current": payload.get("history_current") if isinstance(payload, dict) else False,
+                "chain_valid": payload.get("chain_valid") if isinstance(payload, dict) else False,
+                "snapshots_valid": payload.get("snapshots_valid") if isinstance(payload, dict) else False,
+                "verified_entry_count": payload.get("verified_entry_count") if isinstance(payload, dict) else None,
+                "coverage": coverage,
+                "errors": payload.get("errors", []) if isinstance(payload, dict) else [],
+                "history_errors": payload.get("history_errors", []) if isinstance(payload, dict) else [],
+                "snapshot_errors": payload.get("snapshot_errors", []) if isinstance(payload, dict) else [],
+                "economic_ledger_mutations": [],
+            },
+        )
+
     def probe_site(self, date: str) -> list[ProbeResult]:
         script = self.briefing_root / "scripts" / "sync_briefing_site.py"
         completed, payload = self.command_json(
@@ -449,6 +611,10 @@ class SelfHealingEngine:
         results = [self.probe_report(date)]
         if results[0].passed:
             results.extend(self.probe_research_quality(date))
+            results.append(self.probe_review_queue(date))
+            results.append(self.probe_resolution_evidence(date))
+            results.append(self.probe_paper_theme_registry(date))
+            results.append(self.probe_drift_diagnostics(date))
             results.extend(self.probe_site(date))
         results.append(self.probe_macro_bridge(date))
         results.append(self.probe_cycle_lock())
@@ -461,6 +627,9 @@ class SelfHealingEngine:
     def repair_targets(self, finding: ProbeResult) -> list[Path]:
         mapping = {
             "refresh_research_quality": [self.briefing_root / "data" / f"research-quality-{finding.evidence.get('date', '')}.json"],
+            "refresh_review_queue": [self.briefing_root / "data" / f"review-queue-{finding.evidence.get('date', '')}.json"],
+            "refresh_resolution_evidence": [self.briefing_root / "data" / f"resolution-evidence-{finding.evidence.get('date', '')}.json"],
+            "refresh_drift_diagnostics": [self.briefing_root / "data" / f"drift-diagnostics-{finding.evidence.get('date', '')}.json"],
             "regenerate_site_payload": [
                 self.site_root / "app" / "briefing.generated.json",
                 self.briefing_root / "data" / "site-sync-state.json",
@@ -507,6 +676,26 @@ class SelfHealingEngine:
         if finding.fixer == "refresh_research_quality":
             script = self.briefing_root / "scripts" / "research_quality.py"
             completed = self.runner([sys.executable, str(script), "--date", date], cwd=self.root, timeout=180)
+            return RepairResult("applied" if completed.returncode == 0 else "failed", completed.stderr[-1000:] or completed.stdout[-1000:])
+        if finding.fixer == "refresh_review_queue":
+            script = self.briefing_root / "scripts" / "briefing_store.py"
+            completed = self.runner([sys.executable, str(script), "due-reviews", "--date", date], cwd=self.root, timeout=180)
+            return RepairResult("applied" if completed.returncode == 0 else "failed", completed.stderr[-1000:] or completed.stdout[-1000:])
+        if finding.fixer == "refresh_resolution_evidence":
+            script = self.briefing_root / "scripts" / "resolution_evidence.py"
+            completed = self.runner(
+                [sys.executable, str(script), "prepare", "--date", date, "--no-network"],
+                cwd=self.root,
+                timeout=180,
+            )
+            return RepairResult("applied" if completed.returncode == 0 else "failed", completed.stderr[-1000:] or completed.stdout[-1000:])
+        if finding.fixer == "refresh_drift_diagnostics":
+            script = self.briefing_root / "scripts" / "drift_diagnostics.py"
+            completed = self.runner(
+                [sys.executable, str(script), "--date", date, "--write"],
+                cwd=self.root,
+                timeout=180,
+            )
             return RepairResult("applied" if completed.returncode == 0 else "failed", completed.stderr[-1000:] or completed.stdout[-1000:])
         if finding.fixer == "regenerate_site_payload":
             script = self.briefing_root / "scripts" / "sync_briefing_site.py"
@@ -555,6 +744,12 @@ class SelfHealingEngine:
     def verify_finding(self, finding: ProbeResult, date: str) -> bool:
         if finding.check_id == "research_quality_artifact":
             return self.probe_research_quality(date)[1].passed
+        if finding.check_id == "review_queue_freshness":
+            return self.probe_review_queue(date).passed
+        if finding.check_id == "resolution_evidence_freshness":
+            return self.probe_resolution_evidence(date).passed
+        if finding.check_id == "drift_diagnostics_freshness":
+            return self.probe_drift_diagnostics(date).passed
         if finding.check_id == "site_payload_freshness":
             return self.probe_site(date)[0].passed
         if finding.check_id == "site_state_consistency":

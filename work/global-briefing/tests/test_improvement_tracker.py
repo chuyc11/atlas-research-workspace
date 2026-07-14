@@ -66,7 +66,13 @@ class ImprovementTrackerTests(unittest.TestCase):
             self.root / "work" / "global-briefing" / "data" / f"research-quality-{date}.json",
             {
                 "date": date,
-                "report_audit": {"passed": passed, "errors": [] if passed else ["thin"]},
+                "report_audit": {
+                    "passed": passed,
+                    "errors": [] if passed else ["thin"],
+                    "all_core_stories_passed": passed,
+                    "story_evidence_enforced": True,
+                    "source_role_coverage_pct": 100.0 if passed else 0.0,
+                },
                 "prediction_audit": {"v2_contract": {"errors": [], "review_errors": []}},
             },
         )
@@ -74,7 +80,7 @@ class ImprovementTrackerTests(unittest.TestCase):
     def write_site_health(self, score: int) -> None:
         write_json(
             self.root / "src" / "app" / "briefing.generated.json",
-            {"metrics": {"sourceHealth": {"score": score, "label": "良好" if score >= 65 else "受限", "staleMarketItemCount": 0}}},
+            {"metrics": {"sourceHealth": {"score": score, "label": "良好" if score >= 65 else "受限", "staleMarketItemCount": 0, "limitations": []}}},
         )
 
     def test_retrospective_action_waits_for_next_run_then_verifies(self) -> None:
@@ -106,6 +112,16 @@ class ImprovementTrackerTests(unittest.TestCase):
         _rc, third = self.tracker.run("2026-07-13", apply_safe=False, strict=False)
         source = next(item for item in third["actions"] if item["spec"]["source_key"] == "capability-source-health")
         self.assertEqual(source["status"], "regressed")
+
+    def test_high_source_score_cannot_verify_failed_core_story_evidence(self) -> None:
+        self.write_quality("2026-07-12", passed=False)
+        self.write_site_health(90)
+
+        _rc, result = self.tracker.run("2026-07-12", apply_safe=False, strict=False)
+        source = next(item for item in result["actions"] if item["spec"]["source_key"] == "capability-source-health")
+
+        self.assertNotEqual(source["status"], "verified")
+        self.assertFalse(source["last_evaluation"]["evidence"]["all_core_stories_passed"])
 
     def test_paper_attribution_uses_only_allowlisted_safe_fixer(self) -> None:
         target = self.root / "work" / "global-briefing" / "data" / "paper-attribution-day-2026-07-12.json"

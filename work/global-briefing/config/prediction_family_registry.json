@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "purpose": "Append-only sidecar for collapsing rolling forecasts and repeated asset expressions without rewriting immutable prediction originals.",
+  "event_families": {
+    "US_IRAN_EXECUTABLE_DEESCALATION_2026_07": [
+      "2026-07-12-P02",
+      "2026-07-13-P01",
+      "2026-07-14-P01"
+    ]
+  },
+  "market_theses": {
+    "US_IRAN_GLD_RELATIVE_2026_07": [
+      "2026-07-12-P02|GLD",
+      "2026-07-13-P01|GLD",
+      "2026-07-14-P01|GLD"
+    ],
+    "US_IRAN_JETS_RELATIVE_2026_07": [
+      "2026-07-12-P02|JETS",
+      "2026-07-13-P01|JETS"
+    ]
+  },
+  "governance": {
+    "historical_originals_rewritten": false,
+    "new_family_assignment_required_from": "2026-07-15",
+    "rule": "A changed deadline or wording does not create an independent sample when the causal proposition and evidence state are materially the same."
+  }
+}

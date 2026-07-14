@@ -43,6 +43,10 @@ class SelfHealingTests(unittest.TestCase):
                     "site_state_consistency": {"severity": "medium", "risk": "low"},
                     "site_payload_freshness": {"severity": "high", "risk": "low"},
                     "research_operational_gate": {"severity": "critical", "risk": "high"},
+                    "review_queue_freshness": {"severity": "critical", "risk": "low"},
+                    "resolution_evidence_freshness": {"severity": "high", "risk": "low"},
+                    "drift_diagnostics_freshness": {"severity": "medium", "risk": "low"},
+                    "paper_theme_registry_validity": {"severity": "high", "risk": "high"},
                 },
             },
         )
@@ -125,6 +129,127 @@ class SelfHealingTests(unittest.TestCase):
 
         self.assertFalse(eligible)
         self.assertIn("approval", reason)
+
+    def test_review_queue_probe_requires_consistent_partition_counts(self) -> None:
+        queue = self.root / "work" / "global-briefing" / "data" / "review-queue-2026-07-13.json"
+        payload = {
+            "run_date": "2026-07-13",
+            "counts": {"due_reviews": 3, "review_now": 2, "review_backlog": 1},
+            "review_now": [{"prediction_id": "P1"}, {"prediction_id": "P2"}],
+            "review_backlog": [{"prediction_id": "P3"}],
+        }
+        predictions = self.root / "work" / "global-briefing" / "data" / "predictions.jsonl"
+        predictions.parent.mkdir(parents=True, exist_ok=True)
+        predictions.write_text("", encoding="utf-8")
+        settings = self.root / "work" / "global-briefing" / "config" / "settings.json"
+        write_json(settings, {})
+        payload["input_fingerprint"] = MODULE.stable_hash({
+            "predictions_sha256": MODULE.file_hash(predictions),
+            "deadline_semantics": None,
+            "mature_for_daily_review_when": None,
+            "review_queue": {},
+        })
+        write_json(queue, payload)
+
+        passed = self.engine.probe_review_queue("2026-07-13")
+        stored = json.loads(queue.read_text(encoding="utf-8"))
+        stored["counts"]["review_backlog"] = 0
+        write_json(queue, stored)
+        failed = self.engine.probe_review_queue("2026-07-13")
+
+        self.assertTrue(passed.passed)
+        self.assertFalse(failed.passed)
+
+    def test_resolution_evidence_probe_tracks_queue_and_policy_fingerprint(self) -> None:
+        date = "2026-07-13"
+        queue = self.root / "work" / "global-briefing" / "data" / f"review-queue-{date}.json"
+        write_json(queue, {"input_fingerprint": "queue-sha"})
+        settings = self.root / "work" / "global-briefing" / "config" / "settings.json"
+        policy = {"automatic_ledger_append": False}
+        write_json(settings, {"resolution_evidence": policy})
+        evidence = self.root / "work" / "global-briefing" / "data" / f"resolution-evidence-{date}.json"
+        fingerprint = MODULE.stable_hash({
+            "schema_version": 1,
+            "run_date": date,
+            "review_queue_input_fingerprint": "queue-sha",
+            "resolution_evidence_policy": policy,
+        })
+        write_json(evidence, {
+            "date": date,
+            "input_fingerprint": fingerprint,
+            "counts": {"prediction_work_items": 1},
+            "items": [{"prediction_id": "P1"}],
+        })
+
+        passed = self.engine.probe_resolution_evidence(date)
+        stored = json.loads(evidence.read_text(encoding="utf-8"))
+        stored["input_fingerprint"] = "stale"
+        write_json(evidence, stored)
+        failed = self.engine.probe_resolution_evidence(date)
+
+        self.assertTrue(passed.passed)
+        self.assertFalse(failed.passed)
+
+    def test_drift_probe_requires_matching_fingerprint_and_separate_dimensions(self) -> None:
+        date = "2026-07-13"
+        path = self.root / "work" / "global-briefing" / "data" / f"drift-diagnostics-{date}.json"
+        statuses = {
+            "source_concentration": "healthy",
+            "forecast_calibration": "insufficient_sample",
+            "theme_crowding": "watch",
+            "paper_account_attribution": "healthy",
+        }
+        write_json(path, {
+            "date": date,
+            "input_fingerprint": "current",
+            "dimension_statuses": statuses,
+            "no_opaque_composite_score": True,
+            "deployment_blocking": False,
+        })
+        completed = type("Completed", (), {"returncode": 0, "stderr": ""})()
+        with patch.object(self.engine, "command_json", return_value=(completed, {"input_fingerprint": "current"})):
+            passed = self.engine.probe_drift_diagnostics(date)
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        stored["input_fingerprint"] = "stale"
+        write_json(path, stored)
+        with patch.object(self.engine, "command_json", return_value=(completed, {"input_fingerprint": "current"})):
+            failed = self.engine.probe_drift_diagnostics(date)
+
+        self.assertTrue(passed.passed)
+        self.assertFalse(failed.passed)
+
+    def test_theme_registry_probe_requires_full_account_coverage(self) -> None:
+        date = "2026-07-13"
+        registry = self.root / "work" / "global-briefing" / "config" / "paper_theme_registry.json"
+        write_json(registry, {"schema_version": 1})
+        completed = type("Completed", (), {"returncode": 0, "stderr": ""})()
+        healthy = {
+            "date": date,
+            "valid": True,
+            "audit_passed": True,
+            "history_current": True,
+            "chain_valid": True,
+            "snapshots_valid": True,
+            "current_revision_id": "THEME-REG-TEST",
+            "verified_entry_count": 2,
+            "coverage": {
+                "all_accounts_fully_covered": True,
+                "accounts": [
+                    {"account": "US", "position_value_coverage_pct": 100.0},
+                    {"account": "CHINA", "position_value_coverage_pct": 100.0},
+                ],
+            },
+        }
+        with patch.object(self.engine, "command_json", return_value=(completed, healthy)):
+            passed = self.engine.probe_paper_theme_registry(date)
+        incomplete = json.loads(json.dumps(healthy))
+        incomplete["coverage"]["all_accounts_fully_covered"] = False
+        incomplete["coverage"]["accounts"][1]["position_value_coverage_pct"] = 75.0
+        with patch.object(self.engine, "command_json", return_value=(completed, incomplete)):
+            failed = self.engine.probe_paper_theme_registry(date)
+
+        self.assertTrue(passed.passed)
+        self.assertFalse(failed.passed)
 
     def test_failed_verification_rolls_back_original_file(self) -> None:
         state_path = self.root / "work" / "global-briefing" / "data" / "site-sync-state.json"

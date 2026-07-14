@@ -48,6 +48,9 @@
   "prediction_contract": {
     "schema_version": 2,
     "enforce_from_date": "2026-07-12",
+    "independence_enforce_from_date": "2026-07-15",
+    "evidence_reproducibility_enforce_from_date": "2026-07-15",
+    "family_registry_file": "work/global-briefing/config/prediction_family_registry.json",
     "deadline_semantics": "end_of_day_in_report_timezone",
     "mature_for_daily_review_when": "deadline_before_run_date_unless_terminal_evidence",
     "probability_format": "numeric_open_interval_0_1",
@@ -69,7 +72,7 @@
       "success_criteria",
       "failure_criteria"
     ],
-    "market_mapping_rule": "When tickers are named, every ticker needs symbol, direction, benchmark, verification_rule, and an evaluation_deadline aligned to an observable market session. From 2026-07-14, also pre-register evaluation.metric, window_start, price_field, comparison, and optional threshold_pct.",
+    "market_mapping_rule": "When tickers are named, every ticker needs symbol, direction, benchmark, verification_rule, and an evaluation_deadline aligned to an observable market session. From 2026-07-14, also pre-register evaluation.metric, window_start, price_field, comparison, and optional threshold_pct. From 2026-07-15, every mapping also needs a stable market_thesis_id; evidence must point to a direct page or a content-addressed local market snapshot.",
     "review_rule": "Event proper scoring requires resolution_scope event/combined, review.observed_outcome in {0,1}, review_date after the end-of-day deadline unless terminal_evidence=true, and resolution evidence. Market-only reviews use status active and never close the event."
   },
   "review_queue": {
@@ -77,7 +80,8 @@
     "prioritize_v2": true,
     "prioritize_newly_due": true,
     "block_deployment_on_unresolved_due_v2": true,
-    "block_deployment_on_unresolved_due_v2_market": false,
+    "block_deployment_on_unresolved_due_v2_market": true,
+    "block_deployment_on_unresolved_due_v2_market_from_date": "2026-07-15",
     "machine_evaluation_enforce_from_date": "2026-07-14",
     "event_asset_separation_enforce_from_date": "2026-07-15",
     "persist_full_queue": true,
@@ -147,6 +151,7 @@
   "research_evaluation": {
     "proper_scoring": ["brier_score", "log_loss", "expected_calibration_error"],
     "minimum_sample": 30,
+    "minimum_independent_event_families": 30,
     "minimum_resolved_coverage_pct": 80.0,
     "maximum_brier": 0.25,
     "maximum_expected_calibration_error": 0.15,
@@ -186,6 +191,9 @@
     "require_primary_source_for_high_impact_story": true,
     "require_event_region_source": true,
     "require_external_verification_source": true,
+    "story_evidence_enforce_from_date": "2026-07-15",
+    "primary_thesis_min_items": 1,
+    "primary_thesis_max_items": 5,
     "required_story_layers": [
       "confirmed_facts",
       "claims_and_attribution",
@@ -203,7 +211,9 @@
       "minimum_distinct_links": 12,
       "minimum_distinct_domains": 8,
       "minimum_topic_characters": 180,
-      "minimum_topic_links": 1
+      "minimum_topic_links": 1,
+      "primary_domain_suffixes": [".gov", ".gov.cn", ".gov.uk", ".go.jp", ".int", ".europa.eu"],
+      "primary_domain_allowlist": ["government.se", "imo.org", "un.org", "news.un.org", "president.gov.ua"]
     },
     "ranking_weights": {
       "source_quality": 0.25,

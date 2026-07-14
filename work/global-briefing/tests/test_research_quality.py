@@ -179,6 +179,31 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertTrue(metrics["gates"]["resolved_coverage_at_least_80pct"])
         self.assertEqual(metrics["legacy_matured_prediction_count_excluded"], 1)
 
+    def test_rolling_forecasts_share_one_independent_event_family_weight(self) -> None:
+        first = v2_prediction("2026-07-12-P01", probability=0.9)
+        second = v2_prediction("2026-07-13-P01", probability=0.7)
+        second["date"] = "2026-07-13"
+        second["deadline"] = "2026-07-14"
+        second["market_mapping"][0]["evaluation_deadline"] = "2026-07-14"
+        first_review = resolved_review("2026-07-12-P01", outcome=1)
+        second_review = resolved_review("2026-07-13-P01", outcome=1)
+        second_review["date"] = "2026-07-15"
+        second_review["review"]["review_date"] = "2026-07-15"
+        registry = {"event_families": {"ROLLING_EVENT": [first["prediction_id"], second["prediction_id"]]}}
+
+        metrics = MODULE.proper_scoring_metrics(
+            [first, first_review, second, second_review],
+            cutoff="2026-07-15",
+            minimum_sample=2,
+            family_registry=registry,
+        )
+
+        self.assertEqual(metrics["eligible_sample_count"], 2)
+        self.assertEqual(metrics["independent_event_family_count"], 1)
+        self.assertEqual(metrics["rolling_restatement_count_downweighted"], 1)
+        self.assertFalse(metrics["gates"]["minimum_sample"])
+        self.assertAlmostEqual(metrics["brier_score"], 0.05)
+
     def test_asset_only_prediction_is_excluded_from_event_calibration(self) -> None:
         original = v2_prediction()
         original["scenario"] = "TEST total return exceeds SPY total return by the deadline"
@@ -218,6 +243,24 @@ class ResearchQualityTests(unittest.TestCase):
 
         self.assertTrue(any("event resolution duplicates a market-mapping outcome" in error for error in errors))
 
+    def test_forward_contract_requires_novelty_family_and_reproducible_market_evidence(self) -> None:
+        row = v2_prediction("2026-07-15-P01")
+        row["date"] = "2026-07-15"
+        row["deadline"] = "2026-07-16"
+        row["market_mapping"][0]["evaluation_deadline"] = "2026-07-16"
+        row["evidence"] = [{"source": "Tencent market quote", "url": "https://qt.gtimg.cn/"}]
+
+        errors = MODULE.validate_v2_prediction(
+            row,
+            independence_enforce_from_date="2026-07-15",
+            evidence_reproducibility_enforce_from_date="2026-07-15",
+        )
+
+        self.assertTrue(any("event_family_id" in error for error in errors))
+        self.assertTrue(any("direct auditable page" in error for error in errors))
+        self.assertTrue(any("artifact_sha256" in error for error in errors))
+        self.assertTrue(any("market_thesis_id" in error for error in errors))
+
     def test_early_review_without_terminal_evidence_is_ineligible(self) -> None:
         original = v2_prediction()
         original["deadline"] = "2026-07-19"
@@ -256,6 +299,40 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertTrue(result["passed"])
         self.assertEqual(result["distinct_domain_count"], 2)
         self.assertEqual(result["thesis_layer_counts"]["falsification_signal"], 3)
+
+    def test_report_gate_applies_five_layer_and_source_roles_only_to_marked_core_stories(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.md"
+            path.write_text(
+                "## 2026-07-15 每日全球晨间简报\n"
+                "## 核心摘要\n## 昨日预测复盘\n## 今日预测与市场映射\n## 风险信号\n## 来源与质量\n"
+                "## 政治与外交\n### 核心主线：可审计主线\n"
+                "- **结论：** x\n- **硬证据：** x\n- **机制：** x\n- **反证：** x\n- **证伪：** x\n"
+                "- **证据角色：** 一手来源=[Gov](https://agency.gov/release); 事件地区来源=[Local](https://local.example/story); 外部核验=[Wire](https://wire.example/check)\n"
+                "## 科技与AI\n这一覆盖段落不需要伪装成第二条核心投资主线。[Source](https://tech.example/story)\n",
+                encoding="utf-8",
+            )
+            policy = {
+                "story_evidence_enforce_from_date": "2026-07-15",
+                "primary_thesis_min_items": 1,
+                "primary_thesis_max_items": 5,
+                "minimum_sources_per_core_story": 3,
+                "minimum_independent_domains_per_core_story": 2,
+                "require_primary_source_for_high_impact_story": True,
+                "quality_gate": {
+                    "minimum_report_characters": 10,
+                    "maximum_report_characters": 10000,
+                    "minimum_distinct_links": 3,
+                    "minimum_distinct_domains": 3,
+                    "primary_domain_suffixes": [".gov"],
+                },
+            }
+            result = MODULE.audit_report(path, policy, enforce=True)
+
+        self.assertTrue(result["passed"])
+        self.assertEqual(result["primary_thesis_count"], 1)
+        self.assertEqual(result["source_role_coverage_pct"], 100.0)
+        self.assertTrue(result["all_core_stories_passed"])
 
     def test_storage_rejects_noncompliant_post_enforcement_prediction_before_append(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -402,6 +479,25 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertEqual(metrics["resolved_mapping_count"], 1)
         self.assertEqual(metrics["reciprocal_duplicate_mapping_count_excluded"], 1)
 
+    def test_rolling_market_mappings_use_registry_as_one_thesis(self) -> None:
+        first = v2_prediction("2026-07-12-P01")
+        second = v2_prediction("2026-07-13-P01")
+        second["date"] = "2026-07-13"
+        second["deadline"] = "2026-07-14"
+        second["market_mapping"][0]["evaluation_deadline"] = "2026-07-14"
+        registry = {
+            "market_theses": {
+                "ROLLING_TEST_RELATIVE": ["2026-07-12-P01|TEST", "2026-07-13-P01|TEST"]
+            }
+        }
+
+        metrics = MODULE.market_mapping_metrics(
+            [first, second], cutoff="2026-07-15", family_registry=registry
+        )
+
+        self.assertEqual(metrics["matured_mapping_count"], 1)
+        self.assertEqual(metrics["reciprocal_duplicate_mapping_count_excluded"], 1)
+
     def test_combined_review_validates_event_and_mapping_dimensions_independently(self) -> None:
         original = v2_prediction()
         original["market_mapping"][0]["evaluation"] = {
@@ -480,6 +576,24 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertFalse(after_deadline["operational_passed"])
         self.assertEqual(after_deadline["unresolved_matured_v2_prediction_ids"], ["2026-07-12-P01"])
         self.assertTrue(resolved["operational_passed"])
+
+    def test_unresolved_market_mapping_gate_has_explicit_forward_cutoff(self) -> None:
+        original = v2_prediction()
+        policy = {
+            "block_deployment_on_unresolved_due_v2_market": True,
+            "block_deployment_on_unresolved_due_v2_market_from_date": "2026-07-15",
+        }
+
+        shadow = MODULE.audit_prediction_records(
+            [original], cutoff="2026-07-14", enforce_from_date="2026-07-12", review_policy=policy
+        )
+        enforced = MODULE.audit_prediction_records(
+            [original], cutoff="2026-07-15", enforce_from_date="2026-07-12", review_policy=policy
+        )
+
+        self.assertTrue(shadow["operational_passed"])
+        self.assertFalse(enforced["operational_passed"])
+        self.assertTrue(any("market mappings" in error for error in enforced["operational_errors"]))
 
 
 if __name__ == "__main__":

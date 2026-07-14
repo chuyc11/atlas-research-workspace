@@ -1144,12 +1144,7 @@ def report_quality_audit(text: str) -> dict[str, Any]:
         if not lines:
             errors.append(f"missing decision topic section: {aliases[0]}")
             continue
-        clean_lines = [plain_markdown(line, 800) for line in lines if line.strip()]
-        missing = [layer for layer in required_layers if not any(re.search(rf"(?:^|[-*]\s*)\*?\*?{layer}[：:]", line) for line in clean_lines)]
-        if missing:
-            errors.append(f"{aliases[0]} missing decision layers: {missing}")
-        else:
-            complete_topics += 1
+        complete_topics += 1
         topic_text = " ".join(plain_markdown(line, 1000) for line in lines if line.strip())
         if deep_research_enforced and len(topic_text) < minimum_topic_characters:
             errors.append(
@@ -1160,6 +1155,58 @@ def report_quality_audit(text: str) -> dict[str, Any]:
             errors.append(
                 f"{aliases[0]} needs at least {minimum_topic_links} clickable evidence source(s), found {len(topic_links)}"
             )
+
+    core_matches = list(re.finditer(r"^###\s+核心主线[：:]\s*(.+?)\s*$", text, re.MULTILINE))
+    core_audits: list[dict[str, Any]] = []
+    story_enforce_from = str(research_policy.get("story_evidence_enforce_from_date") or "9999-12-31")
+    story_evidence_enforced = report_date >= story_enforce_from
+    for index, match in enumerate(core_matches):
+        next_heading = re.search(r"^#{1,3}\s+", text[match.end():], re.MULTILINE)
+        block_end = match.end() + next_heading.start() if next_heading else len(text)
+        body = text[match.end():block_end]
+        missing = [layer for layer in required_layers if not re.search(rf"(?:\*\*)?{layer}[：:]", body)]
+        links = {
+            item["href"] for item in markdown_links(body, limit=40)
+            if urlparse(item["href"]).scheme in {"http", "https"}
+            and urlparse(item["href"]).netloc
+            and urlparse(item["href"]).path not in {"", "/"}
+        }
+        domains = {urlparse(href).netloc.lower().removeprefix("www.") for href in links}
+        role_line = re.search(r"(?:\*\*)?证据角色[：:]([^\n]+)", body)
+        role_text = role_line.group(1) if role_line else ""
+        role_links = {item["href"] for item in markdown_links(role_text, limit=10)}
+        roles = {
+            "primary": bool(re.search(r"一手来源\s*=", role_text)) and bool(role_links & links),
+            "eventRegion": bool(re.search(r"事件地区来源\s*=", role_text)) and bool(role_links & links),
+            "externalVerification": bool(re.search(r"外部核验\s*=", role_text)) and bool(role_links & links),
+        }
+        core_errors = [f"missing decision layers: {missing}"] if missing else []
+        if story_evidence_enforced:
+            minimum_story_sources = int(research_policy.get("minimum_sources_per_core_story", 0))
+            minimum_story_domains = int(research_policy.get("minimum_independent_domains_per_core_story", 0))
+            if len(links) < minimum_story_sources:
+                core_errors.append(f"needs {minimum_story_sources} direct sources; found {len(links)}")
+            if len(domains) < minimum_story_domains:
+                core_errors.append(f"needs {minimum_story_domains} independent domains; found {len(domains)}")
+            missing_roles = [name for name, present in roles.items() if not present]
+            if missing_roles:
+                core_errors.append(f"missing linked evidence roles: {missing_roles}")
+        core_audits.append({
+            "title": match.group(1).strip(),
+            "sourceCount": len(links),
+            "sourceDomainCount": len(domains),
+            "roles": roles,
+            "errors": core_errors,
+            "passed": not core_errors,
+        })
+        errors.extend(f"core story '{match.group(1).strip()}': {error}" for error in core_errors)
+
+    minimum_core = int(research_policy.get("primary_thesis_min_items", 0))
+    maximum_core = int(research_policy.get("primary_thesis_max_items", 5))
+    if story_evidence_enforced and len(core_matches) < minimum_core:
+        errors.append(f"report needs at least {minimum_core} explicitly marked core thesis block(s)")
+    if len(core_matches) > maximum_core:
+        errors.append(f"report exceeds the {maximum_core}-thesis maximum")
 
     def table_row_count(lines: list[str]) -> int:
         rows = [line for line in lines if line.strip().startswith("|")]
@@ -1217,6 +1264,9 @@ def report_quality_audit(text: str) -> dict[str, Any]:
         "coreDecisionCount": core_rows,
         "primaryThesisCount": core_rows,
         "topicSectionCount": complete_topics,
+        "coreThesisCount": len(core_matches),
+        "coreStoryAudits": core_audits,
+        "storyEvidenceEnforced": story_evidence_enforced,
         "sourceDomainCount": source_domain_count,
         "deepResearchMode": research_policy.get("mode") == "deep",
         "deepResearchEnforced": deep_research_enforced,
@@ -1228,7 +1278,7 @@ def report_quality_audit(text: str) -> dict[str, Any]:
         "observationCount": observation_rows,
         "fillerCount": len(filler_hits),
         "repeatedPairCount": len(repeated_pairs),
-        "decisionLayerDensityPct": round((complete_topics * len(required_layers)) / max(nonempty_lines, 1) * 100, 2),
+        "decisionLayerDensityPct": round((sum(item["passed"] for item in core_audits) * len(required_layers)) / max(nonempty_lines, 1) * 100, 2),
         "errors": errors,
         "warnings": warnings,
         "repeatedPairs": repeated_pairs,

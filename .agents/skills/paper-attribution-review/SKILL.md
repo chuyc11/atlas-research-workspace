@@ -14,6 +14,7 @@ Use this skill only for virtual simulation. Never place real orders or imply rea
 Read:
 
 - `work/global-briefing/config/paper_trading.json`
+- `work/global-briefing/config/paper_theme_registry.json`
 - `work/global-briefing/data/paper_portfolio_us.json`
 - `work/global-briefing/data/paper_portfolio_china.json`
 - `work/global-briefing/data/paper_trades_us.jsonl`
@@ -46,6 +47,8 @@ Each BUY/SELL/HOLD decision must include:
 - action
 - quantity for BUY/SELL, or current position for HOLD when useful
 - price and price source
+- decision date and actual market-session price date
+- canonical primary theme, supplied explicitly or by a verified registry entry
 - thesis/reason
 - risk
 - linked prediction/scenario when possible
@@ -61,6 +64,7 @@ Respect `paper_trading.json`:
 - No options or derivatives by default.
 - Respect maximum single-position percentage.
 - Respect maximum daily turnover.
+- Resolve every open position to one canonical primary risk theme and reject future BUY actions that would breach `maximum_theme_exposure_pct`.
 - Keep minimum cash reserve.
 - A-share BUY orders round down to 100-share lots.
 - A-share same-day SELL is blocked by T+1.
@@ -93,3 +97,18 @@ python work\global-briefing\scripts\evolution.py paper-attribution --period mont
 ```
 
 In the report, separate account equity, cash, positions, recent virtual trades, today's decisions, thesis, risk, and portfolio review.
+Daily attribution is the change since the previous recorded valuation (or the reconstructed pre-period state), not lifetime unrealized P/L. Always expose the start-exclusive/end-inclusive window, starting and ending equity, period P/L, period return, and the reconciliation difference. Keep cumulative unrealized P/L as a separate position diagnostic.
+
+The theme registry is non-economic risk master data. Audit its current content-addressed revision with:
+
+```powershell
+python work\global-briefing\scripts\paper_theme_registry.py audit --date YYYY-MM-DD
+```
+
+For any intentional registry edit, record a reasoned revision before applying a new BUY:
+
+```powershell
+python work\global-briefing\scripts\paper_theme_registry.py record-revision --date YYYY-MM-DD --reason "Explain the mandate or thesis change"
+```
+
+Do not rewrite historical trades to improve theme coverage. A verified sidecar assignment may classify an existing position for attribution. Registry conflicts, unknown BUY themes, unclassified open positions, an unrecorded current registry revision, and post-order theme exposure above the configured cap must fail closed before a BUY append. A registry-history problem must not block SELL or HOLD.

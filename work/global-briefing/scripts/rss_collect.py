@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import html
+import ipaddress
 import re
 import json
+import socket
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from defusedxml import ElementTree as ET
+from defusedxml.common import DefusedXmlException
 from html.parser import HTMLParser
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -34,23 +37,122 @@ REQUEST_HEADERS = {
     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.7,zh;q=0.6",
 }
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+MAX_REDIRECTS = 3
 
 
-def fetch(url: str, timeout: int, max_response_bytes: int = MAX_RESPONSE_BYTES) -> bytes:
-    request = urllib.request.Request(url, headers=REQUEST_HEADERS)
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        content_length = response.headers.get("Content-Length")
-        if content_length:
-            try:
-                declared_size = int(content_length)
-            except ValueError:
-                declared_size = 0
-            if declared_size > max_response_bytes:
+class UnsafeUrlError(ValueError):
+    """Raised when an outbound source URL violates the public-network policy."""
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        return None
+
+
+def _normalize_hostname(hostname: str) -> str:
+    try:
+        return hostname.rstrip(".").encode("idna").decode("ascii").lower()
+    except UnicodeError as exc:
+        raise UnsafeUrlError("source URL contains an invalid hostname") from exc
+
+
+def _resolve_host_addresses(hostname: str) -> set[str]:
+    try:
+        records = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+    except socket.gaierror as exc:
+        raise UnsafeUrlError(f"source hostname could not be resolved: {hostname}") from exc
+    return {str(record[4][0]).split("%", 1)[0] for record in records}
+
+
+def source_allowed_hosts(source: dict[str, Any]) -> set[str]:
+    candidates = [source.get("homepage"), *source.get("rss", []), *source.get("allowed_redirect_hosts", [])]
+    hosts: set[str] = set()
+    for value in candidates:
+        if not value:
+            continue
+        parsed = urllib.parse.urlsplit(str(value))
+        if parsed.hostname:
+            hosts.add(_normalize_hostname(parsed.hostname))
+        elif "://" not in str(value):
+            hosts.add(_normalize_hostname(str(value)))
+    return hosts
+
+
+def validate_public_https_url(url: str, allowed_hosts: set[str]) -> str:
+    if not isinstance(url, str) or not url or len(url) > 4096 or any(ord(char) < 32 for char in url):
+        raise UnsafeUrlError("source URL is empty, oversized, or contains control characters")
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme.lower() != "https":
+        raise UnsafeUrlError("source URL must use HTTPS")
+    if parsed.username is not None or parsed.password is not None:
+        raise UnsafeUrlError("source URL must not contain credentials")
+    if not parsed.hostname:
+        raise UnsafeUrlError("source URL must contain a hostname")
+    try:
+        port = parsed.port
+    except ValueError as exc:
+        raise UnsafeUrlError("source URL contains an invalid port") from exc
+    if port not in {None, 443}:
+        raise UnsafeUrlError("source URL must use the default HTTPS port")
+
+    hostname = _normalize_hostname(parsed.hostname)
+    normalized_allowlist = {_normalize_hostname(host) for host in allowed_hosts}
+    if hostname not in normalized_allowlist:
+        raise UnsafeUrlError(f"source hostname is not allowlisted: {hostname}")
+    addresses = _resolve_host_addresses(hostname)
+    if not addresses:
+        raise UnsafeUrlError(f"source hostname has no usable address: {hostname}")
+    for address in addresses:
+        try:
+            parsed_address = ipaddress.ip_address(address)
+        except ValueError as exc:
+            raise UnsafeUrlError(f"source hostname resolved to an invalid address: {hostname}") from exc
+        if not parsed_address.is_global:
+            raise UnsafeUrlError(f"source hostname resolved to a non-public address: {hostname}")
+    return urllib.parse.urlunsplit(("https", parsed.netloc, parsed.path or "/", parsed.query, ""))
+
+
+def fetch(
+    url: str,
+    timeout: int,
+    max_response_bytes: int = MAX_RESPONSE_BYTES,
+    *,
+    allowed_hosts: set[str] | None = None,
+    max_redirects: int = MAX_REDIRECTS,
+) -> bytes:
+    initial_hostname = urllib.parse.urlsplit(url).hostname
+    effective_hosts = allowed_hosts or ({initial_hostname} if initial_hostname else set())
+    current_url = validate_public_https_url(url, effective_hosts)
+    opener = urllib.request.build_opener(_NoRedirectHandler())
+    for redirect_count in range(max_redirects + 1):
+        request = urllib.request.Request(current_url, headers=REQUEST_HEADERS)
+        try:
+            response = opener.open(request, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code not in {301, 302, 303, 307, 308}:
+                raise
+            location = exc.headers.get("Location")
+            if not location or redirect_count >= max_redirects:
+                raise UnsafeUrlError("source redirect is missing a location or exceeds the redirect limit") from exc
+            current_url = validate_public_https_url(urllib.parse.urljoin(current_url, location), effective_hosts)
+            continue
+
+        with response:
+            final_url = response.geturl() if hasattr(response, "geturl") else current_url
+            validate_public_https_url(final_url, effective_hosts)
+            content_length = response.headers.get("Content-Length")
+            if content_length:
+                try:
+                    declared_size = int(content_length)
+                except ValueError:
+                    declared_size = 0
+                if declared_size > max_response_bytes:
+                    raise ValueError(f"Response exceeds {max_response_bytes} byte limit: {url}")
+            payload = response.read(max_response_bytes + 1)
+            if len(payload) > max_response_bytes:
                 raise ValueError(f"Response exceeds {max_response_bytes} byte limit: {url}")
-        payload = response.read(max_response_bytes + 1)
-        if len(payload) > max_response_bytes:
-            raise ValueError(f"Response exceeds {max_response_bytes} byte limit: {url}")
-        return payload
+            return payload
+    raise UnsafeUrlError("source redirect limit exceeded")
 
 
 def text_of(element: ET.Element | None) -> str:
@@ -168,7 +270,7 @@ def scrape_homepage(
     homepage = source.get("homepage")
     if not homepage:
         return []
-    raw = fetch(homepage, timeout)
+    raw = fetch(homepage, timeout, allowed_hosts=source_allowed_hosts(source))
     parser = LinkCollector()
     parser.feed(raw.decode("utf-8", errors="replace"))
     items: list[dict[str, Any]] = []
@@ -306,7 +408,7 @@ def collect(
         if source.get("discovery_mode") == "homepage":
             try:
                 discovery_items = scrape_homepage(source, timeout, source_method="homepage_discovery")
-            except (urllib.error.URLError, TimeoutError, OSError, UnicodeError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError, UnicodeError, ValueError, DefusedXmlException) as exc:
                 output["errors"].append(
                     {"source": source.get("name"), "feed_url": source.get("homepage"), "error": f"homepage discovery failed: {exc}"}
                 )
@@ -320,8 +422,12 @@ def collect(
                 source_item_count += 1
         for feed_url in source.get("rss", []):
             try:
-                items = parse_feed(fetch(feed_url, timeout), source, feed_url)
-            except (urllib.error.URLError, TimeoutError, ET.ParseError, OSError) as exc:
+                items = parse_feed(
+                    fetch(feed_url, timeout, allowed_hosts=source_allowed_hosts(source)),
+                    source,
+                    feed_url,
+                )
+            except (urllib.error.URLError, TimeoutError, ET.ParseError, OSError, ValueError, DefusedXmlException) as exc:
                 output["errors"].append({"source": source.get("name"), "feed_url": feed_url, "error": str(exc)})
                 source_feed_errors += 1
                 continue
@@ -335,7 +441,7 @@ def collect(
         if homepage_fallback and source.get("rss") and source_item_count == 0 and source_feed_errors:
             try:
                 fallback_items = scrape_homepage(source, timeout)
-            except (urllib.error.URLError, TimeoutError, OSError, UnicodeError) as exc:
+            except (urllib.error.URLError, TimeoutError, OSError, UnicodeError, ValueError, DefusedXmlException) as exc:
                 output["errors"].append(
                     {"source": source.get("name"), "feed_url": source.get("homepage"), "error": f"homepage fallback failed: {exc}"}
                 )

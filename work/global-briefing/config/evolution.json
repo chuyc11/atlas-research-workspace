@@ -4,8 +4,9 @@
   "purpose": "Structured forecast-review and paper-trading attribution policy for the global briefing automation.",
   "metric_boundary": {
     "legacy_component_score": "Subjective diagnostic rubric only; must not be described as calibration or proper forecast accuracy.",
-    "research_metrics": ["brier_score", "log_loss", "expected_calibration_error"],
-    "research_eligibility": "Numeric ex-ante probability, pre-registered deadline/criteria, binary observed outcome, resolution evidence, and no premature closure."
+    "event_research_metrics": ["brier_score", "log_loss", "expected_calibration_error"],
+    "market_mapping_metrics": ["resolved_coverage_pct", "hit_rate_pct", "mean_signed_performance_pct"],
+    "research_eligibility": "Numeric ex-ante event probability, pre-registered event deadline/criteria, binary observed event outcome, resolution evidence, and no premature closure. Asset mappings are scored separately against their own benchmark and deadline."
   },
   "prediction_review_fields": {
     "score": {

@@ -290,6 +290,12 @@ def append_prediction_records(input_path: Path, date: str, predictions: Path = D
                     event_asset_separation_enforce_from_date=str(
                         settings.get("review_queue", {}).get("event_asset_separation_enforce_from_date") or ""
                     ) or None,
+                    independence_enforce_from_date=str(
+                        settings.get("prediction_contract", {}).get("independence_enforce_from_date") or ""
+                    ) or None,
+                    evidence_reproducibility_enforce_from_date=str(
+                        settings.get("prediction_contract", {}).get("evidence_reproducibility_enforce_from_date") or ""
+                    ) or None,
                 ))
         if not is_review and prediction_id:
             originals[prediction_id] = record

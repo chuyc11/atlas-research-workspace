@@ -1,0 +1,138 @@
+{
+  "schema_version": 1,
+  "updated": "2026-07-13",
+  "method": "Primary theme is the single conservative risk bucket used for the hard exposure cap. Secondary themes are explanatory only and never dilute primary-theme exposure.",
+  "allowed_themes": [
+    "ai_semiconductors",
+    "china_broad_market",
+    "china_technology",
+    "climate_adaptation",
+    "cybersecurity_governance",
+    "geopolitical_security",
+    "safe_haven",
+    "travel_aviation",
+    "utilities_defensive"
+  ],
+  "entries": [
+    {
+      "account": "US",
+      "symbol": "CIBR",
+      "exchange": "NASDAQ",
+      "primary_theme": "cybersecurity_governance",
+      "secondary_themes": ["ai_semiconductors"],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF mandate is cybersecurity exposure", "Linked position thesis is AI governance, identity and cybersecurity"]
+    },
+    {
+      "account": "US",
+      "symbol": "PHO",
+      "exchange": "NASDAQ",
+      "primary_theme": "climate_adaptation",
+      "secondary_themes": [],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF mandate is water resources and infrastructure", "Linked thesis is climate-driven water and adaptation spending"]
+    },
+    {
+      "account": "US",
+      "symbol": "SMH",
+      "exchange": "NASDAQ",
+      "primary_theme": "ai_semiconductors",
+      "secondary_themes": [],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF mandate is semiconductor equities", "Linked thesis is AI infrastructure and hardware capital expenditure"]
+    },
+    {
+      "account": "US",
+      "symbol": "GLD",
+      "exchange": "NYSE ARCA",
+      "primary_theme": "safe_haven",
+      "secondary_themes": ["geopolitical_security"],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["Instrument is a gold exposure vehicle", "Position was opened as a geopolitical tail-risk hedge"]
+    },
+    {
+      "account": "US",
+      "symbol": "ITA",
+      "exchange": "NYSE ARCA",
+      "primary_theme": "geopolitical_security",
+      "secondary_themes": [],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF mandate is aerospace and defense", "Linked thesis is defense modernization and procurement"]
+    },
+    {
+      "account": "US",
+      "symbol": "JETS",
+      "exchange": "NYSE ARCA",
+      "primary_theme": "travel_aviation",
+      "secondary_themes": [],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF mandate is global airlines", "Linked thesis is aviation sensitivity to fuel and route risk"]
+    },
+    {
+      "account": "CHINA",
+      "symbol": "2800.HK",
+      "exchange": "HK",
+      "primary_theme": "china_broad_market",
+      "secondary_themes": [],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF tracks a broad Hong Kong equity index", "Position was opened to diversify concentrated growth exposure"]
+    },
+    {
+      "account": "CHINA",
+      "symbol": "3033.HK",
+      "exchange": "HK",
+      "primary_theme": "china_technology",
+      "secondary_themes": ["ai_semiconductors"],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF mandate is Hang Seng technology exposure", "Linked thesis is China internet and AI risk appetite"]
+    },
+    {
+      "account": "CHINA",
+      "symbol": "510300.SH",
+      "exchange": "SH",
+      "primary_theme": "china_broad_market",
+      "secondary_themes": [],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF tracks the CSI 300 broad large-cap index", "Linked thesis is broad-market policy beta and defensive breadth"]
+    },
+    {
+      "account": "CHINA",
+      "symbol": "512660.SH",
+      "exchange": "SH",
+      "primary_theme": "geopolitical_security",
+      "secondary_themes": [],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF mandate is defense-industry exposure", "Linked thesis is security pressure and defense supply-chain sentiment"]
+    },
+    {
+      "account": "CHINA",
+      "symbol": "588000.SH",
+      "exchange": "SH",
+      "primary_theme": "ai_semiconductors",
+      "secondary_themes": ["china_technology"],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["ETF tracks the STAR 50 hard-technology universe", "Linked thesis is China AI infrastructure and technology capital expenditure"]
+    },
+    {
+      "account": "CHINA",
+      "symbol": "600900.SH",
+      "exchange": "SH",
+      "primary_theme": "utilities_defensive",
+      "secondary_themes": ["climate_adaptation"],
+      "status": "verified",
+      "effective_from": "2026-07-13",
+      "evidence": ["Issuer is a large hydropower utility", "Position was opened as a defensive utility counterweight"]
+    }
+  ]
+}

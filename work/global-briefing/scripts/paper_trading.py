@@ -18,6 +18,13 @@ from typing import Any
 SCRIPT_PATH = Path(__file__).resolve()
 ROOT = SCRIPT_PATH.parents[3]
 CONFIG_PATH = ROOT / "work" / "global-briefing" / "config" / "paper_trading.json"
+if str(SCRIPT_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_PATH.parent))
+
+from paper_theme_registry import assignment_for as registry_theme_assignment
+from paper_theme_registry import audit_history as audit_theme_registry_history
+from paper_theme_registry import load_registry as load_theme_registry
+from paper_theme_registry import resolve_order_theme
 
 
 def now_iso() -> str:
@@ -50,6 +57,22 @@ def validate_config(config: dict[str, Any]) -> None:
     if int(config["max_new_positions_per_day"]) < 1:
         raise ValueError("max_new_positions_per_day must be at least 1.")
 
+    contract = config.get("order_contract", {}) if isinstance(config.get("order_contract"), dict) else {}
+    for field in (
+        "price_date_required_from_date",
+        "theme_required_from_date",
+        "maximum_theme_exposure_enforce_from_date",
+        "theme_registry_history_required_from_date",
+    ):
+        if contract.get(field):
+            datetime.strptime(str(contract[field])[:10], "%Y-%m-%d")
+    if contract.get("theme_registry_history_required_from_date") and not all(
+        config.get(field) for field in ("theme_registry_history_file", "theme_registry_snapshot_dir")
+    ):
+        raise ValueError(
+            "theme_registry_history_file and theme_registry_snapshot_dir are required when registry-history enforcement is configured."
+        )
+
     profile = config.get("strategy_profile", {})
     if not isinstance(profile, dict) or not profile.get("enabled"):
         return
@@ -75,6 +98,11 @@ def validate_config(config: dict[str, Any]) -> None:
     component_total = sum(float(value) for value in signal.get("components", {}).values())
     if abs(component_total - 100) > 1e-9:
         raise ValueError("strategy_profile signal component weights must total 100.")
+    risk_overlays = profile.get("risk_overlays", {}) if isinstance(profile.get("risk_overlays"), dict) else {}
+    if "maximum_theme_exposure_pct" in risk_overlays:
+        maximum_theme = float(risk_overlays["maximum_theme_exposure_pct"])
+        if not 0 < maximum_theme <= 1:
+            raise ValueError("strategy_profile maximum_theme_exposure_pct must be greater than 0 and at most 1.")
 
 
 def load_config() -> dict[str, Any]:
@@ -616,6 +644,62 @@ def equity(state: dict[str, Any]) -> float:
     return float(state.get("cash", 0.0)) + priced_positions_value(state)
 
 
+def theme_registry_for_config(
+    config: dict[str, Any],
+    *,
+    date: str | None = None,
+    require_recorded_revision: bool = False,
+) -> dict[str, Any]:
+    if not config.get("theme_registry_file"):
+        return {"schema_version": 1, "allowed_themes": [], "entries": []}
+    registry = load_theme_registry(config, ROOT, strict=True)
+    if require_recorded_revision:
+        if not date:
+            raise ValueError("A decision date is required to verify the paper theme registry revision.")
+        audit = audit_theme_registry_history(config, ROOT, date)
+        if not audit.get("audit_passed") or not audit.get("history_current"):
+            errors = [*audit.get("history_errors", []), *audit.get("snapshot_errors", [])]
+            detail = "; ".join(errors) or "current registry revision is not audited"
+            raise ValueError(f"BUY blocked by paper theme registry history gate: {detail}")
+        registry["_revision_id"] = audit.get("current_revision_id")
+        registry["_registry_sha256"] = audit.get("current_registry_sha256")
+    return registry
+
+
+def classified_theme_exposure(
+    state: dict[str, Any],
+    config: dict[str, Any],
+    registry: dict[str, Any],
+    date: str,
+) -> tuple[dict[str, float], list[str]]:
+    exposures: dict[str, float] = {}
+    missing: list[str] = []
+    account = config.get("account")
+    for key, position in state.get("positions", {}).items():
+        if not isinstance(position, dict) or float(position.get("quantity", 0.0)) <= 0:
+            continue
+        assignment = registry_theme_assignment(
+            registry,
+            account,
+            position.get("symbol"),
+            position.get("exchange"),
+            date,
+        )
+        registered = str(assignment.get("primary_theme")) if assignment else None
+        explicit = str(position.get("theme") or "").strip() or None
+        if explicit and registered and explicit != registered:
+            raise ValueError(f"Position {account}:{key} theme {explicit!r} conflicts with verified registry theme {registered!r}.")
+        theme = explicit or registered
+        if not theme:
+            missing.append(f"{account}:{key}")
+            continue
+        price_item = state.get("last_prices", {}).get(key, {})
+        price = float(price_item.get("price", position.get("avg_cost", 0.0)) or 0.0)
+        value = float(position.get("quantity", 0.0)) * price * state_fx_rate(state, position, price_item)
+        exposures[theme] = exposures.get(theme, 0.0) + value
+    return exposures, missing
+
+
 def turnover_for_date(
     date: str,
     trades_path: Path,
@@ -691,10 +775,37 @@ def apply_order(
     reason = str(order.get("reason", "")).strip()
     if not reason:
         raise ValueError(f"Order for {key} requires reason.")
+    decision_date = str(order.get("date") or date)[:10]
+    price_date_raw = order.get("price_date")
+    contract = config.get("order_contract", {}) if isinstance(config.get("order_contract"), dict) else {}
+    price_date_required_from = str(contract.get("price_date_required_from_date") or "9999-12-31")[:10]
+    if order.get("price") not in (None, "") and decision_date >= price_date_required_from and not price_date_raw:
+        raise ValueError(f"Order for {key} requires price_date from {price_date_required_from}.")
+    price_date = str(price_date_raw or decision_date)[:10] if order.get("price") not in (None, "") else None
+    if price_date and price_date > decision_date:
+        raise ValueError(f"Order price_date {price_date} cannot follow decision date {decision_date} for {key}.")
+    history_required_from = str(contract.get("theme_registry_history_required_from_date") or "9999-12-31")[:10]
+    require_recorded_revision = action == "BUY" and decision_date >= history_required_from
+    theme_registry = theme_registry_for_config(
+        config,
+        date=decision_date,
+        require_recorded_revision=require_recorded_revision,
+    )
+    theme_required_from = str(contract.get("theme_required_from_date") or "9999-12-31")[:10]
+    theme, theme_source = resolve_order_theme(
+        theme_registry,
+        account=config.get("account"),
+        symbol=symbol,
+        exchange=exchange,
+        date=decision_date,
+        explicit_theme=order.get("theme"),
+        required=action == "BUY" and decision_date >= theme_required_from,
+    )
 
     record: dict[str, Any] = {
         "timestamp": now_iso(),
-        "date": order.get("date", date),
+        "date": decision_date,
+        "price_date": price_date,
         "account": config.get("account"),
         "account_id": config.get("account_id"),
         "market_scope": config.get("market_scope"),
@@ -704,6 +815,10 @@ def apply_order(
         "market_type": market_type,
         "currency": order.get("currency") or market_rules.get("currency"),
         "prediction_id": order.get("prediction_id"),
+        "theme": theme,
+        "theme_source": theme_source,
+        "theme_registry_revision_id": theme_registry.get("_revision_id") if action == "BUY" else None,
+        "theme_registry_sha256": theme_registry.get("_registry_sha256") if action == "BUY" else None,
         "scenario": order.get("scenario"),
         "reason": reason,
         "risk": order.get("risk"),
@@ -764,9 +879,43 @@ def apply_order(
     gross_base = gross * fx_to_base
     fee_base = fee * fx_to_base
     portfolio_equity = max(equity(state), 1.0)
+    profile = config.get("strategy_profile", {})
+    theme_exposure_after = None
+    theme_exposure_pct_after = None
+    theme_limit = None
+    if action == "BUY":
+        enforce_from = str(contract.get("maximum_theme_exposure_enforce_from_date") or "9999-12-31")[:10]
+        if decision_date >= enforce_from:
+            exposures, missing_themes = classified_theme_exposure(state, config, theme_registry, decision_date)
+            if missing_themes:
+                raise ValueError(
+                    "Cannot enforce maximum theme exposure while open positions lack a canonical theme: "
+                    + ", ".join(sorted(missing_themes))
+                )
+            if not theme:
+                raise ValueError(f"BUY {key} requires a canonical paper theme before theme-cap enforcement.")
+            theme_limit = portfolio_equity * float(
+                profile.get("risk_overlays", {}).get("maximum_theme_exposure_pct", 0.0)
+            )
+            theme_exposure_after = float(exposures.get(theme, 0.0)) + gross_base
+            existing_position = state.get("positions", {}).get(key)
+            if isinstance(existing_position, dict) and float(existing_position.get("quantity", 0.0)) > 0:
+                old_price_item = state.get("last_prices", {}).get(key, {})
+                old_value = (
+                    float(existing_position.get("quantity", 0.0))
+                    * float(old_price_item.get("price", existing_position.get("avg_cost", 0.0)) or 0.0)
+                    * state_fx_rate(state, existing_position, old_price_item)
+                )
+                repriced_value = float(existing_position.get("quantity", 0.0)) * price * fx_to_base
+                theme_exposure_after += repriced_value - old_value
+            theme_exposure_pct_after = theme_exposure_after / portfolio_equity
+            if theme_exposure_after > theme_limit + 1e-9:
+                raise ValueError(
+                    f"BUY {key} would exceed maximum theme exposure for {theme}: "
+                    f"{theme_exposure_after:.2f} > {theme_limit:.2f}."
+                )
 
     trades_path = resolve_path(config, "trades_file")
-    profile = config.get("strategy_profile", {})
     policy = profile.get("decision_policy", {}) if isinstance(profile, dict) else {}
     max_actions = int(policy.get("maximum_actions_per_account_per_day", 0))
     if profile.get("enabled") and max_actions > 0 and actions_for_date(
@@ -816,6 +965,7 @@ def apply_order(
                 "avg_cost": 0.0,
                 "cost_basis": 0.0,
                 "realized_pnl": 0.0,
+                "theme": theme,
                 "opened_at": now_iso(),
             }
             positions[key] = position
@@ -828,6 +978,10 @@ def apply_order(
         position["market_type"] = market_type
         position["currency"] = order.get("currency") or market_rules.get("currency")
         position["fx_to_base"] = fx_to_base
+        if theme and position.get("theme") and position.get("theme") != theme:
+            raise ValueError(f"BUY {key} theme {theme!r} conflicts with existing position theme {position.get('theme')!r}.")
+        if theme and not position.get("theme"):
+            position["theme"] = theme
         position["last_buy_date"] = str(record["date"])
         state["cash"] = float(state["cash"]) - total_cost
         realized = 0.0
@@ -861,7 +1015,7 @@ def apply_order(
         "currency": order.get("currency") or market_rules.get("currency"),
         "fx_to_base": fx_to_base,
         "price": price,
-        "date": record["date"],
+        "date": price_date or record["date"],
         "source": order.get("source"),
     }
     record.update(
@@ -881,6 +1035,9 @@ def apply_order(
             "market_lot_adjusted": True if action != "HOLD" and (quantity_raw is not None or notional_raw is not None) else False,
             "cash_after": float(state["cash"]),
             "equity_after": equity(state),
+            "theme_exposure_after": theme_exposure_after,
+            "theme_exposure_pct_after": round(theme_exposure_pct_after, 8) if theme_exposure_pct_after is not None else None,
+            "theme_limit_value": theme_limit,
         }
     )
     return record
@@ -1037,6 +1194,21 @@ def mark_account_to_market(config: dict[str, Any], state: dict[str, Any], prices
         "total_return_pct": summary["total_return_pct"],
         "base_currency": config.get("base_currency"),
         "paper_trading_only": True,
+        "price_snapshot": [
+            {
+                "key": key,
+                "symbol": item.get("symbol"),
+                "exchange": item.get("exchange"),
+                "market_type": item.get("market_type"),
+                "currency": item.get("currency"),
+                "fx_to_base": item.get("fx_to_base"),
+                "price": item.get("price"),
+                "price_date": item.get("date"),
+                "source": item.get("source"),
+            }
+            for key, item in sorted(state.get("last_prices", {}).items())
+            if key in state.get("positions", {}) and isinstance(item, dict)
+        ],
     }
     fingerprint_payload = {key: value for key, value in valuation.items() if key != "timestamp"}
     valuation["valuation_id"] = f"{config.get('account_id')}:{date}"
