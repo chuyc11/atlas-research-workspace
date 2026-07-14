@@ -43,6 +43,10 @@ ATLAS_LEDGER_STATE = ATLAS_RUNTIME_ROOT / "virtual_execution" / "atlas_virtual_e
 ATLAS_LEDGER_AUDIT = ATLAS_RUNTIME_ROOT / "virtual_execution" / "atlas_virtual_execution_audit.json"
 ATLAS_SELF_HEALING_LATEST = ATLAS_RUNTIME_ROOT / "self_healing" / "latest.json"
 ATLAS_IMPROVEMENTS_LATEST = ATLAS_RUNTIME_ROOT / "improvements" / "latest.json"
+ATLAS_ALERTS_LATEST = ATLAS_RUNTIME_ROOT / "alerts" / "latest.json"
+ATLAS_BACKUPS_LATEST = ATLAS_RUNTIME_ROOT / "backups" / "latest.json"
+PUBLICATION_SNAPSHOT_ROOT = ATLAS_RUNTIME_ROOT / "publication_snapshots"
+PUBLICATION_SNAPSHOT_SCHEMA_VERSION = 1
 
 
 def compact(value: str, limit: int = 280) -> str:
@@ -745,6 +749,32 @@ def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any
     }
 
 
+def public_portfolio(value: dict[str, Any]) -> dict[str, Any]:
+    """Project internal paper-account data into the explicitly public site contract."""
+    allocations = []
+    asset_number = 0
+    for item in value.get("allocations", []):
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label") or "")
+        if label not in {"现金", "其他"}:
+            asset_number += 1
+            label = f"匿名资产 {asset_number}"
+        allocations.append({"label": label, "pct": float(item.get("pct") or 0)})
+    return {
+        "name": str(value.get("name") or "虚拟组合"),
+        "return": str(value.get("return") or "N/A"),
+        "returnPct": float(value.get("returnPct") or 0),
+        "allocations": allocations,
+        "review": str(value.get("review") or "仅展示公开聚合指标。"),
+        "paperTradingOnly": value.get("paperTradingOnly") is True,
+        "publicDataOnly": True,
+        "limitations": [
+            "公开站点仅展示聚合收益率和匿名资产配置；账户、持仓、成本、现金与盈亏明细不进入发布载荷。"
+        ],
+    }
+
+
 def top_sources(text: str) -> list[dict[str, str]]:
     seen: set[str] = set()
     result = []
@@ -861,6 +891,12 @@ def source_health(report_date: str) -> dict[str, Any]:
     score -= min(15, round((100 - rss_coverage_pct) * 0.15))
     if market_items and stale_market_items == len(market_items):
         score -= 8
+    rss_item_count = fresh_items + stale_items + unknown_timestamp_items
+    stale_or_unknown_pct = round(
+        (stale_items + unknown_timestamp_items) / rss_item_count * 100,
+        2,
+    ) if rss_item_count else 0.0
+    score -= min(35, round(stale_or_unknown_pct * 0.5))
     score = max(0, min(100, int(score)))
     label = "良好" if score >= 85 else "中等" if score >= 65 else "受限"
     limitations: list[str] = []
@@ -868,6 +904,11 @@ def source_health(report_date: str) -> dict[str, Any]:
         limitations.append(f"RSS 采集出现 {len(errors)} 个错误。")
     if fallbacks:
         limitations.append(f"RSS 使用 {len(fallbacks)} 次回退。")
+    if stale_items or unknown_timestamp_items:
+        limitations.append(
+            f"RSS 时间戳质量受限：{stale_items} 条过期、{unknown_timestamp_items} 条未知，"
+            f"合计占 {stale_or_unknown_pct}%。"
+        )
     if china_errors:
         limitations.append(f"中国结构化行情出现 {len(china_errors)} 个错误，{china_fallback_items}/{len(china_items)} 条使用备用报价。")
     if stale_market_items:
@@ -879,6 +920,7 @@ def source_health(report_date: str) -> dict[str, Any]:
         "rssFresh24hCount": fresh_items,
         "rssStaleCount": stale_items,
         "rssUnknownTimestampCount": unknown_timestamp_items,
+        "rssStaleOrUnknownPct": stale_or_unknown_pct,
         "rssErrorCount": len(errors),
         "rssFallbackCount": len(fallbacks),
         "rssSourceCoveragePct": rss_coverage_pct,
@@ -889,7 +931,7 @@ def source_health(report_date: str) -> dict[str, Any]:
         "priorCloseMarketItemCount": prior_close_market_items,
         "marketItemCount": len(market_items),
         "limitations": limitations,
-        "method": "artifact_backed_source_health_v1",
+        "method": "artifact_backed_source_health_v2",
     }
 
 
@@ -897,22 +939,18 @@ def site_input_hash(raw_report: bytes, report_date: str) -> str:
     digest = hashlib.sha256()
     digest.update(f"atlas-site-schema:{SITE_SCHEMA_VERSION}\n".encode("utf-8"))
     digest.update(raw_report)
-    system_status = build_system_status(report_date)
-    # Self-healing telemetry is downstream operational metadata. Excluding it
-    # from the content identity prevents a health run from recursively creating
-    # a new site update that triggers another health run.
-    system_status.pop("selfHealing", None)
-    system_status.pop("improvements", None)
+    # Operational telemetry is published inside a frozen closed-loop snapshot,
+    # but it is not part of the editorial content identity. This prevents cycle,
+    # healing, alert, and backup updates from recursively changing the report hash.
     dated_inputs = {
         "predictions": predictions_for_date(report_date),
         "evolution": evolution_for_date(report_date),
         "sourceHealth": source_health(report_date),
         "markets": parse_markets(report_date),
         "portfolios": {
-            "us": portfolio("US", report_date),
-            "china": portfolio("CHINA", report_date),
+            "us": public_portfolio(portfolio("US", report_date)),
+            "china": public_portfolio(portfolio("CHINA", report_date)),
         },
-        "system": system_status,
     }
     digest.update(json.dumps(dated_inputs, ensure_ascii=False, sort_keys=True).encode("utf-8"))
     return digest.hexdigest()
@@ -947,13 +985,18 @@ def build_system_status(report_date: str) -> dict[str, Any]:
     if not isinstance(improvements, dict) or str(improvements.get("date") or "") != report_date:
         improvements = {}
     improvement_counts = improvements.get("counts", {}) if isinstance(improvements, dict) else {}
+    alerts = load_json(ATLAS_ALERTS_LATEST, {})
+    if not isinstance(alerts, dict) or str(alerts.get("date") or "") != report_date:
+        alerts = {}
+    backups = load_json(ATLAS_BACKUPS_LATEST, {})
+    if not isinstance(backups, dict) or str(backups.get("date") or "") != report_date:
+        backups = {}
     stages = []
     for item in cycle.get("stages", []) if isinstance(cycle, dict) else []:
         if isinstance(item, dict):
             stages.append({
                 "name": str(item.get("name") or "unknown"),
                 "status": str(item.get("status") or "unknown"),
-                "detail": item.get("detail"),
             })
     return {
         "asOf": str(cycle.get("date") or report_date) if isinstance(cycle, dict) else report_date,
@@ -1009,10 +1052,51 @@ def build_system_status(report_date: str) -> dict[str, Any]:
             "blocking": int(improvement_counts.get("blocking") or 0) if isinstance(improvement_counts, dict) else 0,
             "capabilityGaps": int(improvement_counts.get("capability_gaps") or 0) if isinstance(improvement_counts, dict) else 0,
         },
+        "alerts": {
+            "status": str(alerts.get("status") or "not_run"),
+            "findingCount": int(alerts.get("finding_count") or 0) if isinstance(alerts, dict) else 0,
+        },
+        "recovery": {
+            "status": "verified" if backups.get("verified") is True and backups.get("restore_verified") is True else "not_run",
+            "restoreVerified": backups.get("restore_verified") is True,
+            "outsideWorkspace": backups.get("target_outside_workspace") is True,
+            "fileCount": int(backups.get("file_count") or 0) if isinstance(backups, dict) else 0,
+        },
         "boundary": {
             "paperTradingOnly": True,
             "realBrokerOrdersAllowed": False,
             "legacyLedgersReadOnly": True,
+        },
+    }
+
+
+def public_system_status(value: dict[str, Any]) -> dict[str, Any]:
+    """Keep operational details out of the browser-delivered public payload."""
+    return {
+        "asOf": str(value.get("asOf") or ""),
+        "overallPassed": value.get("overallPassed") is True,
+        "stages": [
+            {"name": str(item.get("name") or "unknown"), "status": str(item.get("status") or "unknown")}
+            for item in value.get("stages", [])
+            if isinstance(item, dict)
+        ],
+        "ledger": {"auditPassed": value.get("ledger", {}).get("auditPassed") is True},
+        "replay": {
+            "executionSafetyPassed": value.get("replay", {}).get("executionSafetyPassed") is True,
+            "strategyEvidencePassed": value.get("replay", {}).get("strategyEvidencePassed") is True,
+        },
+        "shadow": {
+            "recommendedState": str(value.get("shadow", {}).get("recommendedState") or "shadow"),
+            "evidenceStatus": str(value.get("shadow", {}).get("evidenceStatus") or "unknown"),
+        },
+        "selfHealing": {"status": str(value.get("selfHealing", {}).get("status") or "not_run")},
+        "improvements": {"status": str(value.get("improvements", {}).get("status") or "not_run")},
+        "boundary": {
+            "paperTradingOnly": True,
+            "realBrokerOrdersAllowed": False,
+            "sourceCodeAutoModified": False,
+            "productionAutoDeployed": False,
+            "automaticPromotionAllowed": False,
         },
     }
 
@@ -1083,11 +1167,16 @@ def report_quality_audit(text: str) -> dict[str, Any]:
         return max(0, len(rows) - 1)
 
     core_rows = table_row_count(find_section(sections, "核心摘要"))
-    observation_rows = table_row_count(find_section(sections, "股票与ETF观察", "全球股票/ETF观察"))
+    observation_rows = table_row_count(find_section(
+        sections,
+        "股票与ETF观察",
+        "全球股票/ETF观察",
+        "全球股票/ETF研究观察",
+    ))
     if not 3 <= core_rows <= 5:
         errors.append(f"core summary must contain 3-5 decision rows, found {core_rows}")
-    if observation_rows > 7:
-        errors.append(f"observation list must contain at most 7 rows, found {observation_rows}")
+    if not 1 <= observation_rows <= 7:
+        errors.append(f"observation list must contain 1-7 rows, found {observation_rows}")
 
     report_links = markdown_links(text, limit=200)
     distinct_links = {item["href"] for item in report_links}
@@ -1227,13 +1316,13 @@ def build_payload(text: str, report_date: str, report_count: int, sha256: str) -
         "scenarios": scenarios,
         "markets": parse_markets(report_date),
         "portfolios": {
-            "us": portfolio("US", report_date, portfolio_review(portfolio_lines, "US")),
-            "china": portfolio("CHINA", report_date, portfolio_review(portfolio_lines, "CHINA")),
+            "us": public_portfolio(portfolio("US", report_date, portfolio_review(portfolio_lines, "US"))),
+            "china": public_portfolio(portfolio("CHINA", report_date, portfolio_review(portfolio_lines, "CHINA"))),
         },
         "watchlist": watchlist,
         "risks": risks,
         "sources": top_sources(text),
-        "system": build_system_status(report_date),
+        "system": public_system_status(build_system_status(report_date)),
         "forecastReviews": forecast_reviews,
         "frameworkUpdates": framework_updates,
         "evolution": evolution_for_date(report_date),
@@ -1249,6 +1338,16 @@ def safe_public_href(value: Any) -> bool:
         return bool(re.fullmatch(r"#[A-Za-z][A-Za-z0-9_-]*", value))
     parsed = urlparse(value)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and not parsed.username and not parsed.password
+
+
+def contains_private_absolute_path(value: Any) -> bool:
+    if isinstance(value, dict):
+        return any(contains_private_absolute_path(item) for item in value.values())
+    if isinstance(value, list):
+        return any(contains_private_absolute_path(item) for item in value)
+    if not isinstance(value, str):
+        return False
+    return bool(re.search(r"(?:^|\s)[A-Za-z]:[\\/]|/(?:Users|home)/[^\s/]+/", value))
 
 
 def validate_payload(payload: dict[str, Any]) -> list[str]:
@@ -1345,8 +1444,11 @@ def validate_payload(payload: dict[str, Any]) -> list[str]:
                 continue
             if portfolio_payload.get("paperTradingOnly") is not True:
                 errors.append(f"portfolios.{account} must remain paper-trading only")
-            if not isinstance(portfolio_payload.get("positions"), list):
-                errors.append(f"portfolios.{account}.positions must be a list")
+            if portfolio_payload.get("publicDataOnly") is not True:
+                errors.append(f"portfolios.{account} must use the public-data projection")
+            forbidden_portfolio_fields = {"accountId", "positions", "cash", "equity", "realizedPnl", "initialCash"}
+            if forbidden_portfolio_fields.intersection(portfolio_payload):
+                errors.append(f"portfolios.{account} contains restricted account fields")
     system = payload.get("system")
     if not isinstance(system, dict):
         errors.append("system must be an object")
@@ -1354,6 +1456,8 @@ def validate_payload(payload: dict[str, Any]) -> list[str]:
         boundary = system.get("boundary")
         if not isinstance(boundary, dict) or boundary.get("paperTradingOnly") is not True or boundary.get("realBrokerOrdersAllowed") is not False:
             errors.append("system boundary must remain paper-only and forbid real broker orders")
+    if contains_private_absolute_path(payload):
+        errors.append("public payload contains a private absolute filesystem path")
     evolution = payload.get("evolution")
     if not isinstance(evolution, dict) or evolution.get("mode") != "gated_self_evolution":
         errors.append("evolution must contain the gated self-evolution state")
@@ -1398,6 +1502,173 @@ def site_data_matches(expected_hash: str, expected_payload_hash: str | None = No
     )
 
 
+def publication_snapshot_path(report_date: str) -> Path:
+    return PUBLICATION_SNAPSHOT_ROOT / f"atlas-publication-{report_date}.json"
+
+
+def publication_snapshot_readiness(report_date: str) -> dict[str, Any]:
+    cycle_path = cycle_audit_path(report_date)
+    cycle = load_json(cycle_path, {}) if cycle_path else {}
+    healing = load_json(ATLAS_SELF_HEALING_LATEST, {})
+    improvements = load_json(ATLAS_IMPROVEMENTS_LATEST, {})
+    alerts = load_json(ATLAS_ALERTS_LATEST, {})
+    backup = load_json(ATLAS_BACKUPS_LATEST, {})
+    reasons: list[str] = []
+
+    if not isinstance(cycle, dict) or cycle.get("date") != report_date or cycle.get("overall_passed") is not True:
+        reasons.append("date-aligned ATLAS cycle has not passed")
+    healing_counts = healing.get("counts", {}) if isinstance(healing, dict) else {}
+    if (
+        not isinstance(healing, dict)
+        or healing.get("date") != report_date
+        or int(healing_counts.get("blocking") or 0) != 0
+        or str(healing.get("overall_status") or "") == "blocked"
+    ):
+        reasons.append("date-aligned deep self-healing is missing or blocking")
+    improvement_counts = improvements.get("counts", {}) if isinstance(improvements, dict) else {}
+    if (
+        not isinstance(improvements, dict)
+        or improvements.get("date") != report_date
+        or int(improvement_counts.get("blocking") or 0) != 0
+    ):
+        reasons.append("date-aligned improvement verification is missing or blocking")
+    if not isinstance(alerts, dict) or alerts.get("date") != report_date or alerts.get("status") not in {"healthy", "attention_required"}:
+        reasons.append("date-aligned alert artifact is missing or invalid")
+    if (
+        not isinstance(backup, dict)
+        or backup.get("date") != report_date
+        or backup.get("verified") is not True
+        or backup.get("restore_verified") is not True
+        or backup.get("target_outside_workspace") is not True
+    ):
+        reasons.append("date-aligned external backup and restore verification has not passed")
+
+    return {
+        "ready": not reasons,
+        "reasons": reasons,
+        "evidence": {
+            "cycle": {
+                "date": cycle.get("date") if isinstance(cycle, dict) else None,
+                "overallPassed": cycle.get("overall_passed") is True if isinstance(cycle, dict) else False,
+            },
+            "selfHealing": {
+                "date": healing.get("date") if isinstance(healing, dict) else None,
+                "status": healing.get("overall_status") if isinstance(healing, dict) else None,
+                "blocking": int(healing_counts.get("blocking") or 0) if isinstance(healing_counts, dict) else 0,
+            },
+            "improvements": {
+                "date": improvements.get("date") if isinstance(improvements, dict) else None,
+                "status": improvements.get("status") if isinstance(improvements, dict) else None,
+                "blocking": int(improvement_counts.get("blocking") or 0) if isinstance(improvement_counts, dict) else 0,
+            },
+            "alerts": {
+                "date": alerts.get("date") if isinstance(alerts, dict) else None,
+                "status": alerts.get("status") if isinstance(alerts, dict) else None,
+                "findingCount": int(alerts.get("finding_count") or 0) if isinstance(alerts, dict) else 0,
+            },
+            "backup": {
+                "date": backup.get("date") if isinstance(backup, dict) else None,
+                "verified": backup.get("verified") is True if isinstance(backup, dict) else False,
+                "restoreVerified": backup.get("restore_verified") is True if isinstance(backup, dict) else False,
+                "outsideWorkspace": backup.get("target_outside_workspace") is True if isinstance(backup, dict) else False,
+            },
+        },
+    }
+
+
+def publication_snapshot_errors(
+    snapshot: dict[str, Any],
+    *,
+    report_date: str,
+    raw_report: bytes,
+    content_hash: str,
+) -> list[str]:
+    errors: list[str] = []
+    payload = snapshot.get("payload")
+    if snapshot.get("schema_version") != PUBLICATION_SNAPSHOT_SCHEMA_VERSION:
+        errors.append("publication snapshot schema version is invalid")
+    if snapshot.get("date") != report_date:
+        errors.append("publication snapshot date does not match report date")
+    report_hash = hashlib.sha256(raw_report).hexdigest()
+    if snapshot.get("report_sha256") != report_hash:
+        errors.append("report changed after publication snapshot freeze; explicit refresh is required")
+    if snapshot.get("content_hash") != content_hash:
+        errors.append("publication snapshot content hash is inconsistent")
+    if not isinstance(payload, dict):
+        errors.append("publication snapshot payload is missing")
+    else:
+        if payload.get("contentHash") != content_hash:
+            errors.append("frozen payload content hash is inconsistent")
+        if snapshot.get("payload_sha256") != payload_sha256(payload):
+            errors.append("publication snapshot payload hash is inconsistent")
+        errors.extend(validate_payload(payload))
+    return errors
+
+
+def load_publication_snapshot(
+    report_date: str,
+    raw_report: bytes,
+    content_hash: str,
+) -> dict[str, Any] | None:
+    path = publication_snapshot_path(report_date)
+    if not path.exists():
+        return None
+    snapshot = load_json(path, {})
+    if not isinstance(snapshot, dict):
+        raise ValueError("publication snapshot is not a JSON object")
+    errors = publication_snapshot_errors(
+        snapshot,
+        report_date=report_date,
+        raw_report=raw_report,
+        content_hash=content_hash,
+    )
+    if errors:
+        raise ValueError("; ".join(errors))
+    return snapshot
+
+
+def freeze_publication_snapshot(
+    *,
+    report_date: str,
+    raw_report: bytes,
+    content_hash: str,
+    payload: dict[str, Any],
+    refresh: bool = False,
+) -> dict[str, Any]:
+    readiness = publication_snapshot_readiness(report_date)
+    if readiness.get("ready") is not True:
+        raise ValueError("publication snapshot prerequisites failed: " + "; ".join(readiness.get("reasons") or []))
+    path = publication_snapshot_path(report_date)
+    existing = load_json(path, {}) if path.exists() else {}
+    if existing and not refresh:
+        raise ValueError("publication snapshot already exists; use --refresh-publication-snapshot after rerunning all gates")
+    revision = int(existing.get("revision") or 0) + 1 if isinstance(existing, dict) else 1
+    if existing:
+        history_path = PUBLICATION_SNAPSHOT_ROOT / "history" / report_date / f"revision-{revision - 1}.json"
+        write_json_atomic(history_path, existing)
+    snapshot = {
+        "schema_version": PUBLICATION_SNAPSHOT_SCHEMA_VERSION,
+        "date": report_date,
+        "revision": revision,
+        "frozen_at": datetime.now(timezone.utc).isoformat(),
+        "report_sha256": hashlib.sha256(raw_report).hexdigest(),
+        "content_hash": content_hash,
+        "payload_sha256": payload_sha256(payload),
+        "prerequisites": readiness["evidence"],
+        "payload": payload,
+    }
+    errors = publication_snapshot_errors(
+        snapshot,
+        report_date=report_date,
+        raw_report=raw_report,
+        content_hash=content_hash,
+    )
+    if errors:
+        raise ValueError("cannot freeze invalid publication snapshot: " + "; ".join(errors))
+    write_json_atomic(path, snapshot)
+    return snapshot
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Sync newest briefing into the ATLAS site only when content changes.")
     parser.add_argument("--date", type=valid_iso_date, help="Generate a specific dated report instead of the newest report.")
@@ -1405,6 +1676,11 @@ def main() -> int:
     parser.add_argument("--mark-deployed", metavar="SHA256", help="Mark a previously generated content hash as successfully deployed.")
     parser.add_argument("--deployment-url", default="", help="Production URL stored with --mark-deployed.")
     parser.add_argument("--force", action="store_true", help="Regenerate even when the newest hash is already deployed.")
+    parser.add_argument(
+        "--refresh-publication-snapshot",
+        action="store_true",
+        help="Create an explicit same-day snapshot revision after all closed-loop gates have been rerun.",
+    )
     args = parser.parse_args()
 
     state = load_json(STATE_FILE, {})
@@ -1414,12 +1690,21 @@ def main() -> int:
         state.update({
             "last_deployed_sha": args.mark_deployed,
             "last_deployed_payload_sha": current_payload_sha,
+            "last_deployed_snapshot_revision": state.get("pending_snapshot_revision"),
+            "last_deployed_snapshot_sha256": state.get("pending_snapshot_sha256"),
             "last_deployed_at": datetime.now(timezone.utc).isoformat(),
             "deployment_url": args.deployment_url,
         })
         pending_payload_sha = str(state.get("pending_payload_sha") or "")
         if state.get("pending_sha") == args.mark_deployed and (not pending_payload_sha or pending_payload_sha == current_payload_sha):
-            for key in ("pending_sha", "pending_payload_sha", "pending_report", "pending_date"):
+            for key in (
+                "pending_sha",
+                "pending_payload_sha",
+                "pending_report",
+                "pending_date",
+                "pending_snapshot_revision",
+                "pending_snapshot_sha256",
+            ):
                 state.pop(key, None)
         write_json_atomic(STATE_FILE, state)
         print(json.dumps({"status": "marked", "sha256": args.mark_deployed, "payload_sha256": current_payload_sha, "deployment_url": args.deployment_url}, ensure_ascii=False))
@@ -1445,12 +1730,62 @@ def main() -> int:
             continue
         if match.group(1) <= report_date:
             report_count += 1
-    payload = build_payload(text, report_date, report_count, sha256)
+    snapshot: dict[str, Any] | None = None
+    snapshot_status = "not_ready"
+    if not args.refresh_publication_snapshot:
+        try:
+            snapshot = load_publication_snapshot(report_date, raw, sha256)
+        except ValueError as error:
+            print(json.dumps({
+                "status": "error",
+                "date": report_date,
+                "error": str(error),
+                "snapshot": "conflict",
+            }, ensure_ascii=False))
+            return 2
+    if snapshot is not None:
+        payload = snapshot["payload"]
+        snapshot_status = "frozen"
+    else:
+        payload = build_payload(text, report_date, report_count, sha256)
     payload_hash = payload_sha256(payload)
     validation_errors = validate_payload(payload)
     if validation_errors:
         print(json.dumps({"status": "error", "date": report_date, "errors": validation_errors}, ensure_ascii=False, indent=2))
         return 2
+    readiness = publication_snapshot_readiness(report_date)
+    if snapshot is None and readiness.get("ready") is True:
+        if args.dry_run:
+            snapshot_status = "ready_to_freeze"
+        else:
+            try:
+                snapshot = freeze_publication_snapshot(
+                    report_date=report_date,
+                    raw_report=raw,
+                    content_hash=sha256,
+                    payload=payload,
+                    refresh=args.refresh_publication_snapshot,
+                )
+            except ValueError as error:
+                print(json.dumps({
+                    "status": "error",
+                    "date": report_date,
+                    "error": str(error),
+                    "snapshot": "freeze_failed",
+                }, ensure_ascii=False))
+                return 2
+            snapshot_status = "refreshed" if args.refresh_publication_snapshot else "created"
+    elif args.refresh_publication_snapshot:
+        print(json.dumps({
+            "status": "error",
+            "date": report_date,
+            "error": "publication snapshot refresh requires all closed-loop prerequisites",
+            "reasons": readiness.get("reasons") or [],
+        }, ensure_ascii=False))
+        return 2
+
+    snapshot_hash = hashlib.sha256(serialized_payload(snapshot).encode("utf-8")).hexdigest() if snapshot else ""
+    snapshot_revision = int(snapshot.get("revision") or 0) if snapshot else 0
     if args.dry_run:
         print(json.dumps({
             "status": "validated",
@@ -1460,6 +1795,9 @@ def main() -> int:
             "date": report_date,
             "events": len(payload["events"]),
             "scenarios": len(payload["scenarios"]),
+            "publication_snapshot": snapshot_status,
+            "snapshot_revision": snapshot_revision,
+            "snapshot_prerequisites": readiness,
         }, ensure_ascii=False))
         return 0
     if not args.force and state.get("last_deployed_sha") == sha256 and state.get("last_deployed_payload_sha") == payload_hash and site_data_matches(sha256, payload_hash):
@@ -1474,6 +1812,8 @@ def main() -> int:
         "pending_payload_sha": payload_hash,
         "pending_report": str(report_path),
         "pending_date": report_date,
+        "pending_snapshot_revision": snapshot_revision or None,
+        "pending_snapshot_sha256": snapshot_hash or None,
         "last_checked_at": datetime.now(timezone.utc).isoformat(),
     })
     write_json_atomic(STATE_FILE, state)
@@ -1484,6 +1824,8 @@ def main() -> int:
         "report": str(report_path),
         "date": report_date,
         "generated": str(SITE_DATA),
+        "publication_snapshot": snapshot_status,
+        "snapshot_revision": snapshot_revision,
     }, ensure_ascii=False))
     return 0
 

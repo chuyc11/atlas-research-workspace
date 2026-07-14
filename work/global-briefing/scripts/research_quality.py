@@ -100,11 +100,199 @@ def observed_outcome(review: dict[str, Any]) -> int | None:
     return None
 
 
+def review_scope(review_record: dict[str, Any]) -> str:
+    """Return the review dimension without treating asset results as event outcomes.
+
+    Historical reviews did not declare a scope and are event reviews. New market-only
+    records use ``resolution_scope=market`` and must never close or score the event.
+    """
+    review = review_record.get("review")
+    if not isinstance(review, dict):
+        return "none"
+    explicit = str(review.get("resolution_scope") or "").strip().lower()
+    if explicit in {"event", "market", "combined"}:
+        return explicit
+    has_event = observed_outcome(review) is not None
+    has_market = isinstance(review.get("market_resolution"), list) and bool(review.get("market_resolution"))
+    if has_event and has_market:
+        return "combined"
+    if has_market and not has_event:
+        return "market"
+    return "event"
+
+
+def market_mapping_key(prediction_id: str, mapping: dict[str, Any]) -> str:
+    return "|".join(
+        (
+            prediction_id,
+            str(mapping.get("symbol") or "").strip().upper(),
+            str(mapping.get("benchmark") or "").strip().upper(),
+            str(mapping.get("evaluation_deadline") or "").strip(),
+        )
+    )
+
+
+def canonical_market_thesis_key(prediction_id: str, mapping: dict[str, Any]) -> str:
+    """Collapse reciprocal A-vs-B/B-vs-A rows into one independent thesis."""
+    symbol = str(mapping.get("symbol") or "").strip().upper()
+    benchmark = str(mapping.get("benchmark") or "").strip().upper()
+    evaluation = mapping.get("evaluation") if isinstance(mapping.get("evaluation"), dict) else {}
+    return "|".join(
+        (
+            prediction_id,
+            *sorted((symbol, benchmark)),
+            str(mapping.get("evaluation_deadline") or "").strip(),
+            str(evaluation.get("window_start") or "").strip(),
+            str(evaluation.get("metric") or "total_return").strip().lower(),
+        )
+    )
+
+
+def is_asset_only_prediction(record: dict[str, Any]) -> bool:
+    """Detect event records whose resolution is only a benchmark-relative return test."""
+    mappings = record.get("market_mapping")
+    if not isinstance(mappings, list) or not mappings:
+        return False
+    resolution = record.get("resolution") if isinstance(record.get("resolution"), dict) else {}
+    event_text = " ".join(
+        str(value or "")
+        for value in (
+            record.get("scenario"),
+            resolution.get("question"),
+            resolution.get("success_criteria"),
+            resolution.get("failure_criteria"),
+        )
+    ).upper()
+    comparison_terms = (
+        "RETURN", "TOTAL RETURN", "OUTPERFORM", "UNDERPERFORM",
+        "回报", "收益", "涨幅", "跌幅", "跑赢", "跑输",
+    )
+    if not any(term in event_text for term in comparison_terms):
+        return False
+    for mapping in mappings:
+        if not isinstance(mapping, dict):
+            continue
+        symbol = str(mapping.get("symbol") or "").strip().upper()
+        benchmark = str(mapping.get("benchmark") or "").strip().upper()
+        if symbol and benchmark and symbol in event_text and benchmark in event_text:
+            return True
+    return False
+
+
+def _numeric(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def validate_market_resolution_item(
+    prediction_id: str,
+    item: dict[str, Any],
+    review_record: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    prefix = f"{prediction_id}: review.market_resolution"
+    for field in ("symbol", "benchmark", "evaluation_deadline", "status"):
+        if not str(item.get(field) or "").strip():
+            errors.append(f"{prefix}.{field} is required")
+    status = str(item.get("status") or "").lower()
+    if status not in {"resolved", "unresolved"}:
+        errors.append(f"{prefix}.status must be resolved or unresolved")
+        return errors
+    try:
+        evaluation_day = parse_date(item.get("evaluation_deadline"))
+    except (TypeError, ValueError):
+        errors.append(f"{prefix}.evaluation_deadline must be YYYY-MM-DD")
+        return errors
+    if status == "unresolved":
+        blockers = item.get("blockers")
+        if not _nonempty_list(blockers):
+            errors.append(f"{prefix}.blockers must explain why the mapping is unresolved")
+        return errors
+
+    if observed_outcome(item) is None:
+        errors.append(f"{prefix}.observed_outcome must be binary 0 or 1")
+    for field in ("symbol_return_pct", "benchmark_return_pct", "excess_return_pct"):
+        if _numeric(item.get(field)) is None:
+            errors.append(f"{prefix}.{field} must be a finite number")
+    for field in ("start_price_date", "end_price_date"):
+        try:
+            parse_date(item.get(field))
+        except (TypeError, ValueError):
+            errors.append(f"{prefix}.{field} must be YYYY-MM-DD")
+    evidence = item.get("evidence")
+    if not isinstance(evidence, list) or not evidence:
+        errors.append(f"{prefix}.evidence must be a non-empty list")
+    review = review_record.get("review") if isinstance(review_record.get("review"), dict) else {}
+    try:
+        resolved_day = parse_date(review.get("review_date") or review_record.get("date"))
+    except (TypeError, ValueError):
+        errors.append(f"{prefix} requires a valid review_date")
+    else:
+        if resolved_day <= evaluation_day and item.get("terminal_evidence") is not True:
+            errors.append(f"{prefix} is premature before the evaluation deadline has fully elapsed")
+    return errors
+
+
+def resolved_market_mapping_index(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Index independently resolved asset mappings across every appended review."""
+    resolved: dict[str, dict[str, Any]] = {}
+    for row in records:
+        prediction_id = str(row.get("prediction_id") or "")
+        review = row.get("review")
+        if not prediction_id or not isinstance(review, dict):
+            continue
+        items = review.get("market_resolution")
+        if not isinstance(items, list):
+            continue
+        review_day = str(review.get("review_date") or row.get("date") or "")
+        for item in items:
+            if not isinstance(item, dict) or str(item.get("status") or "").lower() != "resolved":
+                continue
+            if validate_market_resolution_item(prediction_id, item, row):
+                continue
+            key = market_mapping_key(prediction_id, item)
+            previous = resolved.get(key)
+            previous_day = str((previous or {}).get("review_date") or "")
+            if previous is None or review_day >= previous_day:
+                resolved[key] = {"review_date": review_day, "record": row, "result": item}
+    return resolved
+
+
 def maturity_date(record: dict[str, Any]) -> date_type:
+    """Return the final calendar day covered by the forecast.
+
+    Date-only deadlines are interpreted as end-of-day in the report timezone.
+    A forecast is therefore mature for a daily run only after this date has
+    fully elapsed, unless terminal evidence permits an early resolution.
+    """
     if record.get("deadline"):
         return parse_date(record["deadline"])
     horizon = str(record.get("horizon") or "1d").lower()
     return parse_date(record.get("date")) + timedelta(days=HORIZON_DAYS.get(horizon, 1))
+
+
+def is_matured_as_of(record: dict[str, Any], cutoff: str | date_type) -> bool:
+    cutoff_day = cutoff if isinstance(cutoff, date_type) else parse_date(cutoff)
+    return maturity_date(record) < cutoff_day
+
+
+def review_is_valid_for_resolution(original: dict[str, Any], review_record: dict[str, Any] | None) -> bool:
+    if not review_record or str(review_record.get("status") or "").lower() not in CLOSED_STATUSES:
+        return False
+    review = review_record.get("review")
+    if not isinstance(review, dict):
+        return False
+    if review_scope(review_record) not in {"event", "combined"}:
+        return False
+    if review.get("terminal_evidence") is True:
+        return True
+    try:
+        resolved_day = parse_date(review.get("review_date") or review_record.get("date"))
+    except (TypeError, ValueError):
+        return False
+    return resolved_day > maturity_date(original)
 
 
 def original_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -116,7 +304,12 @@ def latest_reviews(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     for row in records:
         prediction_id = str(row.get("prediction_id") or "")
         status = str(row.get("status") or "").lower()
-        if not prediction_id or not isinstance(row.get("review"), dict) or status not in CLOSED_STATUSES:
+        if (
+            not prediction_id
+            or not isinstance(row.get("review"), dict)
+            or status not in CLOSED_STATUSES
+            or review_scope(row) not in {"event", "combined"}
+        ):
             continue
         current = latest.get(prediction_id)
         current_day = str((current or {}).get("review", {}).get("review_date") or (current or {}).get("date") or "")
@@ -130,7 +323,12 @@ def _nonempty_list(value: Any) -> bool:
     return isinstance(value, list) and any(str(item).strip() for item in value)
 
 
-def validate_v2_prediction(record: dict[str, Any]) -> list[str]:
+def validate_v2_prediction(
+    record: dict[str, Any],
+    *,
+    machine_evaluation_enforce_from_date: str | None = None,
+    event_asset_separation_enforce_from_date: str | None = None,
+) -> list[str]:
     """Validate the pre-registered v2 prediction contract."""
     errors: list[str] = []
     prediction_id = str(record.get("prediction_id") or "<missing-id>")
@@ -179,10 +377,19 @@ def validate_v2_prediction(record: dict[str, Any]) -> list[str]:
         str(item.get("symbol") if isinstance(item, dict) else item).strip().upper()
         for item in tickers if str(item.get("symbol") if isinstance(item, dict) else item).strip()
     } if isinstance(tickers, list) else set()
+    enforce_event_asset_separation = False
+    if event_asset_separation_enforce_from_date and prediction_day:
+        try:
+            enforce_event_asset_separation = prediction_day >= parse_date(event_asset_separation_enforce_from_date)
+        except (TypeError, ValueError):
+            pass
+    if enforce_event_asset_separation and is_asset_only_prediction(record):
+        errors.append(f"{prediction_id}: event resolution duplicates a market-mapping outcome")
     if ticker_symbols and (not isinstance(mappings, list) or not mappings):
         errors.append(f"{prediction_id}: non-empty market_mapping is required when tickers are named")
     elif isinstance(mappings, list):
         mapped_symbols: set[str] = set()
+        canonical_mapping_keys: set[str] = set()
         for index, item in enumerate(mappings):
             if not isinstance(item, dict):
                 errors.append(f"{prediction_id}: market_mapping[{index}] must be an object")
@@ -193,14 +400,63 @@ def validate_v2_prediction(record: dict[str, Any]) -> list[str]:
             symbol = str(item.get("symbol") or "").strip().upper()
             if symbol:
                 mapped_symbols.add(symbol)
+            if enforce_event_asset_separation:
+                canonical_key = canonical_market_thesis_key(prediction_id, item)
+                if canonical_key in canonical_mapping_keys:
+                    errors.append(
+                        f"{prediction_id}: market_mapping[{index}] duplicates a reciprocal market thesis"
+                    )
+                canonical_mapping_keys.add(canonical_key)
             if str(item.get("direction") or "") not in {"up", "down", "outperform", "underperform", "neutral"}:
                 errors.append(f"{prediction_id}: market_mapping[{index}].direction is invalid")
+            mapping_deadline = None
             try:
                 mapping_deadline = parse_date(item.get("evaluation_deadline"))
                 if prediction_day and mapping_deadline <= prediction_day:
                     errors.append(f"{prediction_id}: market_mapping[{index}].evaluation_deadline must be after date")
             except (TypeError, ValueError):
                 errors.append(f"{prediction_id}: market_mapping[{index}].evaluation_deadline must be YYYY-MM-DD")
+            evaluation = item.get("evaluation")
+            require_machine_evaluation = False
+            if machine_evaluation_enforce_from_date and prediction_day:
+                try:
+                    require_machine_evaluation = prediction_day >= parse_date(machine_evaluation_enforce_from_date)
+                except (TypeError, ValueError):
+                    pass
+            if require_machine_evaluation and not isinstance(evaluation, dict):
+                errors.append(f"{prediction_id}: market_mapping[{index}].evaluation is required for machine resolution")
+            if isinstance(evaluation, dict):
+                if str(evaluation.get("metric") or "") != "total_return":
+                    errors.append(f"{prediction_id}: market_mapping[{index}].evaluation.metric must be total_return")
+                if str(evaluation.get("price_field") or "") not in {"adjusted_close", "close"}:
+                    errors.append(f"{prediction_id}: market_mapping[{index}].evaluation.price_field is invalid")
+                comparisons = {
+                    "symbol_gt_benchmark", "symbol_lt_benchmark", "symbol_return_gt",
+                    "symbol_return_lt", "abs_symbol_return_lte",
+                }
+                if str(evaluation.get("comparison") or "") not in comparisons:
+                    errors.append(f"{prediction_id}: market_mapping[{index}].evaluation.comparison is invalid")
+                expected_comparison = {
+                    "outperform": "symbol_gt_benchmark",
+                    "underperform": "symbol_lt_benchmark",
+                    "up": "symbol_return_gt",
+                    "down": "symbol_return_lt",
+                    "neutral": "abs_symbol_return_lte",
+                }.get(str(item.get("direction") or ""))
+                if expected_comparison and str(evaluation.get("comparison") or "") != expected_comparison:
+                    errors.append(
+                        f"{prediction_id}: market_mapping[{index}].evaluation.comparison conflicts with direction"
+                    )
+                if expected_comparison == "abs_symbol_return_lte" and _numeric(evaluation.get("threshold_pct")) is None:
+                    errors.append(f"{prediction_id}: neutral mapping requires numeric evaluation.threshold_pct")
+                try:
+                    window_start = parse_date(evaluation.get("window_start"))
+                    if prediction_day and window_start < prediction_day:
+                        errors.append(f"{prediction_id}: market_mapping[{index}].evaluation.window_start cannot precede date")
+                    if mapping_deadline and window_start > mapping_deadline:
+                        errors.append(f"{prediction_id}: market_mapping[{index}].evaluation.window_start exceeds deadline")
+                except (TypeError, ValueError):
+                    errors.append(f"{prediction_id}: market_mapping[{index}].evaluation.window_start must be YYYY-MM-DD")
         for missing_symbol in sorted(ticker_symbols - mapped_symbols):
             errors.append(f"{prediction_id}: ticker {missing_symbol} has no market_mapping")
     return errors
@@ -212,24 +468,76 @@ def validate_v2_review(record: dict[str, Any], original: dict[str, Any] | None) 
     errors: list[str] = []
     if original is None:
         return [f"{prediction_id}: review has no original prediction"]
-    status = str(record.get("status") or "").lower()
-    if status not in CLOSED_STATUSES:
-        errors.append(f"{prediction_id}: review status must be one of {sorted(CLOSED_STATUSES)}")
     review = record.get("review")
     if not isinstance(review, dict):
         return [f"{prediction_id}: review object is required"]
+    scope = review_scope(record)
+    if scope not in {"event", "market", "combined"}:
+        errors.append(f"{prediction_id}: review.resolution_scope must be event, market, or combined")
+    status = str(record.get("status") or "").lower()
+    if scope in {"event", "combined"} and status not in CLOSED_STATUSES:
+        errors.append(f"{prediction_id}: event review status must be one of {sorted(CLOSED_STATUSES)}")
+    if scope == "market" and status != "active":
+        errors.append(f"{prediction_id}: market-only review status must be active")
     try:
         resolved_day = parse_date(review.get("review_date") or record.get("date"))
     except (TypeError, ValueError):
         errors.append(f"{prediction_id}: review.review_date must be YYYY-MM-DD")
         resolved_day = None
-    if observed_outcome(review) is None:
-        errors.append(f"{prediction_id}: review.observed_outcome must be binary 0 or 1")
-    evidence = review.get("evidence")
-    if not isinstance(evidence, list) or not evidence:
-        errors.append(f"{prediction_id}: review.evidence must be a non-empty list")
-    if resolved_day and resolved_day < maturity_date(original) and review.get("terminal_evidence") is not True:
-        errors.append(f"{prediction_id}: premature review requires terminal_evidence=true")
+    if scope in {"event", "combined"}:
+        if observed_outcome(review) is None:
+            errors.append(f"{prediction_id}: review.observed_outcome must be binary 0 or 1")
+        evidence = review.get("evidence")
+        if not isinstance(evidence, list) or not evidence:
+            errors.append(f"{prediction_id}: review.evidence must be a non-empty list")
+        if resolved_day and resolved_day <= maturity_date(original) and review.get("terminal_evidence") is not True:
+            errors.append(f"{prediction_id}: premature review requires terminal_evidence=true")
+    if scope in {"market", "combined"}:
+        market_results = review.get("market_resolution")
+        if not isinstance(market_results, list) or not market_results:
+            errors.append(f"{prediction_id}: review.market_resolution must be a non-empty list")
+        else:
+            original_mappings = {
+                market_mapping_key(prediction_id, item): item
+                for item in original.get("market_mapping", [])
+                if isinstance(item, dict)
+            }
+            for item in market_results:
+                if not isinstance(item, dict):
+                    errors.append(f"{prediction_id}: review.market_resolution entries must be objects")
+                    continue
+                errors.extend(validate_market_resolution_item(prediction_id, item, record))
+                item_key = market_mapping_key(prediction_id, item)
+                expected_mapping = original_mappings.get(item_key)
+                if expected_mapping is None:
+                    errors.append(f"{prediction_id}: market resolution does not match a pre-registered mapping")
+                    continue
+                if str(item.get("status") or "").lower() != "resolved":
+                    continue
+                symbol_return = _numeric(item.get("symbol_return_pct"))
+                benchmark_return = _numeric(item.get("benchmark_return_pct"))
+                excess_return = _numeric(item.get("excess_return_pct"))
+                if (
+                    symbol_return is not None
+                    and benchmark_return is not None
+                    and excess_return is not None
+                    and abs(excess_return - (symbol_return - benchmark_return)) > 1e-5
+                ):
+                    errors.append(f"{prediction_id}: market resolution excess return is arithmetically inconsistent")
+                evaluation = expected_mapping.get("evaluation")
+                if isinstance(evaluation, dict) and symbol_return is not None and benchmark_return is not None:
+                    threshold = _numeric(evaluation.get("threshold_pct")) or 0.0
+                    excess = symbol_return - benchmark_return
+                    comparison = str(evaluation.get("comparison") or "")
+                    computed = {
+                        "symbol_gt_benchmark": excess > threshold,
+                        "symbol_lt_benchmark": excess < -threshold,
+                        "symbol_return_gt": symbol_return > threshold,
+                        "symbol_return_lt": symbol_return < -threshold,
+                        "abs_symbol_return_lte": abs(symbol_return) <= threshold,
+                    }.get(comparison)
+                    if computed is not None and observed_outcome(item) != int(computed):
+                        errors.append(f"{prediction_id}: market resolution outcome conflicts with pre-registered rule")
     return errors
 
 
@@ -249,15 +557,23 @@ def proper_scoring_metrics(
         if prediction_id and prediction_id not in original_by_id:
             original_by_id[prediction_id] = row
     reviews = latest_reviews(records)
-    all_matured = {key: row for key, row in original_by_id.items() if maturity_date(row) <= cutoff_day}
-    matured = {
+    all_matured = {key: row for key, row in original_by_id.items() if is_matured_as_of(row, cutoff_day)}
+    matured_v2 = {
         key: row
         for key, row in all_matured.items()
         if row.get("schema_version") == 2
     }
-    legacy_matured_count = len(all_matured) - len(matured)
+    asset_only_matured = {
+        key: row for key, row in matured_v2.items() if is_asset_only_prediction(row)
+    }
+    matured = {
+        key: row for key, row in matured_v2.items() if key not in asset_only_matured
+    }
+    legacy_matured_count = len(all_matured) - len(matured_v2)
     samples: list[dict[str, Any]] = []
     exclusion_counts: Counter[str] = Counter()
+    if asset_only_matured:
+        exclusion_counts["asset_only_prediction"] = len(asset_only_matured)
 
     for prediction_id, original in matured.items():
         review_row = reviews.get(prediction_id)
@@ -279,7 +595,7 @@ def proper_scoring_metrics(
             exclusion_counts["invalid_review_date"] += 1
             continue
         terminal = review.get("terminal_evidence") is True
-        if resolved_day < maturity_date(original) and not terminal:
+        if resolved_day <= maturity_date(original) and not terminal:
             exclusion_counts["early_closure_without_terminal_evidence"] += 1
             continue
         if not _nonempty_list(review.get("evidence")):
@@ -338,7 +654,8 @@ def proper_scoring_metrics(
         "metric_standard": "binary proper scoring; lower is better",
         "cutoff": cutoff,
         "matured_prediction_count": len(matured),
-        "matured_v2_prediction_count": len(matured),
+        "matured_v2_prediction_count": len(matured_v2),
+        "asset_only_matured_prediction_count_excluded": len(asset_only_matured),
         "legacy_matured_prediction_count_excluded": legacy_matured_count,
         "total_matured_prediction_count": len(all_matured),
         "eligible_sample_count": len(samples),
@@ -360,15 +677,117 @@ def proper_scoring_metrics(
     }
 
 
+def market_mapping_metrics(records: list[dict[str, Any]], *, cutoff: str) -> dict[str, Any]:
+    """Score asset mappings independently from probabilistic event forecasts."""
+    cutoff_day = parse_date(cutoff)
+    originals = original_records(records)
+    matured_groups: dict[str, list[dict[str, Any]]] = {}
+    for original in originals:
+        if original.get("schema_version") != 2:
+            continue
+        prediction_id = str(original.get("prediction_id") or "")
+        for mapping in original.get("market_mapping", []):
+            if not prediction_id or not isinstance(mapping, dict):
+                continue
+            try:
+                evaluation_day = parse_date(mapping.get("evaluation_deadline"))
+            except (TypeError, ValueError):
+                continue
+            if evaluation_day < cutoff_day:
+                canonical_key = canonical_market_thesis_key(prediction_id, mapping)
+                matured_groups.setdefault(canonical_key, []).append({
+                    "prediction_id": prediction_id,
+                    "mapping": mapping,
+                    "mapping_id": market_mapping_key(prediction_id, mapping),
+                })
+
+    resolved_index = resolved_market_mapping_index(records)
+    samples: list[dict[str, Any]] = []
+    exclusions: Counter[str] = Counter()
+    reciprocal_duplicate_count = sum(max(0, len(group) - 1) for group in matured_groups.values())
+    if reciprocal_duplicate_count:
+        exclusions["reciprocal_duplicate_mapping"] = reciprocal_duplicate_count
+    direction_counts: Counter[str] = Counter()
+    direction_hits: Counter[str] = Counter()
+    for group in matured_groups.values():
+        expected = next((item for item in group if item["mapping_id"] in resolved_index), group[0])
+        mapping_id = expected["mapping_id"]
+        resolved = resolved_index.get(mapping_id)
+        if not resolved:
+            exclusions["missing_market_resolution"] += 1
+            continue
+        result = resolved["result"]
+        outcome = observed_outcome(result)
+        symbol_return = _numeric(result.get("symbol_return_pct"))
+        benchmark_return = _numeric(result.get("benchmark_return_pct"))
+        excess_return = _numeric(result.get("excess_return_pct"))
+        if outcome is None or symbol_return is None or benchmark_return is None or excess_return is None:
+            exclusions["invalid_market_resolution"] += 1
+            continue
+        mapping = expected["mapping"]
+        direction = str(mapping.get("direction") or "unknown")
+        signed_performance = None
+        if direction == "outperform":
+            signed_performance = excess_return
+        elif direction == "underperform":
+            signed_performance = -excess_return
+        elif direction == "up":
+            signed_performance = symbol_return
+        elif direction == "down":
+            signed_performance = -symbol_return
+        direction_counts[direction] += 1
+        direction_hits[direction] += outcome
+        samples.append({
+            "mapping_id": mapping_id,
+            "prediction_id": expected["prediction_id"],
+            "symbol": mapping.get("symbol"),
+            "benchmark": mapping.get("benchmark"),
+            "direction": direction,
+            "evaluation_deadline": mapping.get("evaluation_deadline"),
+            "observed_outcome": outcome,
+            "symbol_return_pct": round(symbol_return, 6),
+            "benchmark_return_pct": round(benchmark_return, 6),
+            "excess_return_pct": round(excess_return, 6),
+            "signed_performance_pct": round(signed_performance, 6) if signed_performance is not None else None,
+            "review_date": resolved.get("review_date"),
+        })
+
+    resolved_count = len(samples)
+    matured_count = len(matured_groups)
+    signed = [item["signed_performance_pct"] for item in samples if item["signed_performance_pct"] is not None]
+    by_direction = {
+        direction: {
+            "resolved_count": count,
+            "hit_rate_pct": round(direction_hits[direction] / count * 100, 2) if count else None,
+        }
+        for direction, count in sorted(direction_counts.items())
+    }
+    return {
+        "metric_standard": "independent benchmark-relative mapping evaluation; event probability is not reused",
+        "cutoff": cutoff,
+        "matured_mapping_count": matured_count,
+        "resolved_mapping_count": resolved_count,
+        "reciprocal_duplicate_mapping_count_excluded": reciprocal_duplicate_count,
+        "resolved_coverage_pct": round(resolved_count / matured_count * 100, 2) if matured_count else 0.0,
+        "hit_rate_pct": round(sum(item["observed_outcome"] for item in samples) / resolved_count * 100, 2) if resolved_count else None,
+        "mean_signed_performance_pct": round(sum(signed) / len(signed), 6) if signed else None,
+        "by_direction": by_direction,
+        "exclusion_counts": dict(sorted(exclusions.items())),
+        "samples": samples,
+    }
+
+
 def audit_prediction_records(
     records: list[dict[str, Any]],
     *,
     cutoff: str,
     enforce_from_date: str,
     evaluation_config: dict[str, Any] | None = None,
+    review_policy: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     originals = original_records(records)
     reviews = latest_reviews(records)
+    all_review_rows = [row for row in records if isinstance(row.get("review"), dict)]
     counts = Counter(str(row.get("prediction_id") or "") for row in originals)
     duplicate_original_ids = sorted(key for key, count in counts.items() if key and count > 1)
     original_by_id: dict[str, dict[str, Any]] = {}
@@ -376,7 +795,11 @@ def audit_prediction_records(
         prediction_id = str(row.get("prediction_id") or "")
         if prediction_id and prediction_id not in original_by_id:
             original_by_id[prediction_id] = row
-    orphan_reviews = sorted(key for key in reviews if key not in original_by_id)
+    orphan_reviews = sorted({
+        str(row.get("prediction_id") or "")
+        for row in all_review_rows
+        if str(row.get("prediction_id") or "") not in original_by_id
+    } - {""})
     current_rows = [row for row in originals if str(row.get("date") or "") == cutoff]
     enforce_day = parse_date(enforce_from_date)
     v2_errors: list[str] = []
@@ -389,8 +812,17 @@ def audit_prediction_records(
             continue
         if row_day >= enforce_day:
             v2_applicable.append(row)
-            v2_errors.extend(validate_v2_prediction(row))
-    for prediction_id, review_row in reviews.items():
+            v2_errors.extend(validate_v2_prediction(
+                row,
+                machine_evaluation_enforce_from_date=str(
+                    (review_policy or {}).get("machine_evaluation_enforce_from_date") or ""
+                ) or None,
+                event_asset_separation_enforce_from_date=str(
+                    (review_policy or {}).get("event_asset_separation_enforce_from_date") or ""
+                ) or None,
+            ))
+    for review_row in all_review_rows:
+        prediction_id = str(review_row.get("prediction_id") or "")
         original = original_by_id.get(prediction_id)
         if not original:
             continue
@@ -412,9 +844,13 @@ def audit_prediction_records(
     v2_orphan_reviews = sorted(
         prediction_id
         for prediction_id in orphan_reviews
-        if date_on_or_after(
-            reviews[prediction_id].get("review", {}).get("review_date") or reviews[prediction_id].get("date"),
-            enforce_day,
+        if any(
+            str(row.get("prediction_id") or "") == prediction_id
+            and date_on_or_after(
+                row.get("review", {}).get("review_date") or row.get("date"),
+                enforce_day,
+            )
+            for row in all_review_rows
         )
     )
 
@@ -428,8 +864,36 @@ def audit_prediction_records(
             review_day = parse_date(review.get("review_date") or review_row.get("date"))
         except (TypeError, ValueError):
             continue
-        if review_day < maturity_date(original) and review.get("terminal_evidence") is not True:
+        if review_day <= maturity_date(original) and review.get("terminal_evidence") is not True:
             early_closed.append(prediction_id)
+
+    matured_v2 = {
+        prediction_id: original
+        for prediction_id, original in original_by_id.items()
+        if original.get("schema_version") == 2 and is_matured_as_of(original, cutoff)
+    }
+    unresolved_matured_v2 = sorted(
+        prediction_id
+        for prediction_id, original in matured_v2.items()
+        if not review_is_valid_for_resolution(original, reviews.get(prediction_id))
+    )
+    mapping_metrics = market_mapping_metrics(records, cutoff=cutoff)
+    resolved_mapping_keys = set(resolved_market_mapping_index(records))
+    unresolved_matured_v2_mappings: list[str] = []
+    for prediction_id, original in original_by_id.items():
+        if original.get("schema_version") != 2:
+            continue
+        for mapping in original.get("market_mapping", []):
+            if not isinstance(mapping, dict):
+                continue
+            try:
+                is_due = parse_date(mapping.get("evaluation_deadline")) < parse_date(cutoff)
+            except (TypeError, ValueError):
+                continue
+            key = market_mapping_key(prediction_id, mapping)
+            if is_due and key not in resolved_mapping_keys:
+                unresolved_matured_v2_mappings.append(key)
+    unresolved_matured_v2_mappings.sort()
 
     eval_config = evaluation_config or {}
     metrics = proper_scoring_metrics(
@@ -446,6 +910,15 @@ def audit_prediction_records(
         operational_errors.append("orphan v2 review records")
     operational_errors.extend(v2_errors)
     operational_errors.extend(v2_review_errors)
+    if (review_policy or {}).get("block_deployment_on_unresolved_due_v2") is True and unresolved_matured_v2:
+        operational_errors.append(
+            "matured v2 predictions require valid resolution reviews: " + ", ".join(unresolved_matured_v2)
+        )
+    if (review_policy or {}).get("block_deployment_on_unresolved_due_v2_market") is True and unresolved_matured_v2_mappings:
+        operational_errors.append(
+            "matured v2 market mappings require valid independent resolutions: "
+            + ", ".join(unresolved_matured_v2_mappings)
+        )
     numeric_count = sum(numeric_probability(row.get("probability")) is not None for row in originals)
     return {
         "cutoff": cutoff,
@@ -464,6 +937,8 @@ def audit_prediction_records(
             if condition
         ],
         "early_closed_without_terminal_evidence": sorted(early_closed),
+        "matured_v2_prediction_ids": sorted(matured_v2),
+        "unresolved_matured_v2_prediction_ids": unresolved_matured_v2,
         "numeric_probability_coverage_pct": round(numeric_count / len(originals) * 100, 2) if originals else None,
         "v2_contract": {
             "enforce_from_date": enforce_from_date,
@@ -475,6 +950,9 @@ def audit_prediction_records(
         "operational_errors": operational_errors,
         "operational_passed": not operational_errors,
         "proper_scoring": metrics,
+        "event_scoring": metrics,
+        "market_mapping_scoring": mapping_metrics,
+        "unresolved_matured_v2_market_mapping_ids": unresolved_matured_v2_mappings,
     }
 
 
@@ -491,7 +969,13 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
         }
     text = report_path.read_text(encoding="utf-8")
     links = LINK_RE.findall(text)
-    domains = sorted({urlparse(link).netloc.lower().removeprefix("www.") for link in links})
+    auditable_links = {
+        link for link in links
+        if urlparse(link).scheme in {"http", "https"}
+        and bool(urlparse(link).netloc)
+        and urlparse(link).path not in {"", "/"}
+    }
+    domains = sorted({urlparse(link).netloc.lower().removeprefix("www.") for link in auditable_links})
     requirements = {
         "minimum_report_characters": int(policy.get("minimum_report_characters", 0)),
         "maximum_report_characters": int(policy.get("maximum_report_characters", 10**9)),
@@ -502,7 +986,7 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
         errors.append("report is shorter than the configured minimum")
     if len(text) > requirements["maximum_report_characters"]:
         errors.append("report exceeds the configured maximum")
-    if len(set(links)) < requirements["minimum_distinct_links"]:
+    if len(auditable_links) < requirements["minimum_distinct_links"]:
         errors.append("report has too few distinct source links")
     if len(domains) < requirements["minimum_distinct_domains"]:
         errors.append("report has too few independent source domains")
@@ -531,7 +1015,8 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
         "path": str(report_path),
         "exists": True,
         "character_count": len(text),
-        "distinct_link_count": len(set(links)),
+        "distinct_link_count": len(auditable_links),
+        "all_http_link_count": len(set(links)),
         "distinct_domain_count": len(domains),
         "domains": domains,
         "required_sections_missing": missing_sections,
@@ -560,6 +1045,7 @@ def build_quality_report(
         cutoff=date,
         enforce_from_date=enforce_from,
         evaluation_config=research_config,
+        review_policy=settings.get("review_queue", {}),
     )
     news_policy = settings.get("news_research_policy", {})
     quality_policy = news_policy.get("quality_gate", {})

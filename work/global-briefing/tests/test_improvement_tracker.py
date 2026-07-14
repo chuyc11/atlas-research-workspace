@@ -111,9 +111,28 @@ class ImprovementTrackerTests(unittest.TestCase):
         target = self.root / "work" / "global-briefing" / "data" / "paper-attribution-day-2026-07-12.json"
 
         def safe_fixer(spec, date):
-            self.assertEqual(spec.auto_fixer, "write_paper_attribution")
-            write_json(target, {"end": date})
-            return True, "written"
+            if spec.auto_fixer == "write_paper_attribution":
+                write_json(target, {"end": date})
+                return True, "written"
+            if spec.auto_fixer == "write_drift_diagnostics":
+                write_json(
+                    self.root / "work" / "global-briefing" / "data" / f"drift-diagnostics-{date}.json",
+                    {
+                        "date": date,
+                        "input_fingerprint": "test",
+                        "dimension_statuses": {
+                            "source_concentration": "healthy",
+                            "forecast_calibration": "insufficient_sample",
+                            "theme_crowding": "healthy",
+                            "paper_account_attribution": "watch",
+                        },
+                        "no_opaque_composite_score": True,
+                        "deployment_blocking": False,
+                        "paper_account_attribution": {"accounts": []},
+                    },
+                )
+                return True, "written"
+            self.fail(f"unexpected fixer {spec.auto_fixer}")
 
         with patch.object(self.tracker, "apply_fixer", side_effect=safe_fixer):
             _rc, report = self.tracker.run("2026-07-12", apply_safe=True, strict=False)
@@ -122,6 +141,36 @@ class ImprovementTrackerTests(unittest.TestCase):
         self.assertEqual(action["status"], "verified")
         self.assertTrue(target.exists())
         self.assertEqual(report["repairs"][0]["fixer"], "write_paper_attribution")
+
+    def test_paper_theme_provenance_remains_a_durable_gap_until_both_accounts_reach_80pct(self) -> None:
+        date = "2026-07-12"
+        write_json(
+            self.root / "work" / "global-briefing" / "data" / f"drift-diagnostics-{date}.json",
+            {
+                "date": date,
+                "input_fingerprint": "test",
+                "dimension_statuses": {
+                    "source_concentration": "healthy",
+                    "forecast_calibration": "insufficient_sample",
+                    "theme_crowding": "healthy",
+                    "paper_account_attribution": "watch",
+                },
+                "no_opaque_composite_score": True,
+                "deployment_blocking": False,
+                "paper_account_attribution": {
+                    "accounts": [
+                        {"account": "US", "explicit_theme_attribution_coverage_pct": 75},
+                        {"account": "CHINA", "explicit_theme_attribution_coverage_pct": 90},
+                    ]
+                },
+            },
+        )
+
+        _rc, report = self.tracker.run(date, apply_safe=False, strict=False)
+        action = next(item for item in report["actions"] if item["spec"]["source_key"] == "capability-paper-theme-provenance")
+
+        self.assertEqual(action["status"], "open")
+        self.assertEqual(action["last_evaluation"]["evidence"]["coverage_pct_by_account"]["US"], 75)
 
     def test_action_id_is_stable_across_runs(self) -> None:
         _rc, first = self.tracker.run("2026-07-12", apply_safe=False, strict=False)
@@ -169,6 +218,37 @@ class ImprovementTrackerTests(unittest.TestCase):
         self.assertTrue(any("closed before deadline" in error for error in errors))
         self.assertTrue(any("component scores" in error for error in errors))
         self.assertTrue(any("failure_reasons" in error for error in errors))
+
+    def test_new_review_integrity_accepts_evidence_inside_review_object(self) -> None:
+        predictions = self.root / "work" / "global-briefing" / "data" / "predictions.jsonl"
+        predictions.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {
+                "schema_version": 2,
+                "prediction_id": "2026-07-12-P01",
+                "date": "2026-07-12",
+                "deadline": "2026-07-12",
+            },
+            {
+                "prediction_id": "2026-07-12-P01",
+                "date": "2026-07-13",
+                "status": "validated",
+                "review": {
+                    "review_date": "2026-07-13",
+                    "observed_outcome": 1,
+                    "evidence": [{"source": "Official", "url": "https://example.com/result"}],
+                },
+            },
+        ]
+        predictions.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        self.tracker.run("2026-07-12", apply_safe=False, strict=False)
+        self.write_quality("2026-07-13", passed=True)
+
+        _rc, report = self.tracker.run("2026-07-13", apply_safe=False, strict=False)
+        action = next(item for item in report["actions"] if item["spec"]["source_key"] == "review-explicit-scoring")
+
+        self.assertEqual(action["last_evaluation"]["outcome"], "pass")
+        self.assertEqual(action["last_evaluation"]["evidence"]["errors"], [])
 
 
 if __name__ == "__main__":

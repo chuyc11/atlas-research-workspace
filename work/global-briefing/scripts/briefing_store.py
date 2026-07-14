@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import re
+import subprocess
 import sys
 from datetime import date as date_type
 from datetime import datetime, timedelta
@@ -17,6 +20,11 @@ if str(SCRIPT_PATH.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT_PATH.parent))
 
 from research_quality import parse_date as parse_contract_date
+from research_quality import maturity_date
+from research_quality import market_mapping_key
+from research_quality import resolved_market_mapping_index
+from research_quality import review_scope
+from research_quality import review_is_valid_for_resolution
 from research_quality import validate_v2_prediction, validate_v2_review
 
 ROOT = SCRIPT_PATH.parents[3]
@@ -28,6 +36,7 @@ DEFAULT_REPORT = REPORT_DIR / f"{DAILY_REPORT_STEM}.md"
 DEFAULT_PREDICTIONS = ROOT / "work" / "global-briefing" / "data" / "predictions.jsonl"
 DEFAULT_EVOLUTION_STATE = ROOT / "work" / "global-briefing" / "data" / "evolution_state.json"
 DEFAULT_SETTINGS = ROOT / "work" / "global-briefing" / "config" / "settings.json"
+DEFAULT_DATA_DIR = ROOT / "work" / "global-briefing" / "data"
 TITLE_RE = re.compile(r"^##\s+(\d{4}-\d{2}-\d{2})\b.*$", re.MULTILINE)
 DAILY_FILE_RE = re.compile(rf"^{re.escape(DAILY_REPORT_STEM)}-(\d{{4}}-\d{{2}}-\d{{2}})\.md$")
 
@@ -224,6 +233,15 @@ def append_prediction_records(input_path: Path, date: str, predictions: Path = D
         for item in existing
         if item.get("prediction_id") and not isinstance(item.get("review"), dict)
     }
+    review_keys = {
+        (
+            str(item.get("prediction_id") or ""),
+            str(item.get("status") or ""),
+            str(item.get("review", {}).get("review_date") or item.get("date") or ""),
+        )
+        for item in existing
+        if isinstance(item.get("review"), dict)
+    }
     prepared: list[dict[str, Any]] = []
     errors: list[str] = []
     for raw_record in records:
@@ -240,8 +258,19 @@ def append_prediction_records(input_path: Path, date: str, predictions: Path = D
             errors.append(f"{prediction_id or '<missing-id>'}: invalid date")
             prepared.append(record)
             continue
-        if not is_review and prediction_id in originals:
-            errors.append(f"{prediction_id}: original prediction already exists")
+        if is_review:
+            review = record.get("review") if isinstance(record.get("review"), dict) else {}
+            review_key = (
+                prediction_id,
+                str(record.get("status") or ""),
+                str(review.get("review_date") or record.get("date") or ""),
+            )
+            if review_key in review_keys:
+                continue
+        elif prediction_id in originals:
+            if originals[prediction_id] == record:
+                continue
+            errors.append(f"{prediction_id}: original prediction already exists with different content")
         if record_day >= enforce_from:
             if is_review:
                 original = originals.get(prediction_id)
@@ -253,9 +282,19 @@ def append_prediction_records(input_path: Path, date: str, predictions: Path = D
                 if original is None or original_is_v2:
                     errors.extend(validate_v2_review(record, original))
             else:
-                errors.extend(validate_v2_prediction(record))
+                errors.extend(validate_v2_prediction(
+                    record,
+                    machine_evaluation_enforce_from_date=str(
+                        settings.get("review_queue", {}).get("machine_evaluation_enforce_from_date") or ""
+                    ) or None,
+                    event_asset_separation_enforce_from_date=str(
+                        settings.get("review_queue", {}).get("event_asset_separation_enforce_from_date") or ""
+                    ) or None,
+                ))
         if not is_review and prediction_id:
             originals[prediction_id] = record
+        elif is_review:
+            review_keys.add(review_key)
         prepared.append(record)
     if errors:
         raise ValueError("Prediction contract rejected the batch: " + "; ".join(errors))
@@ -303,6 +342,250 @@ def print_previous(
         print(json.dumps(record, ensure_ascii=False, sort_keys=True))
 
 
+def _latest_review_by_prediction(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    latest: dict[str, dict[str, Any]] = {}
+    for record in records:
+        prediction_id = str(record.get("prediction_id") or "")
+        review = record.get("review")
+        if (
+            not prediction_id
+            or not isinstance(review, dict)
+            or review_scope(record) not in {"event", "combined"}
+        ):
+            continue
+        review_date = str(review.get("review_date") or record.get("date") or "")
+        previous = latest.get(prediction_id)
+        if previous is None:
+            latest[prediction_id] = record
+            continue
+        previous_review = previous.get("review") if isinstance(previous.get("review"), dict) else {}
+        previous_date = str(previous_review.get("review_date") or previous.get("date") or "")
+        if review_date >= previous_date:
+            latest[prediction_id] = record
+    return latest
+
+
+def _review_closes_prediction(original: dict[str, Any], review_record: dict[str, Any] | None) -> bool:
+    return review_is_valid_for_resolution(original, review_record)
+
+
+def review_queue_settings() -> dict[str, Any]:
+    try:
+        settings = json.loads(DEFAULT_SETTINGS.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    queue = settings.get("review_queue", {}) if isinstance(settings, dict) else {}
+    return queue if isinstance(queue, dict) else {}
+
+
+def review_queue_path(run_date: str) -> Path:
+    return DEFAULT_DATA_DIR / f"review-queue-{run_date}.json"
+
+
+def review_queue_input_fingerprint(predictions: Path = DEFAULT_PREDICTIONS) -> str:
+    settings = json.loads(DEFAULT_SETTINGS.read_text(encoding="utf-8")) if DEFAULT_SETTINGS.exists() else {}
+    contract = settings.get("prediction_contract", {}) if isinstance(settings, dict) else {}
+    queue = settings.get("review_queue", {}) if isinstance(settings, dict) else {}
+    material = {
+        "predictions_sha256": hashlib.sha256(predictions.read_bytes()).hexdigest() if predictions.exists() else None,
+        "deadline_semantics": contract.get("deadline_semantics") if isinstance(contract, dict) else None,
+        "mature_for_daily_review_when": contract.get("mature_for_daily_review_when") if isinstance(contract, dict) else None,
+        "review_queue": queue if isinstance(queue, dict) else {},
+    }
+    return hashlib.sha256(
+        json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    if path.exists() and path.read_text(encoding="utf-8") == text:
+        return False
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary.write_text(text, encoding="utf-8", newline="\n")
+    temporary.replace(path)
+    return True
+
+
+def due_review_queue(run_date: str, records: list[dict[str, Any]]) -> dict[str, Any]:
+    """Return every unresolved ledger item that needs review, without closing items early.
+
+    Date-only deadlines mature at the end of that date. A morning run therefore puts
+    equal-date items in ``matures_today`` and only treats earlier deadlines as due.
+    """
+    current = parse_contract_date(run_date)
+    latest_reviews = _latest_review_by_prediction(records)
+    resolved_mappings = resolved_market_mapping_index(records)
+    categories: dict[str, list[dict[str, Any]]] = {
+        "due_reviews": [],
+        "matures_today": [],
+        "open_not_due": [],
+    }
+    fully_closed_count = 0
+    event_resolved_count = 0
+    resolved_mapping_count = 0
+
+    for original in records:
+        if isinstance(original.get("review"), dict) or not original.get("prediction_id"):
+            continue
+        prediction_id = str(original["prediction_id"])
+        latest_review = latest_reviews.get(prediction_id)
+        event_resolved = _review_closes_prediction(original, latest_review)
+        if event_resolved:
+            event_resolved_count += 1
+        try:
+            event_deadline = maturity_date(original)
+        except (TypeError, ValueError):
+            event_deadline = None
+
+        market_due: list[dict[str, Any]] = []
+        market_matures_today: list[dict[str, Any]] = []
+        market_not_due: list[dict[str, Any]] = []
+        mappings = original.get("market_mapping")
+        if isinstance(mappings, list):
+            for mapping in mappings:
+                if not isinstance(mapping, dict):
+                    continue
+                mapping_id = market_mapping_key(prediction_id, mapping)
+                if mapping_id in resolved_mappings:
+                    resolved_mapping_count += 1
+                    continue
+                try:
+                    evaluation_day = parse_contract_date(mapping.get("evaluation_deadline"))
+                except (TypeError, ValueError):
+                    market_not_due.append(mapping)
+                    continue
+                if evaluation_day < current:
+                    market_due.append(mapping)
+                elif evaluation_day == current:
+                    market_matures_today.append(mapping)
+                else:
+                    market_not_due.append(mapping)
+
+        item = {
+            "prediction_id": prediction_id,
+            "schema_version": original.get("schema_version"),
+            "event_deadline": event_deadline.isoformat() if event_deadline else None,
+            "latest_review": latest_review,
+            "event_resolution_status": "resolved" if event_resolved else "unresolved",
+            "market_mappings_due": market_due,
+            "market_mappings_maturing_today": market_matures_today,
+            "market_mappings_not_due": market_not_due,
+            "prediction": original,
+        }
+        has_unresolved_mapping = bool(market_due or market_matures_today or market_not_due)
+        if event_resolved and not has_unresolved_mapping:
+            fully_closed_count += 1
+            continue
+        if ((not event_resolved) and event_deadline and event_deadline < current) or market_due:
+            due_days = []
+            if (not event_resolved) and event_deadline and event_deadline < current:
+                due_days.append((current - event_deadline).days)
+            for mapping in market_due:
+                try:
+                    due_days.append((current - parse_contract_date(mapping.get("evaluation_deadline"))).days)
+                except (TypeError, ValueError):
+                    pass
+            item["overdue_days"] = max(due_days) if due_days else 0
+            categories["due_reviews"].append(item)
+        elif ((not event_resolved) and event_deadline and event_deadline == current) or market_matures_today:
+            categories["matures_today"].append(item)
+        else:
+            categories["open_not_due"].append(item)
+
+    queue_config = review_queue_settings()
+    capacity = max(1, int(queue_config.get("daily_capacity") or 12))
+    prioritize_v2 = queue_config.get("prioritize_v2") is not False
+    prioritize_newly_due = queue_config.get("prioritize_newly_due") is not False
+
+    def priority(item: dict[str, Any]) -> tuple[int, int, str]:
+        schema_rank = 0 if prioritize_v2 and item.get("schema_version") == 2 else 1
+        overdue_days = int(item.get("overdue_days") or 0)
+        age_rank = overdue_days if prioritize_newly_due else -overdue_days
+        return schema_rank, age_rank, str(item.get("prediction_id") or "")
+
+    categories["due_reviews"].sort(key=priority)
+    review_now = categories["due_reviews"][:capacity]
+    review_backlog = categories["due_reviews"][capacity:]
+    return {
+        "run_date": run_date,
+        "deadline_semantics": "date-only deadlines mature at end of day; deadline < run_date is due",
+        "policy": {
+            "daily_capacity": capacity,
+            "prioritize_v2": prioritize_v2,
+            "prioritize_newly_due": prioritize_newly_due,
+        },
+        "counts": {
+            "due_reviews": len(categories["due_reviews"]),
+            "review_now": len(review_now),
+            "review_backlog": len(review_backlog),
+            "matures_today": len(categories["matures_today"]),
+            "open_not_due": len(categories["open_not_due"]),
+            "closed": fully_closed_count,
+            "fully_closed": fully_closed_count,
+            "event_resolved": event_resolved_count,
+            "market_mappings_resolved": resolved_mapping_count,
+        },
+        "review_now": review_now,
+        "review_backlog": review_backlog,
+        **categories,
+    }
+
+
+def print_due_reviews(date: str, predictions: Path = DEFAULT_PREDICTIONS, *, full: bool = True) -> None:
+    ensure_files(predictions=predictions)
+    queue = due_review_queue(date, load_json_records(predictions))
+    queue["input_fingerprint"] = review_queue_input_fingerprint(predictions)
+    path = review_queue_path(date)
+    changed = atomic_write_json(path, queue)
+    if full:
+        print(json.dumps(queue, ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps({
+            "run_date": date,
+            "counts": queue["counts"],
+            "policy": queue["policy"],
+            "review_now": queue["review_now"],
+            "full_queue_path": str(path),
+            "artifact_status": "updated" if changed else "unchanged",
+        }, ensure_ascii=False, indent=2))
+
+
+def prepare_resolution_workbench(run_date: str) -> dict[str, Any]:
+    """Prepare the non-authoritative review workbench as part of startup context.
+
+    Startup deliberately disables network collection. The evidence phase can rerun the
+    command with network access, while a failed optional collector never hides the queue.
+    """
+    script = SCRIPT_PATH.parent / "resolution_evidence.py"
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(script), "prepare", "--date", run_date, "--no-network"],
+            cwd=ROOT,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {"status": "error", "error": str(exc), "nonfatal": True}
+    output = completed.stdout.strip().splitlines()
+    if completed.returncode == 0 and output:
+        try:
+            payload = json.loads(output[-1])
+        except json.JSONDecodeError:
+            payload = {"status": "ok", "stdout": output[-1]}
+        payload["nonfatal"] = True
+        return payload
+    return {
+        "status": "error",
+        "returncode": completed.returncode,
+        "error": completed.stderr[-1000:] or completed.stdout[-1000:],
+        "nonfatal": True,
+    }
+
+
 def print_summary_context(period: str, date: str) -> None:
     ensure_files()
     start, end = period_bounds(period, date)
@@ -325,6 +608,12 @@ def main(argv: list[str] | None = None) -> int:
     previous_parser = subparsers.add_parser("previous", help="Print previous-day report section and recent predictions.")
     previous_parser.add_argument("--date", default=None, help="Run date in YYYY-MM-DD. Defaults to today.")
     previous_parser.add_argument("--limit", type=int, default=20)
+
+    due_parser = subparsers.add_parser(
+        "due-reviews",
+        help="Print the full-ledger queue of unresolved predictions and market mappings due for review.",
+    )
+    due_parser.add_argument("--date", required=True, help="Run date in YYYY-MM-DD.")
 
     write_parser = subparsers.add_parser("write", help="Write one dated Markdown report file.")
     write_parser.add_argument("--date", required=True)
@@ -351,7 +640,14 @@ def main(argv: list[str] | None = None) -> int:
         print(f"initialized predictions={DEFAULT_PREDICTIONS}")
         return 0
     if args.command == "previous":
+        print("\n=== DUE_REVIEW_QUEUE ===")
+        print_due_reviews(args.date or today_string(), full=False)
+        print("\n=== RESOLUTION_EVIDENCE_WORKBENCH ===")
+        print(json.dumps(prepare_resolution_workbench(args.date or today_string()), ensure_ascii=False, indent=2))
         print_previous(date=args.date, limit=args.limit)
+        return 0
+    if args.command == "due-reviews":
+        print_due_reviews(args.date)
         return 0
     if args.command == "write":
         path, existed = write_daily_report(args.date, args.input.read_text(encoding="utf-8"))

@@ -192,6 +192,29 @@ class ImprovementTracker:
                 auto_fixer="write_paper_attribution",
             ),
             ActionSpec(
+                source_key="capability-drift-diagnostics",
+                domain="research_governance",
+                title="保持四维漂移诊断可复现",
+                recommendation="每日生成点时漂移诊断，并保持来源、事件校准、主题拥挤和双账户归因四个维度独立。",
+                acceptance_key="drift_diagnostics",
+                acceptance_criteria=f"存在日期为 {date}、指纹有效且无不透明综合分的漂移诊断。",
+                severity="medium",
+                risk="low",
+                origin="capability_audit",
+                auto_fixer="write_drift_diagnostics",
+            ),
+            ActionSpec(
+                source_key="capability-paper-theme-provenance",
+                domain="paper_trading",
+                title="保持虚拟仓位主题归因与版本历史可审计",
+                recommendation="双账户保持完整主题覆盖；每次注册表变更必须记录原因、内容寻址快照和哈希链版本，未来BUY固化当前版本。",
+                acceptance_key="paper_theme_provenance",
+                acceptance_criteria="US与CHINA主题归因覆盖率分别达到80%，且当前注册表版本链与快照审计通过。",
+                severity="medium",
+                risk="high",
+                origin="capability_audit",
+            ),
+            ActionSpec(
                 source_key="capability-core-version-control",
                 domain="delivery_governance",
                 title="将核心工作区纳入版本控制与 CI",
@@ -273,7 +296,7 @@ class ImprovementTracker:
                 original = original_v2[prediction_id]
                 if review.get("observed_outcome") not in {0, 1, False, True}:
                     errors.append(f"{prediction_id}: missing observed_outcome")
-                if not review.get("resolution_evidence") and not row.get("evidence"):
+                if not review.get("evidence") and not review.get("resolution_evidence") and not row.get("evidence"):
                     errors.append(f"{prediction_id}: missing resolution evidence")
                 review_date = str(review.get("review_date") or row.get("date") or "")[:10]
                 deadline = str(original.get("deadline") or "")[:10]
@@ -293,6 +316,76 @@ class ImprovementTracker:
             payload = read_json(path, {})
             passed = path.is_file() and isinstance(payload, dict) and payload.get("end") == date
             return Evaluation("pass" if passed else "fail", "每日纸面归因存在" if passed else "每日纸面归因缺失", {"path": str(path), "exists": path.exists()})
+        if spec.acceptance_key == "drift_diagnostics":
+            path = self.briefing_root / "data" / f"drift-diagnostics-{date}.json"
+            payload = read_json(path, {})
+            dimensions = payload.get("dimension_statuses", {}) if isinstance(payload, dict) else {}
+            required = {"source_concentration", "forecast_calibration", "theme_crowding", "paper_account_attribution"}
+            passed = bool(
+                path.is_file()
+                and isinstance(payload, dict)
+                and payload.get("date") == date
+                and set(dimensions) == required
+                and payload.get("input_fingerprint")
+                and payload.get("no_opaque_composite_score") is True
+                and payload.get("deployment_blocking") is False
+            )
+            return Evaluation(
+                "pass" if passed else "fail",
+                "四维漂移诊断可复现" if passed else "漂移诊断缺失或结构无效",
+                {"path": str(path), "exists": path.exists(), "dimension_statuses": dimensions},
+            )
+        if spec.acceptance_key == "paper_theme_provenance":
+            path = self.briefing_root / "data" / f"drift-diagnostics-{date}.json"
+            payload = read_json(path, {})
+            paper = payload.get("paper_account_attribution", {}) if isinstance(payload, dict) else {}
+            coverage = {
+                str(row.get("account")): row.get("explicit_theme_attribution_coverage_pct")
+                for row in paper.get("accounts", []) if isinstance(row, dict)
+            } if isinstance(paper, dict) else {}
+            script = self.briefing_root / "scripts" / "paper_theme_registry.py"
+            registry_audit: dict[str, Any] = {}
+            audit_returncode: int | None = None
+            if script.is_file():
+                completed = subprocess.run(
+                    [sys.executable, str(script), "audit", "--date", date],
+                    cwd=str(self.root),
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    capture_output=True,
+                )
+                audit_returncode = completed.returncode
+                try:
+                    registry_audit = json.loads(completed.stdout)
+                except json.JSONDecodeError:
+                    registry_audit = {}
+            coverage_passed = bool(coverage) and all(
+                value is not None and float(value) >= 80.0 for value in coverage.values()
+            )
+            audit_passed = bool(
+                audit_returncode == 0
+                and registry_audit.get("audit_passed") is True
+                and registry_audit.get("history_current") is True
+                and registry_audit.get("chain_valid") is True
+                and registry_audit.get("snapshots_valid") is True
+            )
+            passed = coverage_passed and audit_passed
+            return Evaluation(
+                "pass" if passed else "fail",
+                "双账户主题覆盖与注册表版本审计均达标" if passed else "主题覆盖或注册表版本审计未达标",
+                {
+                    "path": str(path),
+                    "coverage_pct_by_account": coverage,
+                    "required_pct": 80.0,
+                    "registry_audit_returncode": audit_returncode,
+                    "registry_audit_passed": registry_audit.get("audit_passed", False),
+                    "registry_revision_id": registry_audit.get("current_revision_id"),
+                    "history_current": registry_audit.get("history_current", False),
+                    "chain_valid": registry_audit.get("chain_valid", False),
+                    "snapshots_valid": registry_audit.get("snapshots_valid", False),
+                },
+            )
         if spec.acceptance_key == "core_version_control":
             repositories = {
                 "control_plane": self.root,
@@ -366,16 +459,24 @@ class ImprovementTracker:
         return Evaluation("manual", "需要人工提供执行证据")
 
     def apply_fixer(self, spec: ActionSpec, date: str) -> tuple[bool, str]:
-        if spec.auto_fixer != "write_paper_attribution":
+        if spec.auto_fixer == "write_paper_attribution":
+            command = [
+                sys.executable,
+                str(self.briefing_root / "scripts" / "evolution.py"),
+                "paper-attribution",
+                "--period", "day",
+                "--date", date,
+                "--write",
+            ]
+        elif spec.auto_fixer == "write_drift_diagnostics":
+            command = [
+                sys.executable,
+                str(self.briefing_root / "scripts" / "drift_diagnostics.py"),
+                "--date", date,
+                "--write",
+            ]
+        else:
             return False, "no allowlisted fixer"
-        command = [
-            sys.executable,
-            str(self.briefing_root / "scripts" / "evolution.py"),
-            "paper-attribution",
-            "--period", "day",
-            "--date", date,
-            "--write",
-        ]
         completed = subprocess.run(command, cwd=self.root, text=True, encoding="utf-8", errors="replace", capture_output=True)
         return completed.returncode == 0, completed.stderr[-1000:] or completed.stdout[-1000:]
 

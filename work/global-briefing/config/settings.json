@@ -6,6 +6,13 @@
   "monthly_summary_file": "outputs/每月全球简报总结-YYYY-MM.md",
   "evolution_config": "work/global-briefing/config/evolution.json",
   "self_healing_config": "work/global-briefing/config/self_healing.json",
+  "publication_snapshot": {
+    "enabled": true,
+    "freeze_after": ["cycle", "deep_self_healing", "improvements", "alerts", "verified_external_backup"],
+    "path_pattern": "work/shared/atlas/publication_snapshots/atlas-publication-YYYY-MM-DD.json",
+    "conflict_policy": "fail_closed_and_require_explicit_revision",
+    "retry_policy": "reuse_exact_frozen_payload"
+  },
   "improvement_tracking_config": "work/global-briefing/config/improvement_tracking.json",
   "self_healing_commands": [
     "python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict",
@@ -14,6 +21,7 @@
   ],
   "evolution_outputs": {
     "daily_scorecard": "work/global-briefing/data/scorecard-day-YYYY-MM-DD.json",
+    "drift_diagnostics": "work/global-briefing/data/drift-diagnostics-YYYY-MM-DD.json",
     "weekly_scorecard": "work/global-briefing/data/scorecard-week-YYYY-MM-DD.json",
     "monthly_scorecard": "work/global-briefing/data/scorecard-month-YYYY-MM-DD.json",
     "paper_attribution": "work/global-briefing/data/paper-attribution-PERIOD-YYYY-MM-DD.json",
@@ -21,6 +29,8 @@
     "monthly_review": "outputs/每月预测复盘-YYYY-MM.md"
   },
   "evolution_commands": [
+    "python work/global-briefing/scripts/resolution_evidence.py prepare --date YYYY-MM-DD --timeout 8 --workers 4",
+    "python work/global-briefing/scripts/drift_diagnostics.py --date YYYY-MM-DD --write",
     "python work/global-briefing/scripts/evolution.py update-policy --period month --date YYYY-MM-DD",
     "python work/global-briefing/scripts/evolution.py scorecard --period day --date YYYY-MM-DD --write",
     "python work/global-briefing/scripts/evolution.py paper-attribution --period day --date YYYY-MM-DD --write",
@@ -38,6 +48,8 @@
   "prediction_contract": {
     "schema_version": 2,
     "enforce_from_date": "2026-07-12",
+    "deadline_semantics": "end_of_day_in_report_timezone",
+    "mature_for_daily_review_when": "deadline_before_run_date_unless_terminal_evidence",
     "probability_format": "numeric_open_interval_0_1",
     "required_original_fields": [
       "prediction_id",
@@ -57,8 +69,80 @@
       "success_criteria",
       "failure_criteria"
     ],
-    "market_mapping_rule": "When tickers are named, every ticker needs symbol, direction, benchmark, verification_rule, and an evaluation_deadline aligned to an observable market session.",
-    "review_rule": "Proper scoring requires review.observed_outcome in {0,1}, review_date at/after deadline unless terminal_evidence=true, and resolution evidence."
+    "market_mapping_rule": "When tickers are named, every ticker needs symbol, direction, benchmark, verification_rule, and an evaluation_deadline aligned to an observable market session. From 2026-07-14, also pre-register evaluation.metric, window_start, price_field, comparison, and optional threshold_pct.",
+    "review_rule": "Event proper scoring requires resolution_scope event/combined, review.observed_outcome in {0,1}, review_date after the end-of-day deadline unless terminal_evidence=true, and resolution evidence. Market-only reviews use status active and never close the event."
+  },
+  "review_queue": {
+    "daily_capacity": 12,
+    "prioritize_v2": true,
+    "prioritize_newly_due": true,
+    "block_deployment_on_unresolved_due_v2": true,
+    "block_deployment_on_unresolved_due_v2_market": false,
+    "machine_evaluation_enforce_from_date": "2026-07-14",
+    "event_asset_separation_enforce_from_date": "2026-07-15",
+    "persist_full_queue": true,
+    "output_pattern": "work/global-briefing/data/review-queue-YYYY-MM-DD.json"
+  },
+  "resolution_evidence": {
+    "schema_version": 1,
+    "output_pattern": "work/global-briefing/data/resolution-evidence-YYYY-MM-DD.json",
+    "scope": "review_now",
+    "event_outcome_policy": "verified_sources_and_analyst_judgment_required",
+    "market_candidate_policy": "machine_rule_plus_same-source_session-aligned_prices_then_source_verification",
+    "automatic_ledger_append": false,
+    "market_mapping_gate_mode": "shadow_until_coverage_is_proven"
+  },
+  "drift_diagnostics": {
+    "enabled": true,
+    "schema_version": 1,
+    "gate_mode": "shadow",
+    "output_pattern": "work/global-briefing/data/drift-diagnostics-YYYY-MM-DD.json",
+    "lookback_days": 28,
+    "minimum_history_days": 7,
+    "minimum_event_samples": 10,
+    "minimum_ece_samples": 30,
+    "minimum_composition_predictions": 10,
+    "minimum_theme_predictions": 10,
+    "source_family_hhi_watch": 0.18,
+    "source_family_hhi_alert": 0.28,
+    "top_source_family_share_watch_pct": 35.0,
+    "top_source_family_share_alert_pct": 50.0,
+    "brier_deterioration_watch": 0.05,
+    "brier_deterioration_alert": 0.1,
+    "ece_deterioration_watch": 0.07,
+    "ece_deterioration_alert": 0.12,
+    "theme_hhi_watch": 0.2,
+    "theme_hhi_alert": 0.3,
+    "top_theme_share_watch_pct": 45.0,
+    "top_theme_share_alert_pct": 60.0,
+    "single_symbol_share_watch_pct": 30.0,
+    "single_symbol_share_alert_pct": 45.0,
+    "paper_position_limit_watch_ratio": 0.9,
+    "paper_price_stale_after_calendar_days": 4,
+    "paper_stale_value_watch_pct": 20.0,
+    "paper_stale_value_alert_pct": 50.0,
+    "primary_domain_suffixes": [".gov", ".gov.cn", ".gov.uk", ".go.jp", ".int", ".europa.eu"],
+    "source_family_aliases": {
+      "apnews.com": "Associated Press",
+      "bbc.com": "BBC",
+      "bbc.co.uk": "BBC",
+      "bbci.co.uk": "BBC",
+      "ec.europa.eu": "European Union",
+      "europa.eu": "European Union",
+      "finance.yahoo.com": "Yahoo Finance",
+      "news.google.com": "Google News discovery",
+      "reuters.com": "Reuters"
+    },
+    "theme_taxonomy": {
+      "ai_semiconductors": ["ai", "artificial intelligence", "chip", "semiconductor", "人工智能", "芯片", "半导体", "算力"],
+      "china_macro_policy": ["china", "chinese", "pbc", "pboc", "a-share", "中国", "央行", "a股", "港股", "宽基", "科创"],
+      "climate_adaptation": ["climate", "heat", "wildfire", "typhoon", "water", "气候", "高温", "野火", "台风", "水资源", "韧性"],
+      "energy_shipping": ["oil", "gas", "energy", "shipping", "hormuz", "电网", "能源", "石油", "天然气", "航运", "霍尔木兹"],
+      "geopolitical_security": ["war", "military", "defence", "defense", "nato", "ukraine", "iran", "安全", "军事", "军工", "北约", "俄乌", "美伊", "战争"],
+      "public_health": ["health", "outbreak", "disease", "who", "公共卫生", "疫情", "疾病", "卫生"],
+      "travel_aviation": ["airline", "aviation", "travel", "tourism", "航空", "旅行", "旅游"]
+    },
+    "promotion_policy": "Remain shadow-only until at least four weekly artifacts exist, false positives are reviewed, source-family coverage is audited, and paper price/theme provenance is at least 80%."
   },
   "research_evaluation": {
     "proper_scoring": ["brier_score", "log_loss", "expected_calibration_error"],

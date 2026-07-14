@@ -128,10 +128,46 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(payload["reportQuality"]["primaryThesisCount"], 5)
         self.assertEqual(payload["reportQuality"]["topicSectionCount"], 6)
         self.assertGreaterEqual(payload["reportQuality"]["sourceDomainCount"], payload["reportQuality"]["minimumDistinctDomains"])
-        self.assertEqual(payload["metrics"]["sourceHealth"]["method"], "artifact_backed_source_health_v1")
+        self.assertEqual(payload["metrics"]["sourceHealth"]["method"], "artifact_backed_source_health_v2")
         self.assertFalse(payload["metrics"]["riskModel"]["calibrated"])
         self.assertEqual(len({event["id"] for event in payload["events"]}), len(payload["events"]))
         self.assertGreater(len({event["implication"] for event in payload["events"]}), 1)
+
+    def test_source_health_penalizes_stale_and_unknown_rss_items(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary)
+            (data_dir / "rss-items-2026-07-14.json").write_text(
+                json.dumps({
+                    "generated_at": "2026-07-14T23:59:59+08:00",
+                    "items": [
+                        {"source": "A", "published": "Tue, 14 Jul 2026 04:00:00 GMT"},
+                        {"source": "A", "published": "Fri, 10 Jul 2026 04:00:00 GMT"},
+                        {"source": "A", "published": "unknown"},
+                    ],
+                    "errors": [],
+                    "fallbacks": [],
+                }),
+                encoding="utf-8",
+            )
+            (data_dir / "china-market-snapshot-2026-07-14.json").write_text("{}", encoding="utf-8")
+            (data_dir / "market-snapshot-2026-07-14.json").write_text("{}", encoding="utf-8")
+            sources = data_dir / "sources.json"
+            sources.write_text(json.dumps({"sources": [{"name": "A", "rss": "https://a.example/rss"}]}), encoding="utf-8")
+            with (
+                patch.object(SITE_SYNC, "DATA_DIR", data_dir),
+                patch.object(SITE_SYNC, "SOURCES_CONFIG_PATH", sources),
+            ):
+                health = SITE_SYNC.source_health("2026-07-14")
+
+        self.assertLess(health["score"], 85)
+        self.assertEqual(health["rssStaleOrUnknownPct"], 66.67)
+        self.assertTrue(any("时间戳" in item for item in health["limitations"]))
+
+    def test_current_report_exposes_nonempty_observation_table(self) -> None:
+        report_path, _report_date = SITE_SYNC.report_for_date("2026-07-14")
+        audit = SITE_SYNC.report_quality_audit(report_path.read_text(encoding="utf-8"))
+
+        self.assertGreaterEqual(audit["observationCount"], 1)
 
     def test_v2_report_builds_with_numeric_probabilities_and_complete_events(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
@@ -223,6 +259,13 @@ class WorkspaceSyncTests(unittest.TestCase):
 
         self.assertEqual(changed_telemetry, baseline)
 
+    def test_cycle_telemetry_is_not_part_of_editorial_content_identity(self) -> None:
+        report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
+        with patch.object(SITE_SYNC, "build_system_status", side_effect=AssertionError("must not be called")):
+            content_hash = SITE_SYNC.site_input_hash(report_path.read_bytes(), report_date)
+
+        self.assertRegex(content_hash, r"^[0-9a-f]{64}$")
+
     def test_improvement_telemetry_is_date_aligned_and_not_content_identity(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
         baseline = SITE_SYNC.site_input_hash(report_path.read_bytes(), report_date)
@@ -286,6 +329,70 @@ class WorkspaceSyncTests(unittest.TestCase):
 
         self.assertEqual(baseline["contentHash"], changed["contentHash"])
         self.assertNotEqual(SITE_SYNC.payload_sha256(baseline), SITE_SYNC.payload_sha256(changed))
+
+    def test_publication_snapshot_requires_all_date_aligned_closed_loop_artifacts(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cycle = root / "cycle.json"
+            healing = root / "healing.json"
+            improvements = root / "improvements.json"
+            alerts = root / "alerts.json"
+            backup = root / "backup.json"
+            cycle.write_text(json.dumps({"date": "2026-07-13", "overall_passed": True}), encoding="utf-8")
+            healing.write_text(json.dumps({"date": "2026-07-13", "overall_status": "healthy", "counts": {"blocking": 0}}), encoding="utf-8")
+            improvements.write_text(json.dumps({"date": "2026-07-13", "status": "degraded", "counts": {"blocking": 0}}), encoding="utf-8")
+            alerts.write_text(json.dumps({"date": "2026-07-13", "status": "healthy", "finding_count": 0}), encoding="utf-8")
+            backup.write_text(json.dumps({"date": "2026-07-13", "verified": True, "restore_verified": True, "target_outside_workspace": True}), encoding="utf-8")
+            with (
+                patch.object(SITE_SYNC, "cycle_audit_path", return_value=cycle),
+                patch.object(SITE_SYNC, "ATLAS_SELF_HEALING_LATEST", healing),
+                patch.object(SITE_SYNC, "ATLAS_IMPROVEMENTS_LATEST", improvements),
+                patch.object(SITE_SYNC, "ATLAS_ALERTS_LATEST", alerts),
+                patch.object(SITE_SYNC, "ATLAS_BACKUPS_LATEST", backup),
+            ):
+                ready = SITE_SYNC.publication_snapshot_readiness("2026-07-13")
+                backup.write_text(json.dumps({"date": "2026-07-12", "verified": True, "restore_verified": True, "target_outside_workspace": True}), encoding="utf-8")
+                blocked = SITE_SYNC.publication_snapshot_readiness("2026-07-13")
+
+        self.assertTrue(ready["ready"])
+        self.assertFalse(blocked["ready"])
+        self.assertTrue(any("backup" in reason for reason in blocked["reasons"]))
+
+    def test_frozen_publication_snapshot_is_retry_stable_and_rejects_silent_report_drift(self) -> None:
+        report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
+        raw = report_path.read_bytes()
+        content_hash = SITE_SYNC.site_input_hash(raw, report_date)
+        payload = SITE_SYNC.build_payload(raw.decode("utf-8"), report_date, 1, content_hash)
+        readiness = {"ready": True, "reasons": [], "evidence": {"cycle": {"overallPassed": True}}}
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot_root = Path(temporary) / "snapshots"
+            with (
+                patch.object(SITE_SYNC, "PUBLICATION_SNAPSHOT_ROOT", snapshot_root),
+                patch.object(SITE_SYNC, "publication_snapshot_readiness", return_value=readiness),
+            ):
+                first = SITE_SYNC.freeze_publication_snapshot(
+                    report_date=report_date,
+                    raw_report=raw,
+                    content_hash=content_hash,
+                    payload=payload,
+                )
+                loaded = SITE_SYNC.load_publication_snapshot(report_date, raw, content_hash)
+                with self.assertRaisesRegex(ValueError, "report changed"):
+                    SITE_SYNC.load_publication_snapshot(report_date, raw + b"\nchanged", content_hash)
+                second = SITE_SYNC.freeze_publication_snapshot(
+                    report_date=report_date,
+                    raw_report=raw,
+                    content_hash=content_hash,
+                    payload=payload,
+                    refresh=True,
+                )
+
+            history_exists = (snapshot_root / "history" / report_date / "revision-1.json").exists()
+
+        self.assertEqual(first["revision"], 1)
+        self.assertEqual(loaded["payload_sha256"], first["payload_sha256"])
+        self.assertEqual(second["revision"], 2)
+        self.assertTrue(history_exists)
 
     def test_snapshot_selection_never_uses_a_future_file(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
