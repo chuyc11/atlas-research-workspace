@@ -839,7 +839,8 @@ def source_health(report_date: str) -> dict[str, Any]:
         reference = reference.replace(tzinfo=timezone(timedelta(hours=8)))
     fresh_items = 0
     stale_items = 0
-    unknown_timestamp_items = 0
+    freshness = rss.get("freshness", {}) if isinstance(rss.get("freshness"), dict) else {}
+    unknown_timestamp_items = int(freshness.get("undated_quarantined") or 0)
     rss_sources: set[str] = set()
     for item in items if isinstance(items, list) else []:
         if not isinstance(item, dict):
@@ -868,10 +869,35 @@ def source_health(report_date: str) -> dict[str, Any]:
     china_fallback_items = sum(
         int(item.get("items") or 0) for item in china_fallbacks if isinstance(item, dict)
     )
+    china_missing_price_date_items = 0
+    china_stale_price_items = 0
     market_items = market.get("items", []) if isinstance(market, dict) else []
     prior_close_market_items = 0
     stale_market_items = 0
     report_day = Date.fromisoformat(report_date)
+
+    def business_day_age(price_day: Date) -> int:
+        current = price_day
+        count = 0
+        while current < report_day:
+            current += timedelta(days=1)
+            if current.weekday() < 5:
+                count += 1
+        return count
+
+    for item in china_items:
+        if not isinstance(item, dict) or item.get("price") is None:
+            continue
+        if not item.get("price_date"):
+            china_missing_price_date_items += 1
+            continue
+        try:
+            china_price_day = Date.fromisoformat(str(item["price_date"])[:10])
+        except ValueError:
+            china_missing_price_date_items += 1
+            continue
+        if business_day_age(china_price_day) > 1:
+            china_stale_price_items += 1
     for item in market_items:
         if not isinstance(item, dict) or not item.get("price_date"):
             continue
@@ -882,12 +908,13 @@ def source_health(report_date: str) -> dict[str, Any]:
             continue
         if age_days > 0:
             prior_close_market_items += 1
-        if age_days > 3:
+        if business_day_age(Date.fromisoformat(str(item["price_date"])[:10])) > 1:
             stale_market_items += 1
     score = 100
     score -= min(24, len(errors) * 3)
     score -= min(12, len(fallbacks) * 6)
     score -= min(30, len(china_errors) * 5 + (10 if china_fallback_items else 0))
+    score -= min(25, china_missing_price_date_items * 2 + china_stale_price_items * 3)
     score -= min(15, round((100 - rss_coverage_pct) * 0.15))
     if market_items and stale_market_items == len(market_items):
         score -= 8
@@ -898,7 +925,7 @@ def source_health(report_date: str) -> dict[str, Any]:
     ) if rss_item_count else 0.0
     score -= min(35, round(stale_or_unknown_pct * 0.5))
     score = max(0, min(100, int(score)))
-    label = "良好" if score >= 85 else "中等" if score >= 65 else "受限"
+    label = "良好" if score >= 90 else "中等" if score >= 80 else "受限"
     limitations: list[str] = []
     if errors:
         limitations.append(f"RSS 采集出现 {len(errors)} 个错误。")
@@ -911,6 +938,11 @@ def source_health(report_date: str) -> dict[str, Any]:
         )
     if china_errors:
         limitations.append(f"中国结构化行情出现 {len(china_errors)} 个错误，{china_fallback_items}/{len(china_items)} 条使用备用报价。")
+    if china_missing_price_date_items or china_stale_price_items:
+        limitations.append(
+            f"中国行情时间戳受限：{china_missing_price_date_items} 条缺少价格日期、"
+            f"{china_stale_price_items} 条超过一个营业日。"
+        )
     if stale_market_items:
         limitations.append(f"全球行情 {stale_market_items}/{len(market_items)} 条价格日期早于报告日。")
     return {
@@ -927,11 +959,13 @@ def source_health(report_date: str) -> dict[str, Any]:
         "chinaErrorCount": len(china_errors),
         "chinaFallbackItemCount": china_fallback_items,
         "chinaItemCount": len(china_items),
+        "chinaMissingPriceDateItemCount": china_missing_price_date_items,
+        "chinaStalePriceItemCount": china_stale_price_items,
         "staleMarketItemCount": stale_market_items,
         "priorCloseMarketItemCount": prior_close_market_items,
         "marketItemCount": len(market_items),
         "limitations": limitations,
-        "method": "artifact_backed_source_health_v2",
+        "method": "artifact_backed_source_health_v3",
     }
 
 
@@ -1002,6 +1036,10 @@ def build_system_status(report_date: str) -> dict[str, Any]:
         "asOf": str(cycle.get("date") or report_date) if isinstance(cycle, dict) else report_date,
         "cycleId": str(cycle.get("cycle_id") or "") if isinstance(cycle, dict) else "",
         "overallPassed": cycle.get("overall_passed") is True if isinstance(cycle, dict) else False,
+        "gateScope": str(cycle.get("gate_scope") or "legacy") if isinstance(cycle, dict) else "legacy",
+        "operationalGatePassed": cycle.get("operational_gate_passed", cycle.get("overall_passed")) is True if isinstance(cycle, dict) else False,
+        "releaseCandidatePassed": cycle.get("release_candidate_passed") is True if isinstance(cycle, dict) else False,
+        "researchPromotionPassed": cycle.get("research_promotion_passed") is True if isinstance(cycle, dict) else False,
         "blockingReasons": list(cycle.get("blocking_reasons") or []) if isinstance(cycle, dict) else [],
         "stages": stages,
         "ledger": {
@@ -1075,6 +1113,10 @@ def public_system_status(value: dict[str, Any]) -> dict[str, Any]:
     return {
         "asOf": str(value.get("asOf") or ""),
         "overallPassed": value.get("overallPassed") is True,
+        "gateScope": str(value.get("gateScope") or "legacy"),
+        "operationalGatePassed": value.get("operationalGatePassed", value.get("overallPassed")) is True,
+        "releaseCandidatePassed": value.get("releaseCandidatePassed") is True,
+        "researchPromotionPassed": value.get("researchPromotionPassed") is True,
         "stages": [
             {"name": str(item.get("name") or "unknown"), "status": str(item.get("status") or "unknown")}
             for item in value.get("stages", [])
@@ -1565,7 +1607,11 @@ def publication_snapshot_readiness(report_date: str) -> dict[str, Any]:
     backup = load_json(ATLAS_BACKUPS_LATEST, {})
     reasons: list[str] = []
 
-    if not isinstance(cycle, dict) or cycle.get("date") != report_date or cycle.get("overall_passed") is not True:
+    if (
+        not isinstance(cycle, dict)
+        or cycle.get("date") != report_date
+        or cycle.get("operational_gate_passed", cycle.get("overall_passed")) is not True
+    ):
         reasons.append("date-aligned ATLAS cycle has not passed")
     healing_counts = healing.get("counts", {}) if isinstance(healing, dict) else {}
     if (
@@ -1582,8 +1628,8 @@ def publication_snapshot_readiness(report_date: str) -> dict[str, Any]:
         or int(improvement_counts.get("blocking") or 0) != 0
     ):
         reasons.append("date-aligned improvement verification is missing or blocking")
-    if not isinstance(alerts, dict) or alerts.get("date") != report_date or alerts.get("status") not in {"healthy", "attention_required"}:
-        reasons.append("date-aligned alert artifact is missing or invalid")
+    if not isinstance(alerts, dict) or alerts.get("date") != report_date or alerts.get("status") != "healthy":
+        reasons.append("date-aligned alerts are missing or still require attention")
     if (
         not isinstance(backup, dict)
         or backup.get("date") != report_date

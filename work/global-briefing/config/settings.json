@@ -83,6 +83,7 @@
     "block_deployment_on_unresolved_due_v2_market": true,
     "block_deployment_on_unresolved_due_v2_market_from_date": "2026-07-15",
     "machine_evaluation_enforce_from_date": "2026-07-14",
+    "market_resolution_price_recompute_enforce_from_date": "2026-07-16",
     "event_asset_separation_enforce_from_date": "2026-07-15",
     "persist_full_queue": true,
     "output_pattern": "work/global-briefing/data/review-queue-YYYY-MM-DD.json"

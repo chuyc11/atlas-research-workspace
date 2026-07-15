@@ -137,7 +137,7 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(payload["reportQuality"]["primaryThesisCount"], 5)
         self.assertEqual(payload["reportQuality"]["topicSectionCount"], 6)
         self.assertGreaterEqual(payload["reportQuality"]["sourceDomainCount"], payload["reportQuality"]["minimumDistinctDomains"])
-        self.assertEqual(payload["metrics"]["sourceHealth"]["method"], "artifact_backed_source_health_v2")
+        self.assertEqual(payload["metrics"]["sourceHealth"]["method"], "artifact_backed_source_health_v3")
         self.assertFalse(payload["metrics"]["riskModel"]["calibrated"])
         self.assertEqual(len({event["id"] for event in payload["events"]}), len(payload["events"]))
         self.assertGreater(len({event["implication"] for event in payload["events"]}), 1)

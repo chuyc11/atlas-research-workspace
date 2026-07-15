@@ -39,6 +39,14 @@ SCHEMA_VERSION = 1
 USER_AGENT = "Mozilla/5.0 ATLASResolutionEvidence/1.0"
 
 
+def open_yahoo_url(request: urllib.request.Request, timeout: int):
+    parsed = urllib.parse.urlsplit(request.full_url)
+    if parsed.scheme != "https" or parsed.hostname != "query2.finance.yahoo.com":
+        raise ValueError(f"resolution URL is not allowlisted: {request.full_url}")
+    # The scheme and exact provider hostname are validated immediately above.
+    return urllib.request.urlopen(request, timeout=timeout)  # nosec B310
+
+
 def stable_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -112,7 +120,7 @@ def fetch_yahoo_history(symbol: str, start: Date, end: Date, timeout: int) -> di
     )
     request = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_yahoo_url(request, timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         return {"symbol": symbol, "provider_symbol": ticker, "source_url": url, "error": str(exc), "points": []}

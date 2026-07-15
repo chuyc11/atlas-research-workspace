@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -30,6 +31,16 @@ def atomic_json(path: Path, payload: Any) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     temporary.replace(path)
+
+
+def alert_fingerprint(date: str, destinations: list[str], findings: list[dict[str, Any]]) -> str:
+    content = json.dumps(
+        {"date": date, "destinations": destinations, "findings": findings},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(content).hexdigest()
 
 
 def build_alert(
@@ -77,19 +88,105 @@ def build_alert(
         findings.append({"kind": "cycle", "id": cycle.get("cycle_id"), "severity": "critical", "status": "blocked", "title": "ATLAS cycle blocked", "summary": blocker})
     severity_rank = {"critical": 0, "high": 1, "medium": 2, "low": 3}
     findings.sort(key=lambda item: (severity_rank.get(str(item.get("severity")), 9), str(item.get("id"))))
+    alerts_root = runtime_root / "alerts"
+    previous = read_json(alerts_root / "latest.json")
+    fingerprint = alert_fingerprint(date, list(destinations), findings)
+    alert_id = f"ATLAS-ALERT-{date.replace('-', '')}-{fingerprint[:16].upper()}"
+    same_alert = previous.get("alert_id") == alert_id
+    generated_at = (
+        str(previous.get("generated_at"))
+        if same_alert and previous.get("generated_at")
+        else datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    )
+    ack_required_severities = {
+        str(value) for value in config.get("ack_required_severities", ["critical", "high"])
+    }
+    requires_ack = any(str(item.get("severity")) in ack_required_severities for item in findings)
+    attempts = list(previous.get("delivery_attempts", [])) if same_alert else []
+    if findings and not attempts:
+        attempts = [
+            {
+                "attempt": 1,
+                "prepared_at": generated_at,
+                "destinations": list(destinations),
+                "status": "pending_handoff",
+            }
+        ]
+    ack_timeout = int(config.get("ack_timeout_minutes") or 60)
     payload = {
         "schema_version": 1,
+        "alert_id": alert_id,
+        "content_sha256": fingerprint,
         "date": date,
-        "generated_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+        "generated_at": generated_at,
         "status": "attention_required" if findings else "healthy",
         "destinations": destinations,
-        "delivery_contract": "The daily Codex automation must include this payload summary in its final response, which is delivered to the Codex task inbox.",
+        "delivery_contract": "External automation must hand off every configured destination, record a receipt, and acknowledge critical/high findings.",
+        "delivery_state": (
+            str(previous.get("delivery_state"))
+            if same_alert and previous.get("delivery_state")
+            else "pending"
+            if findings
+            else "not_required"
+        ),
+        "delivery_attempts": attempts,
+        "retry_limit": int(config.get("retry_limit") or 3),
+        "requires_acknowledgement": requires_ack,
+        "acknowledged_at": previous.get("acknowledged_at") if same_alert else None,
+        "acknowledged_by": previous.get("acknowledged_by") if same_alert else None,
+        "escalation_due_at": (
+            (datetime.fromisoformat(generated_at.replace("Z", "+00:00")) + timedelta(minutes=ack_timeout))
+            .isoformat()
+            .replace("+00:00", "Z")
+            if requires_ack
+            else None
+        ),
         "finding_count": len(findings),
         "findings": findings,
     }
-    alerts_root = runtime_root / "alerts"
     atomic_json(alerts_root / f"alert-{date}.json", payload)
     atomic_json(alerts_root / "latest.json", payload)
+    return payload
+
+
+def acknowledge_alert(date: str, acknowledged_by: str, *, runtime_root: Path = RUNTIME_ROOT) -> dict[str, Any]:
+    path = runtime_root / "alerts" / f"alert-{date}.json"
+    payload = read_json(path)
+    if not payload or payload.get("date") != date:
+        raise ValueError(f"no alert exists for {date}")
+    actor = acknowledged_by.strip()
+    if not actor:
+        raise ValueError("acknowledged_by is required")
+    payload["acknowledged_at"] = datetime.now(UTC).isoformat().replace("+00:00", "Z")
+    payload["acknowledged_by"] = actor
+    payload["delivery_state"] = "acknowledged"
+    atomic_json(path, payload)
+    atomic_json(runtime_root / "alerts" / "latest.json", payload)
+    return payload
+
+
+def retry_alert(date: str, *, runtime_root: Path = RUNTIME_ROOT) -> dict[str, Any]:
+    path = runtime_root / "alerts" / f"alert-{date}.json"
+    payload = read_json(path)
+    if not payload or payload.get("date") != date:
+        raise ValueError(f"no alert exists for {date}")
+    attempts = list(payload.get("delivery_attempts", []))
+    retry_limit = int(payload.get("retry_limit") or 3)
+    if len(attempts) >= retry_limit:
+        payload["delivery_state"] = "escalation_required"
+    else:
+        attempts.append(
+            {
+                "attempt": len(attempts) + 1,
+                "prepared_at": datetime.now(UTC).isoformat().replace("+00:00", "Z"),
+                "destinations": list(payload.get("destinations", [])),
+                "status": "pending_handoff",
+            }
+        )
+        payload["delivery_attempts"] = attempts
+        payload["delivery_state"] = "pending"
+    atomic_json(path, payload)
+    atomic_json(runtime_root / "alerts" / "latest.json", payload)
     return payload
 
 
@@ -97,8 +194,18 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Prepare the daily ATLAS external alert payload.")
     parser.add_argument("--date", required=True)
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--ack-by")
+    parser.add_argument("--retry", action="store_true")
     args = parser.parse_args()
-    payload = build_alert(args.date)
+    if args.ack_by and args.retry:
+        parser.error("--ack-by and --retry are mutually exclusive")
+    payload = (
+        acknowledge_alert(args.date, args.ack_by)
+        if args.ack_by
+        else retry_alert(args.date)
+        if args.retry
+        else build_alert(args.date)
+    )
     if args.json:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:

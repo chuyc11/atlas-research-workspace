@@ -90,6 +90,7 @@ python atlas.py quality --date 2026-07-11 --strict
 ```powershell
 python atlas.py cycle --date 2026-07-10
 python atlas.py cycle --date 2026-07-10 --dry-run
+python atlas.py cycle --date 2026-07-10 --full-tests
 ```
 
 cycle 的稳定产物：
@@ -98,13 +99,18 @@ cycle 的稳定产物：
 - 账本状态快照：`work/shared/atlas/virtual_execution/atlas_virtual_execution_state.json`
 - 账本审计：`work/shared/atlas/virtual_execution/atlas_virtual_execution_audit.json`
 - 运行审计：`work/shared/atlas/run_audits/atlas-cycle-YYYY-MM-DD.json`
-- 不可变运行历史：`work/shared/atlas/run_audits/history/YYYY-MM-DD/ATLAS-CYCLE-*-RUN-*.json`
+- 哈希链运行历史：`work/shared/atlas/run_audits/history/YYYY-MM-DD/ATLAS-CYCLE-*-RUN-*.json`
+- 三仓来源锁：`work/shared/atlas/workspace-lock.json`
 
 cycle 使用内容指纹和稳定事件 ID 保持幂等；账本、状态和账本审计在输入不变时保持字节稳定，
 每次调用则单独保留一份运行历史。相同源事件不会被静默去重，而会触发阻断并保留上一份已通过审计的 canonical ledger。
 cycle 通过 `work/shared/atlas/cycle.lock` 阻止并发运行；doctor 或 sync 上游门禁失败时只继续生成诊断和运行审计，不写 canonical ledger。
-每日自动生成的 `temp_orders_YYYY-MM-DD.json` 会作为 `virtual_order_intent` 进入 canonical ledger；
+每日自动生成的 `temp-orders-YYYY-MM-DD.json` 会作为 `virtual_order_intent` 进入 canonical ledger；旧版下划线文件只作兼容输入，
+同日两个非空别名并存会 fail-closed；
 实际旧账本仍不会被 cycle 直接追加。
+
+cycle 的 `overall_passed` 仅为向后兼容字段，语义等同 `operational_gate_passed`。`release_candidate_passed`
+还要求 `--full-tests`、输入不变的幂等复跑、三仓干净且均有远端；`research_promotion_passed` 单独表示研究证据门禁，三者不能互相替代。
 
 启动网页：
 
@@ -155,7 +161,7 @@ atlas doctor
 - 唯一规范化账本是 `work/shared/atlas/virtual_execution/atlas_virtual_execution_ledger.jsonl`。
 - `work/global-briefing/data/paper_trades_us.jsonl`、`paper_trades_china.jsonl` 和
   `work/trading-core/data/replays/global_briefing/trades/*.jsonl` 是只读历史来源。
-- `work/global-briefing/data/temp_orders_*.json` 是自动虚拟订单意图来源，只写入 canonical ledger。
+- `work/global-briefing/data/temp-orders-*.json` 是自动虚拟订单意图来源，只写入 canonical ledger。
 - 账本审计要求所有事件 `paper_trading_only=true`、`no_real_broker_order=true`，并拒绝 broker/live order 字段。
 - paper-trading 写入器按账户加锁并使用恢复日志提交组合与成交账本；相同 `order_id` 或相同订单内容会幂等复用，复用 ID 但修改内容会 fail-closed，同批后续订单失败不会留下半事务。
 - replay gate 只接受 isolated historical replay evaluation，要求主账本未写入、`run-daily` 未调用、no-trade fallback 未启用。
@@ -163,7 +169,15 @@ atlas doctor
 - shadow promotion gate 由 verified out-of-sample evidence 驱动；无证据时保持 shadow，且不会自动晋升到 active-normal。
 - 影子证据的日期、样本数、收益、错误率、回撤、成本和来源链字段均采用 fail-closed 校验；畸形证据只会保持 shadow。
 - 2026-07-12 起新增预测使用 v2 预注册契约：数值概率、明确截止日、成功/失败判定规则、证据快照与基准化市场映射。
+- 2026-07-16 起市场解析必须使用预注册会话窗口与截止会话，保存原始起止价格，并由质量门禁重算标的、基准和超额收益。
 - 旧的高/中/低概率和状态默认分只作兼容展示，不进入 Brier、Log Loss 或 ECE；研究晋升只接受合格到期解析样本。
+
+## 安全与恢复
+
+- Node 审计固定使用 npm 官方安全端点；当前策略不保留漏洞例外，未来例外必须有责任人、理由和到期日，high/critical 永不豁免。
+- 根 CI 固定 GitHub Action 提交，执行 Ruff、Bandit、秘密扫描、Python 依赖审计、60% 覆盖率及 Python 3.11/3.12 矩阵。
+- 灾备写入 `D:/ATLAS-Backups`，要求与工作区不同卷；每个快照包含三仓 Git bundle、文件级哈希、嵌入清单、外置清单和前序清单哈希，并执行真实恢复校验。
+- 高/严重改进项需要确认；告警具备稳定 ID、重试上限、确认超时和升级状态。Slack 连接器只作为已配置目的地，未绑定频道时不得宣称已送达。
 
 预测系统的分层设计、契约示例和晋升标准见 [RESEARCH_ARCHITECTURE.md](RESEARCH_ARCHITECTURE.md)。
 

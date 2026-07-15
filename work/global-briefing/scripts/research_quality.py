@@ -33,6 +33,11 @@ DEFAULT_SETTINGS = BRIEFING_ROOT / "config" / "settings.json"
 DEFAULT_PREDICTIONS = BRIEFING_ROOT / "data" / "predictions.jsonl"
 DEFAULT_DATA_DIR = BRIEFING_ROOT / "data"
 DEFAULT_OUTPUTS = ROOT / "outputs"
+DEFAULT_A_SHARE_CALENDAR = ROOT / "work" / "trading-core" / "data" / "equity_universe" / "trading_calendar.json"
+DEFAULT_EXCHANGE_CALENDAR_CONTRACT = (
+    ROOT / "work" / "trading-core" / "data" / "system" / "ashare_trading_calendar_contract.json"
+)
+DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM = "2026-07-16"
 
 HORIZON_DAYS = {"1d": 1, "1w": 7, "1m": 30}
 CLOSED_STATUSES = {"validated", "partial", "wrong", "expired"}
@@ -219,10 +224,96 @@ def _numeric(value: Any) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def instrument_market(symbol: Any) -> str:
+    value = str(symbol or "").strip().upper()
+    if value.endswith((".SH", ".SZ", ".BJ")):
+        return "A_SHARE"
+    if value.endswith(".HK"):
+        return "HK"
+    return "US_OR_GLOBAL"
+
+
+def load_exchange_holidays(
+    path: Path = DEFAULT_EXCHANGE_CALENDAR_CONTRACT,
+) -> dict[str, set[str]]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    raw = payload.get("explicit_holiday_list", {}) if isinstance(payload, dict) else {}
+    return {
+        str(exchange).upper(): {str(day)[:10] for day in days}
+        for exchange, days in raw.items()
+        if isinstance(days, list)
+    }
+
+
+def load_a_share_sessions(path: Path = DEFAULT_A_SHARE_CALENDAR) -> dict[tuple[str, str], bool]:
+    if not path.exists():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    rows = payload.get("rows", payload) if isinstance(payload, dict) else payload
+    sessions: dict[tuple[str, str], bool] = {}
+    if not isinstance(rows, list):
+        return sessions
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        day = str(row.get("date") or row.get("trade_date") or "")[:10]
+        exchange = str(row.get("exchange") or "").strip().upper()
+        if day and exchange:
+            sessions[(exchange, day)] = bool(row.get("is_trading_day", row.get("is_open", False)))
+    return sessions
+
+
+def market_session_status(day: date_type, symbol: Any) -> tuple[bool, str]:
+    value = str(symbol or "").strip().upper()
+    market = instrument_market(value)
+    if market == "US_OR_GLOBAL":
+        return day.weekday() < 5, "weekday_calendar"
+    exchange = (
+        "SSE"
+        if value.endswith(".SH")
+        else "SZSE"
+        if value.endswith(".SZ")
+        else "BSE"
+        if value.endswith(".BJ")
+        else "HKEX"
+    )
+    sessions = load_a_share_sessions()
+    key = (exchange, day.isoformat())
+    if key in sessions:
+        return sessions[key], "official_exchange_session_file"
+    holidays = load_exchange_holidays()
+    if exchange in holidays:
+        return day.weekday() < 5 and day.isoformat() not in holidays[exchange], "official_exchange_holiday_contract"
+    return False, "official_exchange_calendar_unavailable"
+
+
+def is_comparable_market_session(day: date_type, symbol: Any, benchmark: Any) -> bool:
+    return market_session_status(day, symbol)[0] and market_session_status(day, benchmark)[0]
+
+
+def previous_comparable_market_session(
+    boundary: date_type,
+    symbol: Any,
+    benchmark: Any,
+) -> date_type | None:
+    candidate = boundary - timedelta(days=1)
+    for _ in range(10):
+        if is_comparable_market_session(candidate, symbol, benchmark):
+            return candidate
+        candidate -= timedelta(days=1)
+    return None
+
+
 def validate_market_resolution_item(
     prediction_id: str,
     item: dict[str, Any],
     review_record: dict[str, Any],
+    *,
+    original: dict[str, Any] | None = None,
+    expected_mapping: dict[str, Any] | None = None,
+    price_recompute_enforce_from_date: str = DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM,
 ) -> list[str]:
     errors: list[str] = []
     prefix = f"{prediction_id}: review.market_resolution"
@@ -249,11 +340,48 @@ def validate_market_resolution_item(
     for field in ("symbol_return_pct", "benchmark_return_pct", "excess_return_pct"):
         if _numeric(item.get(field)) is None:
             errors.append(f"{prefix}.{field} must be a finite number")
+    price_days: dict[str, date_type] = {}
     for field in ("start_price_date", "end_price_date"):
         try:
-            parse_date(item.get(field))
+            price_days[field] = parse_date(item.get(field))
         except (TypeError, ValueError):
             errors.append(f"{prefix}.{field} must be YYYY-MM-DD")
+    start_day = price_days.get("start_price_date")
+    end_day = price_days.get("end_price_date")
+    symbol = str(item.get("symbol") or "").strip().upper()
+    benchmark = str(item.get("benchmark") or "").strip().upper()
+    if start_day and end_day:
+        if start_day >= end_day:
+            errors.append(f"{prefix} start_price_date must precede end_price_date")
+        if not is_comparable_market_session(start_day, symbol, benchmark):
+            errors.append(f"{prefix}.start_price_date is not a comparable market session")
+        if not is_comparable_market_session(end_day, symbol, benchmark):
+            errors.append(f"{prefix}.end_price_date is not a comparable market session")
+        if end_day != evaluation_day:
+            errors.append(f"{prefix}.end_price_date must equal the pre-registered evaluation deadline")
+        if expected_mapping is not None and original is not None:
+            evaluation = expected_mapping.get("evaluation")
+            verification_rule = str(expected_mapping.get("verification_rule") or "")
+            single_session_rule = any(term in verification_rule.lower() for term in ("single day", "single-day", "单日"))
+            if isinstance(evaluation, dict) and evaluation.get("window_start"):
+                boundary_value = evaluation.get("window_start")
+            elif single_session_rule:
+                boundary_value = expected_mapping.get("evaluation_deadline")
+            else:
+                boundary_value = original.get("date")
+            try:
+                boundary = parse_date(boundary_value)
+            except (TypeError, ValueError):
+                errors.append(f"{prefix} cannot determine the pre-registered window start")
+            else:
+                expected_start = previous_comparable_market_session(boundary, symbol, benchmark)
+                if expected_start is None:
+                    errors.append(f"{prefix} cannot resolve a comparable baseline session")
+                elif start_day != expected_start:
+                    errors.append(
+                        f"{prefix}.start_price_date must be the last comparable session before "
+                        f"the pre-registered window ({expected_start.isoformat()})"
+                    )
     evidence = item.get("evidence")
     if not isinstance(evidence, list) or not evidence:
         errors.append(f"{prefix}.evidence must be a non-empty list")
@@ -265,12 +393,58 @@ def validate_market_resolution_item(
     else:
         if resolved_day <= evaluation_day and item.get("terminal_evidence") is not True:
             errors.append(f"{prefix} is premature before the evaluation deadline has fully elapsed")
+        try:
+            recompute_enforce_day = parse_date(price_recompute_enforce_from_date)
+        except (TypeError, ValueError):
+            recompute_enforce_day = date_type.max
+        if resolved_day >= recompute_enforce_day:
+            raw_prices: dict[str, float] = {}
+            for field in (
+                "symbol_start_price",
+                "symbol_end_price",
+                "benchmark_start_price",
+                "benchmark_end_price",
+            ):
+                value = _numeric(item.get(field))
+                if value is None or value <= 0:
+                    errors.append(f"{prefix}.{field} must be a positive finite number")
+                else:
+                    raw_prices[field] = value
+            expected_price_field = None
+            if expected_mapping is not None and isinstance(expected_mapping.get("evaluation"), dict):
+                expected_price_field = str(expected_mapping["evaluation"].get("price_field") or "")
+            if expected_price_field and str(item.get("price_field") or "") != expected_price_field:
+                errors.append(f"{prefix}.price_field must match the pre-registered evaluation")
+            if len(raw_prices) == 4:
+                computed_symbol = (raw_prices["symbol_end_price"] / raw_prices["symbol_start_price"] - 1.0) * 100.0
+                computed_benchmark = (
+                    raw_prices["benchmark_end_price"] / raw_prices["benchmark_start_price"] - 1.0
+                ) * 100.0
+                computed_excess = computed_symbol - computed_benchmark
+                reported = {
+                    "symbol_return_pct": computed_symbol,
+                    "benchmark_return_pct": computed_benchmark,
+                    "excess_return_pct": computed_excess,
+                }
+                for field, computed in reported.items():
+                    value = _numeric(item.get(field))
+                    if value is not None and abs(value - computed) > 1e-5:
+                        errors.append(f"{prefix}.{field} conflicts with recomputed raw-price return")
     return errors
 
 
-def resolved_market_mapping_index(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def resolved_market_mapping_index(
+    records: list[dict[str, Any]],
+    *,
+    price_recompute_enforce_from_date: str = DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM,
+) -> dict[str, dict[str, Any]]:
     """Index independently resolved asset mappings across every appended review."""
     resolved: dict[str, dict[str, Any]] = {}
+    originals = {
+        str(row.get("prediction_id") or ""): row
+        for row in records
+        if not isinstance(row.get("review"), dict) and row.get("prediction_id")
+    }
     for row in records:
         prediction_id = str(row.get("prediction_id") or "")
         review = row.get("review")
@@ -283,7 +457,21 @@ def resolved_market_mapping_index(records: list[dict[str, Any]]) -> dict[str, di
         for item in items:
             if not isinstance(item, dict) or str(item.get("status") or "").lower() != "resolved":
                 continue
-            if validate_market_resolution_item(prediction_id, item, row):
+            original = originals.get(prediction_id)
+            expected_mappings = {
+                market_mapping_key(prediction_id, mapping): mapping
+                for mapping in (original or {}).get("market_mapping", [])
+                if isinstance(mapping, dict)
+            }
+            expected_mapping = expected_mappings.get(market_mapping_key(prediction_id, item))
+            if validate_market_resolution_item(
+                prediction_id,
+                item,
+                row,
+                original=original,
+                expected_mapping=expected_mapping,
+                price_recompute_enforce_from_date=price_recompute_enforce_from_date,
+            ):
                 continue
             key = market_mapping_key(prediction_id, item)
             previous = resolved.get(key)
@@ -479,6 +667,10 @@ def validate_v2_prediction(
                 mapping_deadline = parse_date(item.get("evaluation_deadline"))
                 if prediction_day and mapping_deadline <= prediction_day:
                     errors.append(f"{prediction_id}: market_mapping[{index}].evaluation_deadline must be after date")
+                if not is_comparable_market_session(mapping_deadline, item.get("symbol"), item.get("benchmark")):
+                    errors.append(
+                        f"{prediction_id}: market_mapping[{index}].evaluation_deadline must be a comparable market session"
+                    )
             except (TypeError, ValueError):
                 errors.append(f"{prediction_id}: market_mapping[{index}].evaluation_deadline must be YYYY-MM-DD")
             evaluation = item.get("evaluation")
@@ -527,7 +719,12 @@ def validate_v2_prediction(
     return errors
 
 
-def validate_v2_review(record: dict[str, Any], original: dict[str, Any] | None) -> list[str]:
+def validate_v2_review(
+    record: dict[str, Any],
+    original: dict[str, Any] | None,
+    *,
+    price_recompute_enforce_from_date: str = DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM,
+) -> list[str]:
     """Validate a resolution record against its immutable original forecast."""
     prediction_id = str(record.get("prediction_id") or "<missing-id>")
     errors: list[str] = []
@@ -571,9 +768,18 @@ def validate_v2_review(record: dict[str, Any], original: dict[str, Any] | None) 
                 if not isinstance(item, dict):
                     errors.append(f"{prediction_id}: review.market_resolution entries must be objects")
                     continue
-                errors.extend(validate_market_resolution_item(prediction_id, item, record))
                 item_key = market_mapping_key(prediction_id, item)
                 expected_mapping = original_mappings.get(item_key)
+                errors.extend(
+                    validate_market_resolution_item(
+                        prediction_id,
+                        item,
+                        record,
+                        original=original,
+                        expected_mapping=expected_mapping,
+                        price_recompute_enforce_from_date=price_recompute_enforce_from_date,
+                    )
+                )
                 if expected_mapping is None:
                     errors.append(f"{prediction_id}: market resolution does not match a pre-registered mapping")
                     continue
@@ -770,6 +976,7 @@ def market_mapping_metrics(
     *,
     cutoff: str,
     family_registry: dict[str, Any] | None = None,
+    price_recompute_enforce_from_date: str = DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM,
 ) -> dict[str, Any]:
     """Score asset mappings independently from probabilistic event forecasts."""
     cutoff_day = parse_date(cutoff)
@@ -795,7 +1002,10 @@ def market_mapping_metrics(
                     "mapping_id": market_mapping_key(prediction_id, mapping),
                 })
 
-    resolved_index = resolved_market_mapping_index(records)
+    resolved_index = resolved_market_mapping_index(
+        records,
+        price_recompute_enforce_from_date=price_recompute_enforce_from_date,
+    )
     samples: list[dict[str, Any]] = []
     exclusions: Counter[str] = Counter()
     reciprocal_duplicate_count = sum(max(0, len(group) - 1) for group in matured_groups.values())
@@ -933,7 +1143,16 @@ def audit_prediction_records(
         except (TypeError, ValueError):
             continue
         if original_day >= enforce_day:
-            v2_review_errors.extend(validate_v2_review(review_row, original))
+            v2_review_errors.extend(
+                validate_v2_review(
+                    review_row,
+                    original,
+                    price_recompute_enforce_from_date=str(
+                        (review_policy or {}).get("market_resolution_price_recompute_enforce_from_date")
+                        or DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM
+                    ),
+                )
+            )
     v2_duplicate_ids = sorted(
         prediction_id
         for prediction_id in duplicate_original_ids
@@ -979,8 +1198,22 @@ def audit_prediction_records(
         for prediction_id, original in matured_v2.items()
         if not review_is_valid_for_resolution(original, reviews.get(prediction_id))
     )
-    mapping_metrics = market_mapping_metrics(records, cutoff=cutoff, family_registry=family_registry)
-    resolved_mapping_keys = set(resolved_market_mapping_index(records))
+    price_recompute_enforce_from_date = str(
+        (review_policy or {}).get("market_resolution_price_recompute_enforce_from_date")
+        or DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM
+    )
+    mapping_metrics = market_mapping_metrics(
+        records,
+        cutoff=cutoff,
+        family_registry=family_registry,
+        price_recompute_enforce_from_date=price_recompute_enforce_from_date,
+    )
+    resolved_mapping_keys = set(
+        resolved_market_mapping_index(
+            records,
+            price_recompute_enforce_from_date=price_recompute_enforce_from_date,
+        )
+    )
     unresolved_matured_v2_mappings: list[str] = []
     for prediction_id, original in original_by_id.items():
         if original.get("schema_version") != 2:

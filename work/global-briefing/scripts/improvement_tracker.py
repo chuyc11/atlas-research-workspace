@@ -141,7 +141,7 @@ class ImprovementTracker:
         mapping = self.config.get("acceptance_rules", {})
         criteria = {
             "v2_contract": "下一批 v2 预测继续满足概率、证据、截止日、解析标准和资产映射契约。",
-            "source_health": "来源健康分数达到 65，且所有核心主线通过独立来源、证据角色和限制披露审计。",
+            "source_health": "来源健康分数达到 80，陈旧或未知 RSS 不超过 20%，且所有核心主线通过独立来源、证据角色和限制披露审计。",
             "manual_evidence": "下一次复盘提供可审计的执行证据，由人工确认建议已落实。",
             "new_review_integrity": "下一批到期 v2 复盘不得提前结案，并包含显式结果、失败原因和证据。",
             "no_stale_market_data": "不得使用过期市场价格解析新的资产预测。",
@@ -174,7 +174,7 @@ class ImprovementTracker:
                 title="恢复多源证据健康度",
                 recommendation="修复 RSS/结构化行情失败，降低全量备用报价依赖，并保持限制披露。",
                 acceptance_key="source_health",
-                acceptance_criteria="来源健康分数达到 65。",
+                acceptance_criteria="来源健康分数达到 80，陈旧或未知 RSS 不超过 20%。",
                 severity="high",
                 risk="high",
                 origin="capability_audit",
@@ -275,7 +275,16 @@ class ImprovementTracker:
             role_coverage = float(report_audit.get("source_role_coverage_pct") or 0.0)
             roles_passed = not roles_enforced or role_coverage == 100.0
             limitations_disclosed = isinstance(health, dict) and isinstance(health.get("limitations"), list)
-            passed = score >= 65 and core_stories_passed and roles_passed and limitations_disclosed
+            stale_or_unknown_pct = float(health.get("rssStaleOrUnknownPct") or 0.0) if isinstance(health, dict) else 100.0
+            missing_market_dates = int(health.get("chinaMissingPriceDateItemCount") or 0) if isinstance(health, dict) else 1
+            passed = (
+                score >= 80
+                and stale_or_unknown_pct <= 20.0
+                and missing_market_dates == 0
+                and core_stories_passed
+                and roles_passed
+                and limitations_disclosed
+            )
             evidence = {
                 "score": score,
                 "label": health.get("label"),
@@ -284,6 +293,8 @@ class ImprovementTracker:
                 "all_core_stories_passed": core_stories_passed,
                 "story_evidence_enforced": roles_enforced,
                 "source_role_coverage_pct": role_coverage,
+                "rss_stale_or_unknown_pct": stale_or_unknown_pct,
+                "china_missing_price_date_items": missing_market_dates,
             }
             detail = (
                 f"来源健康 {score}/100；核心主线审计={'通过' if core_stories_passed else '失败'}；"
@@ -566,7 +577,7 @@ class ImprovementTracker:
         unresolved = [a for a in actions.values() if a.get("status") not in {"verified", "closed"}]
         regressed = [a for a in unresolved if a.get("status") == "regressed"]
         overdue = [a for a in unresolved if a.get("status") == "overdue"]
-        blocking_levels = set(self.config.get("blocking_severities", ["critical"]))
+        blocking_levels = set(self.config.get("blocking_severities", ["critical", "high"]))
         blocking = [a for a in unresolved if a.get("spec", {}).get("severity") in blocking_levels and a.get("status") in {"regressed", "overdue"}]
         capability_gaps = [a for a in unresolved if a.get("spec", {}).get("origin") == "capability_audit"]
         report = {

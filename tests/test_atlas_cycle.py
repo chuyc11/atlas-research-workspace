@@ -71,7 +71,7 @@ class AtlasCycleTests(unittest.TestCase):
         write_jsonl(self.briefing / "data" / "paper_trades_us.jsonl", [trade])
         write_jsonl(self.briefing / "data" / "paper_trades_china.jsonl", [])
         write_json(
-            self.briefing / "data" / "temp_orders_2026-07-10.json",
+            self.briefing / "data" / "temp-orders-2026-07-10.json",
             {
                 "orders": [
                     {
@@ -89,7 +89,15 @@ class AtlasCycleTests(unittest.TestCase):
         )
         write_json(
             self.briefing / "data" / "paper_portfolio_us.json",
-            {"account_id": "global-briefing-us-paper-trading", "mode": "paper_trading", "cash": 99980, "initial_cash": 100000, "positions": {}},
+            {
+                "account_id": "global-briefing-us-paper-trading",
+                "mode": "paper_trading",
+                "cash": 99980,
+                "initial_cash": 100000,
+                "positions": {
+                    "NASDAQ:TEST": {"exchange": "NASDAQ", "symbol": "TEST", "quantity": 2}
+                },
+            },
         )
         write_json(
             self.briefing / "data" / "paper_portfolio_china.json",
@@ -115,7 +123,13 @@ class AtlasCycleTests(unittest.TestCase):
         )
         write_json(
             self.trading / "data" / "replays" / "global_briefing" / "accounts" / "account-GB-HIST-REPLAY-20260710-20260710.json",
-            {"replay_id": "GB-HIST-REPLAY-20260710-20260710", "cash": 999599.8, "equity": 1000000, "positions": [], "isolated": True},
+            {
+                "replay_id": "GB-HIST-REPLAY-20260710-20260710",
+                "cash": 999599.8,
+                "equity": 1000000,
+                "positions": [{"symbol": "510300.SH", "quantity": 100}],
+                "isolated": True,
+            },
         )
         write_json(
             self.trading / "data" / "replays" / "global_briefing" / "global_briefing_replay_evaluation-2026-07-10-2026-07-10.json",
@@ -157,6 +171,35 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertTrue(second["write_performed"])
         self.assertEqual(len({event["ledger_event_id"] for event in second["events"]}), 3)
         self.assertIn("virtual_order_intent", {event["event_type"] for event in second["events"]})
+        self.assertEqual(second["audit"]["source_counts"]["global_briefing_temp_orders"], 1)
+        self.assertTrue(second["audit"]["reconciliation"]["passed"])
+
+    def test_previous_canonical_source_mutation_fails_closed(self) -> None:
+        first = atlas.build_virtual_execution_ledger(write_files=True)
+        ledger_path = Path(first["ledger_path"])
+        first_bytes = ledger_path.read_bytes()
+        trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
+        trade = json.loads(trades_path.read_text(encoding="utf-8").splitlines()[0])
+        trade["price"] = 12
+        write_jsonl(trades_path, [trade])
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        self.assertTrue(failed["audit"]["continuity"]["mutated_locators"])
+        self.assertEqual(ledger_path.read_bytes(), first_bytes)
+
+    def test_account_position_mismatch_fails_closed(self) -> None:
+        portfolio_path = self.briefing / "data" / "paper_portfolio_us.json"
+        portfolio = json.loads(portfolio_path.read_text(encoding="utf-8"))
+        portfolio["positions"]["NASDAQ:TEST"]["quantity"] = 99
+        write_json(portfolio_path, portfolio)
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertTrue(failed["audit"]["reconciliation"]["blocking_reasons"])
 
     def test_duplicate_source_event_fails_closed_without_overwriting_good_ledger(self) -> None:
         first = atlas.build_virtual_execution_ledger(write_files=True)
@@ -220,12 +263,33 @@ class AtlasCycleTests(unittest.TestCase):
         audit_path = self.runtime / "run_audits" / "atlas-cycle-2026-07-10.json"
         payload = json.loads(audit_path.read_text(encoding="utf-8"))
         self.assertTrue(payload["overall_passed"])
+        self.assertTrue(payload["operational_gate_passed"])
+        self.assertFalse(payload["release_candidate_passed"])
+        self.assertFalse(payload["research_promotion_passed"])
+        self.assertEqual(payload["gate_scope"], "daily_operational")
         self.assertTrue(payload["boundary"]["single_virtual_execution_ledger"])
         self.assertTrue(payload["boundary"]["targeted_integration_test_gate"])
         self.assertFalse(payload["boundary"]["full_test_suite_executed"])
         self.assertEqual(payload["ledger"]["event_count"], 3)
         cycle_state = json.loads((self.runtime / "cycle_state.json").read_text(encoding="utf-8"))
         self.assertTrue(Path(cycle_state["last_history_json"]).exists())
+        self.assertEqual(payload["audit_chain"]["entry_sha256"], atlas.audit_record_hash(payload))
+        self.assertTrue(atlas.audit_cycle_history(Path(cycle_state["last_history_json"]).parent)["passed"])
+        workspace_lock = json.loads((self.runtime / "workspace-lock.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(workspace_lock["repositories"]), 3)
+        self.assertFalse(workspace_lock["release_reproducible"])
+
+    def test_run_audit_hash_chain_detects_history_mutation(self) -> None:
+        history = self.runtime / "run_audits" / "history" / "2026-07-10"
+        payload = {"run_id": "RUN-1", "audit_chain": {"schema_version": 1, "sequence": 1, "previous_audit_sha256": None}}
+        payload["audit_chain"]["entry_sha256"] = atlas.audit_record_hash(payload)
+        write_json(history / "RUN-1.json", payload)
+        self.assertTrue(atlas.audit_cycle_history(history)["passed"])
+        payload["run_id"] = "TAMPERED"
+        write_json(history / "RUN-1.json", payload)
+        result = atlas.audit_cycle_history(history)
+        self.assertFalse(result["passed"])
+        self.assertIn("entry hash mismatch", result["errors"][0])
 
     def test_sync_failure_writes_audit_but_never_writes_canonical_ledger(self) -> None:
         args = argparse.Namespace(

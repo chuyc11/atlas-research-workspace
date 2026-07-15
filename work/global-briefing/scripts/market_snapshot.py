@@ -29,6 +29,14 @@ REQUEST_HEADERS = {
 }
 
 
+def open_yahoo_url(request: urllib.request.Request, timeout: int):
+    parsed = urllib.parse.urlsplit(request.full_url)
+    if parsed.scheme != "https" or parsed.hostname != "query2.finance.yahoo.com":
+        raise ValueError(f"market-data URL is not allowlisted: {request.full_url}")
+    # The scheme and exact provider hostname are validated immediately above.
+    return urllib.request.urlopen(request, timeout=timeout)  # nosec B310
+
+
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -116,7 +124,7 @@ def fetch_yahoo_chart(ticker: str, timeout: int) -> dict[str, Any]:
     url = f"https://query2.finance.yahoo.com/v8/finance/chart/{encoded}?range=5d&interval=1d"
     request = urllib.request.Request(url, headers=REQUEST_HEADERS)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_yahoo_url(request, timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         return {"ticker": ticker, "error": f"yahoo chart failed: {exc}"}

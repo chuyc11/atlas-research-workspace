@@ -13,6 +13,7 @@ import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 SCRIPT_PATH = Path(__file__).resolve()
@@ -36,10 +37,41 @@ TENCENT_HEADERS = {
     "Referer": "https://finance.qq.com/",
 }
 EASTMONEY_FIELDS = "f43,f57,f58,f169,f170,f60,f47,f48,f46,f44,f45,f86,f152"
+ALLOWED_QUOTE_HOSTS = {"query1.finance.yahoo.com", "qt.gtimg.cn", "push2.eastmoney.com"}
+
+
+def open_quote_url(request: urllib.request.Request, timeout: int):
+    parsed = urllib.parse.urlsplit(request.full_url)
+    if parsed.scheme != "https" or parsed.hostname not in ALLOWED_QUOTE_HOSTS:
+        raise ValueError(f"quote URL is not allowlisted: {request.full_url}")
+    # The scheme and exact provider hostname are validated immediately above.
+    return urllib.request.urlopen(request, timeout=timeout)  # nosec B310
 
 
 def now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def timestamp_price_date(value: Any, timezone_name: str = "Asia/Shanghai") -> str | None:
+    try:
+        stamp = int(value)
+    except (TypeError, ValueError):
+        return None
+    try:
+        return datetime.fromtimestamp(stamp, timezone.utc).astimezone(ZoneInfo(timezone_name)).date().isoformat()
+    except (OSError, OverflowError, ValueError):
+        return None
+
+
+def text_price_date(value: Any) -> str | None:
+    text = str(value or "").strip()
+    digits = "".join(character for character in text if character.isdigit())
+    if len(digits) < 8:
+        return None
+    try:
+        return datetime.strptime(digits[:8], "%Y%m%d").date().isoformat()
+    except ValueError:
+        return None
 
 
 def load_watchlist(path: Path = WATCHLIST_PATH) -> dict[str, Any]:
@@ -102,11 +134,11 @@ def eastmoney_secid(item: dict[str, Any]) -> str | None:
 def tencent_query_symbol(item: dict[str, Any]) -> str | None:
     code, exchange = normalize_symbol(item["symbol"])
     if exchange == "SH":
-        return f"s_sh{code}"
+        return f"sh{code}"
     if exchange == "SZ":
-        return f"s_sz{code}"
+        return f"sz{code}"
     if exchange == "HK":
-        return f"s_hk{code}"
+        return f"hk{code}"
     return None
 
 
@@ -182,6 +214,7 @@ def quote_from_record(item: dict[str, Any], record: dict[str, Any], provider: st
         "volume": volume,
         "provider": provider,
         "source_detail": source_detail,
+        "price_date": text_price_date(first_value(record, ["日期", "时间", "date", "trade_date", "更新时间"])),
         "fetched_at": now_utc(),
         "data_status": "ok" if price is not None else "missing_price",
     }
@@ -199,7 +232,7 @@ def fetch_yahoo_item(item: dict[str, Any], timeout: int) -> dict[str, Any]:
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{encoded}?range=5d&interval=1d"
     request = urllib.request.Request(url, headers=REQUEST_HEADERS)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_quote_url(request, timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         return {
@@ -228,6 +261,9 @@ def fetch_yahoo_item(item: dict[str, Any], timeout: int) -> dict[str, Any]:
         except (TypeError, ValueError, ZeroDivisionError):
             change_pct = None
     code, exchange = normalize_symbol(item["symbol"])
+    timestamps = result.get("timestamp") or []
+    timezone_name = str(meta.get("exchangeTimezoneName") or "Asia/Shanghai")
+    price_date = timestamp_price_date(timestamps[-1], timezone_name) if timestamps else None
     return {
         "symbol": item["symbol"],
         "normalized_code": code,
@@ -242,6 +278,7 @@ def fetch_yahoo_item(item: dict[str, Any], timeout: int) -> dict[str, Any]:
         "currency": meta.get("currency"),
         "provider": "Yahoo Finance chart fallback",
         "source_detail": f"chart/{mapped}",
+        "price_date": price_date,
         "fetched_at": now_utc(),
         "data_status": "ok" if price is not None else "missing_price",
     }
@@ -263,7 +300,8 @@ def quote_from_tencent_fields(item: dict[str, Any], query_symbol: str, fields: l
     code, exchange = normalize_symbol(item["symbol"])
     name = fields[1] if len(fields) > 1 and fields[1] else item.get("name")
     price = as_float(fields[3]) if len(fields) > 3 else None
-    change_pct = as_float(fields[5]) if len(fields) > 5 else None
+    full_quote = len(fields) > 32
+    change_pct = as_float(fields[32]) if full_quote else as_float(fields[5]) if len(fields) > 5 else None
     return {
         "symbol": item["symbol"],
         "normalized_code": code,
@@ -273,12 +311,13 @@ def quote_from_tencent_fields(item: dict[str, Any], query_symbol: str, fields: l
         "name": name,
         "theme": item.get("theme"),
         "price": price,
-        "change": as_float(fields[4]) if len(fields) > 4 else None,
+        "change": as_float(fields[31]) if full_quote else as_float(fields[4]) if len(fields) > 4 else None,
         "change_pct": change_pct,
-        "volume": as_float(fields[6]) if len(fields) > 6 else None,
-        "amount": as_float(fields[7]) if len(fields) > 7 else None,
+        "volume": as_float(fields[36]) if full_quote and len(fields) > 36 else as_float(fields[6]) if len(fields) > 6 else None,
+        "amount": as_float(fields[37]) if full_quote and len(fields) > 37 else as_float(fields[7]) if len(fields) > 7 else None,
         "provider": "Tencent quote",
         "source_detail": f"qt.gtimg.cn/{query_symbol}",
+        "price_date": text_price_date(fields[30]) if full_quote and len(fields) > 30 else None,
         "fetched_at": now_utc(),
         "data_status": "ok" if price is not None else "missing_price",
     }
@@ -307,7 +346,7 @@ def fetch_tencent_batch(items: list[dict[str, Any]], timeout: int) -> tuple[list
         url = f"https://qt.gtimg.cn/q={encoded}"
         request = urllib.request.Request(url, headers=TENCENT_HEADERS)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
+            with open_quote_url(request, timeout) as response:
                 raw = response.read()
         except Exception as exc:
             errors.append({"scope": "tencent_quote", "error": str(exc)})
@@ -351,7 +390,7 @@ def fetch_eastmoney_item(item: dict[str, Any], timeout: int) -> dict[str, Any]:
     url = f"https://push2.eastmoney.com/api/qt/stock/get?{query}"
     request = urllib.request.Request(url, headers=REQUEST_HEADERS)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with open_quote_url(request, timeout) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception as exc:
         return {
@@ -397,6 +436,7 @@ def fetch_eastmoney_item(item: dict[str, Any], timeout: int) -> dict[str, Any]:
         "volume": as_float(data.get("f47")),
         "provider": "Eastmoney quote",
         "source_detail": f"push2.eastmoney.com/{secid}",
+        "price_date": timestamp_price_date(data.get("f86")),
         "fetched_at": now_utc(),
         "data_status": "ok" if price is not None else "missing_price",
     }

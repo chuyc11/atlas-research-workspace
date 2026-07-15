@@ -1,26 +1,41 @@
 {
   "schema_version": 1,
   "default_due_days": 7,
-  "blocking_severities": ["critical"],
+  "blocking_severities": ["critical", "high"],
   "auto_fix_risks": ["low"],
   "external_alerting": {
     "enabled": true,
-    "destinations": ["codex_task_inbox"],
-    "delivery_command": "python atlas.py alerts --date RUN_DATE"
+    "destinations": ["codex_task_inbox", "slack_connector"],
+    "delivery_command": "python atlas.py alerts --date RUN_DATE",
+    "ack_timeout_minutes": 60,
+    "retry_limit": 3,
+    "retry_backoff_minutes": [5, 15, 60],
+    "ack_required_severities": ["critical", "high"]
   },
   "disaster_recovery": {
     "enabled": true,
     "maximum_backup_age_hours": 24,
     "retention_days": 14,
-    "target_directory": "%USERPROFILE%/Documents/ATLAS-Backups",
-    "include_paths": [
-      "atlas.py",
-      "REPOSITORY_GOVERNANCE.md",
-      "work/global-briefing/config",
-      "work/global-briefing/data",
-      "work/shared/atlas",
-      "outputs",
-      "src/app/briefing.generated.json"
+    "minimum_snapshots_to_keep": 3,
+    "target_directory": "D:/ATLAS-Backups",
+    "require_different_volume": true,
+      "git_repositories": [".", "src", "work/trading-core"],
+      "include_paths": [
+        ".github",
+        "atlas.py",
+        "pyproject.toml",
+        "requirements.txt",
+        "requirements-dev.txt",
+        "README.md",
+        "QUALITY_AUDIT.md",
+        "REPOSITORY_GOVERNANCE.md",
+        "RESEARCH_ARCHITECTURE.md",
+        "tests",
+        "work/global-briefing",
+        "work/shared/atlas",
+        "outputs",
+      "src",
+      "work/trading-core"
     ]
   },
   "acceptance_rules": {

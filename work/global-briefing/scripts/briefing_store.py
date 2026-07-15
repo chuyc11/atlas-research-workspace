@@ -280,7 +280,18 @@ def append_prediction_records(input_path: Path, date: str, predictions: Path = D
                     and parse_contract_date(original.get("date")) >= enforce_from
                 )
                 if original is None or original_is_v2:
-                    errors.extend(validate_v2_review(record, original))
+                    errors.extend(
+                        validate_v2_review(
+                            record,
+                            original,
+                            price_recompute_enforce_from_date=str(
+                                settings.get("review_queue", {}).get(
+                                    "market_resolution_price_recompute_enforce_from_date"
+                                )
+                                or "2026-07-16"
+                            ),
+                        )
+                    )
             else:
                 errors.extend(validate_v2_prediction(
                     record,

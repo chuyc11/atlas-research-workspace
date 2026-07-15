@@ -104,4 +104,5 @@ class RssCollectSecurityTests(unittest.TestCase):
                 with patch.object(MODULE, "SOURCES_PATH", path), patch.object(MODULE, "fetch", side_effect=[malicious, valid]):
                     result = MODULE.collect(max_sources=None, timeout=1, homepage_fallback=False)
         self.assertEqual(len(result["errors"]), 1)
-        self.assertEqual([item["source"] for item in result["items"]], ["two"])
+        self.assertEqual(result["items"], [])
+        self.assertEqual([item["source"] for item in result["undated_items"]], ["two"])

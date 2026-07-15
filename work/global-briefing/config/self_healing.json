@@ -7,7 +7,7 @@
   "lock_stale_minutes": 120,
   "rollback_on_verification_failure": true,
   "auto_fix_risks": ["low"],
-  "blocking_severities": ["critical"],
+  "blocking_severities": ["critical", "high"],
   "deep_checks": {
     "briefing_tests": true,
     "site_quality": true,

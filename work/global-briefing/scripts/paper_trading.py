@@ -8,6 +8,7 @@ import copy
 import hashlib
 import json
 import os
+import socket
 import sys
 from contextlib import ExitStack, contextmanager
 from datetime import datetime
@@ -312,22 +313,63 @@ def lock_path(config: dict[str, Any]) -> Path:
     return resolve_path(config, "portfolio_file").with_suffix(".lock")
 
 
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        import ctypes
+
+        process_query_limited_information = 0x1000
+        still_active = 259
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+        if not handle:
+            return False
+        try:
+            exit_code = ctypes.c_ulong()
+            return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and exit_code.value == still_active
+        finally:
+            kernel32.CloseHandle(handle)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def lock_is_stale(path: Path, existing: dict[str, Any], *, maximum_age_seconds: int = 3600) -> bool:
+    try:
+        age = max(0.0, datetime.now().timestamp() - path.stat().st_mtime)
+    except OSError:
+        return False
+    pid = existing.get("pid")
+    hostname = str(existing.get("hostname") or "").casefold()
+    if hostname == socket.gethostname().casefold() and isinstance(pid, int):
+        return not process_is_alive(pid)
+    return age > maximum_age_seconds
+
+
 @contextmanager
 def account_lock(config: dict[str, Any]):
     path = lock_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
     token = hashlib.sha256(f"{os.getpid()}:{now_iso()}:{config.get('account_id')}".encode("utf-8")).hexdigest()
-    payload = {"pid": os.getpid(), "created_at": now_iso(), "token": token}
+    payload = {"pid": os.getpid(), "hostname": socket.gethostname(), "created_at": now_iso(), "token": token}
     for _attempt in range(2):
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError as exc:
             try:
                 existing = json.loads(path.read_text(encoding="utf-8"))
-                created = datetime.fromisoformat(str(existing.get("created_at", "")))
-                stale = (datetime.now() - created).total_seconds() > 3600
-            except (OSError, ValueError, TypeError, json.JSONDecodeError):
-                stale = True
+                if not isinstance(existing, dict):
+                    existing = {}
+            except (OSError, json.JSONDecodeError):
+                existing = {}
+            stale = lock_is_stale(path, existing)
             if stale:
                 path.unlink(missing_ok=True)
                 continue

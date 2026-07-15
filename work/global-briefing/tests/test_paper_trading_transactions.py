@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import socket
 import sys
 import tempfile
 import unittest
@@ -114,6 +116,34 @@ class PaperTradingTransactionTests(unittest.TestCase):
         self.assertEqual(MODULE.read_jsonl(self.root / "data" / "trades.jsonl"), [])
         self.assertFalse((self.root / "data" / "portfolio.lock").exists())
         self.assertFalse((self.root / "data" / "trades.transaction.json").exists())
+
+    def test_old_lock_owned_by_live_process_is_never_stolen(self) -> None:
+        config = MODULE.account_config(self.config, "US")
+        path = MODULE.lock_path(config)
+        path.write_text(json.dumps({"pid": os.getpid(), "hostname": socket.gethostname(), "created_at": "2000-01-01T00:00:00", "token": "live"}), encoding="utf-8")
+        os.utime(path, (1, 1))
+        with self.assertRaisesRegex(RuntimeError, "is locked"):
+            with MODULE.account_lock(config):
+                self.fail("live lock was stolen")
+        self.assertTrue(path.exists())
+
+    def test_dead_local_process_lock_is_reclaimed(self) -> None:
+        config = MODULE.account_config(self.config, "US")
+        path = MODULE.lock_path(config)
+        path.write_text(json.dumps({"pid": 2147483647, "hostname": socket.gethostname(), "created_at": MODULE.now_iso(), "token": "dead"}), encoding="utf-8")
+        with MODULE.account_lock(config):
+            current = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(current["pid"], os.getpid())
+        self.assertFalse(path.exists())
+
+    def test_fresh_incomplete_lock_is_not_deleted_during_owner_write_window(self) -> None:
+        config = MODULE.account_config(self.config, "US")
+        path = MODULE.lock_path(config)
+        path.write_text("", encoding="utf-8")
+        with self.assertRaisesRegex(RuntimeError, "is locked"):
+            with MODULE.account_lock(config):
+                self.fail("incomplete lock was stolen")
+        self.assertTrue(path.exists())
 
     def test_pending_orders_count_toward_batch_turnover_limit(self) -> None:
         path = self.write_orders([

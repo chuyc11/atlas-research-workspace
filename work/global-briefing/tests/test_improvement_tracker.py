@@ -56,7 +56,7 @@ class ImprovementTrackerTests(unittest.TestCase):
             },
         )
         self.write_quality("2026-07-12", passed=True)
-        self.write_site_health(70)
+        self.write_site_health(85)
 
     def tearDown(self) -> None:
         self.temp.cleanup()
@@ -80,7 +80,18 @@ class ImprovementTrackerTests(unittest.TestCase):
     def write_site_health(self, score: int) -> None:
         write_json(
             self.root / "src" / "app" / "briefing.generated.json",
-            {"metrics": {"sourceHealth": {"score": score, "label": "良好" if score >= 65 else "受限", "staleMarketItemCount": 0, "limitations": []}}},
+            {
+                "metrics": {
+                    "sourceHealth": {
+                        "score": score,
+                        "label": "良好" if score >= 80 else "受限",
+                        "staleMarketItemCount": 0,
+                        "rssStaleOrUnknownPct": 0,
+                        "chinaMissingPriceDateItemCount": 0,
+                        "limitations": [],
+                    }
+                }
+            },
         )
 
     def test_retrospective_action_waits_for_next_run_then_verifies(self) -> None:

@@ -416,17 +416,26 @@ class ResearchQualityTests(unittest.TestCase):
     def test_due_review_queue_keeps_invalid_early_review_open_but_skips_mature_review(self) -> None:
         original = v2_prediction()
         original["deadline"] = "2026-07-19"
-        original["market_mapping"][0]["evaluation_deadline"] = "2026-07-19"
+        original["market_mapping"][0]["evaluation_deadline"] = "2026-07-17"
         early = resolved_review()
         mature = resolved_review()
         mature["date"] = "2026-07-20"
         mature["review"]["review_date"] = "2026-07-20"
+        market = market_review(deadline="2026-07-17", review_date="2026-07-20")
+        market["review"]["market_resolution"][0].update(
+            {
+                "symbol_start_price": 100.0,
+                "symbol_end_price": 102.0,
+                "benchmark_start_price": 100.0,
+                "benchmark_end_price": 101.0,
+            }
+        )
 
         early_queue = STORE.due_review_queue("2026-07-20", [original, early])
         mature_queue = STORE.due_review_queue("2026-07-20", [original, mature])
         fully_resolved_queue = STORE.due_review_queue(
             "2026-07-20",
-            [original, mature, market_review(deadline="2026-07-19", review_date="2026-07-20")],
+            [original, mature, market],
         )
 
         self.assertEqual(early_queue["counts"]["due_reviews"], 1)
@@ -514,6 +523,41 @@ class ResearchQualityTests(unittest.TestCase):
         combined["review"]["market_resolution"][0]["observed_outcome"] = 0
         errors = MODULE.validate_v2_review(combined, original)
         self.assertTrue(any("outcome conflicts" in item for item in errors))
+
+    def test_market_resolution_rejects_weekend_baseline_and_wrong_window(self) -> None:
+        original = v2_prediction()
+        review = market_review()
+        review["review"]["market_resolution"][0]["start_price_date"] = "2026-07-12"
+
+        errors = MODULE.validate_v2_review(review, original)
+
+        self.assertTrue(any("not a comparable market session" in item for item in errors))
+        self.assertTrue(any("last comparable session" in item for item in errors))
+
+    def test_market_resolution_recomputes_returns_from_raw_prices_after_enforcement(self) -> None:
+        original = v2_prediction()
+        original["market_mapping"][0]["evaluation"] = {
+            "metric": "total_return",
+            "window_start": "2026-07-13",
+            "price_field": "adjusted_close",
+            "comparison": "symbol_gt_benchmark",
+        }
+        review = market_review(review_date="2026-07-16")
+        result = review["review"]["market_resolution"][0]
+        result.update(
+            {
+                "price_field": "adjusted_close",
+                "symbol_start_price": 100.0,
+                "symbol_end_price": 102.0,
+                "benchmark_start_price": 100.0,
+                "benchmark_end_price": 101.0,
+            }
+        )
+
+        self.assertEqual(MODULE.validate_v2_review(review, original), [])
+        result["symbol_return_pct"] = 9.0
+        errors = MODULE.validate_v2_review(review, original)
+        self.assertTrue(any("recomputed raw-price return" in item for item in errors))
 
     def test_same_day_review_requires_terminal_evidence_under_end_of_day_deadlines(self) -> None:
         original = v2_prediction()

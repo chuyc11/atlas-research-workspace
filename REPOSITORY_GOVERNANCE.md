@@ -30,12 +30,22 @@ remote URLs. A green root CI run covers root-owned control-plane and briefing
 code only; it must never be presented as evidence that the website or
 trading-core repositories passed.
 
+Every non-dry-run cycle writes `work/shared/atlas/workspace-lock.json` with the
+full commit, branch, clean/dirty state, remote names (never URLs), and a stable
+content hash for all three repositories. A release candidate is false unless
+that lock is reproducible. External disaster-recovery snapshots also contain
+verified `git bundle` files for all three histories, but bundles are recovery
+media and do not satisfy the fetchable-remote release requirement.
+
 ## Test tiers
 
 - `python -m pytest -q`: fast, root-owned unit and control-plane tests.
 - `python atlas.py test`: cross-repository integration and website build gate.
 - `python atlas.py test --full`: release-candidate gate including the complete
   trading-core regression suite.
+- `python atlas.py cycle --full-tests`: records full-suite evidence; it becomes
+  a release candidate only on an identical idempotent rerun with reproducible
+  repository provenance.
 
 Third-party code under `work/trading-core/external_research` is reference-only
 and is excluded from ATLAS test discovery and release artifacts.

@@ -330,6 +330,7 @@ def apply_freshness_filter(
 ) -> None:
     cutoff = reference_time - timedelta(hours=lookback_hours) if lookback_hours else None
     retained: list[dict[str, Any]] = []
+    undated_items: list[dict[str, Any]] = []
     stale_count = 0
     undated_count = 0
     for item in output.get("items", []):
@@ -339,7 +340,7 @@ def apply_freshness_filter(
             item["published_at"] = None
             item["age_hours"] = None
             undated_count += 1
-            retained.append(item)
+            undated_items.append(item)
             continue
         age_hours = max(0.0, (reference_time - published_at).total_seconds() / 3600)
         item["published_at"] = published_at.isoformat()
@@ -350,12 +351,14 @@ def apply_freshness_filter(
             continue
         retained.append(item)
     output["items"] = retained
+    output["undated_items"] = undated_items
     output["freshness"] = {
         "lookback_hours": lookback_hours,
         "reference_time": reference_time.isoformat(),
         "retained": len(retained),
         "stale_filtered": stale_count,
-        "undated_retained": undated_count,
+        "undated_retained": 0,
+        "undated_quarantined": undated_count,
     }
 
 
@@ -368,16 +371,23 @@ def build_source_health(output: dict[str, Any], sources: list[dict[str, Any]]) -
     for error in output.get("errors", []):
         name = str(error.get("source") or "unknown")
         error_counts[name] = error_counts.get(name, 0) + 1
+    fallback_sources = {
+        str(item.get("source") or "unknown")
+        for item in output.get("fallbacks", [])
+        if isinstance(item, dict)
+    }
     output["source_health"] = [
         {
             "source": source.get("name"),
             "tier": source.get("tier"),
             "items": item_counts.get(str(source.get("name")), 0),
             "errors": error_counts.get(str(source.get("name")), 0),
-            "status": "healthy"
-            if item_counts.get(str(source.get("name")), 0) > 0
+            "status": "fallback"
+            if str(source.get("name")) in fallback_sources
             else "degraded"
             if error_counts.get(str(source.get("name")), 0) > 0
+            else "healthy"
+            if item_counts.get(str(source.get("name")), 0) > 0
             else "discovery_only",
         }
         for source in sources

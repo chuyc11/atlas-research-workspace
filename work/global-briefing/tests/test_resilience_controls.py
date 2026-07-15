@@ -30,6 +30,22 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 class ResilienceControlTests(unittest.TestCase):
+    def test_repository_backup_config_covers_uncommitted_first_party_sources(self) -> None:
+        config = DR.load_config(DR.CONFIG_PATH)
+        includes = set(config["include_paths"])
+
+        self.assertTrue({
+            ".github",
+            "atlas.py",
+            "pyproject.toml",
+            "requirements-dev.txt",
+            "tests",
+            "work/global-briefing",
+            "src",
+            "work/trading-core",
+        }.issubset(includes))
+        self.assertEqual(config["git_repositories"], [".", "src", "work/trading-core"])
+
     def test_backup_is_external_and_restore_verified(self) -> None:
         with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as external:
             root = Path(workspace)
@@ -46,11 +62,55 @@ class ResilienceControlTests(unittest.TestCase):
             self.assertTrue(Path(result["archive"]).is_file())
             self.assertFalse(Path(result["archive"]).is_relative_to(root))
             self.assertEqual(result["file_count"], 1)
+            self.assertIsNone(result["previous_manifest_sha256"])
 
             newer = DR.create_snapshot(date="2026-07-12", root=root, config_path=config, latest_path=latest)
             self.assertNotEqual(newer["archive"], result["archive"])
-            self.assertFalse(Path(result["archive"]).exists())
+            self.assertEqual(newer["previous_manifest_sha256"], result["manifest_sha256"])
+            self.assertTrue(Path(result["archive"]).exists())
             self.assertTrue(Path(newer["archive"]).exists())
+
+            Path(newer["manifest_sidecar"]).write_text("{}", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "integrity check failed"):
+                DR.create_snapshot(date="2026-07-12", root=root, config_path=config, latest_path=latest)
+
+    def test_backup_migrates_verified_v1_snapshot_to_auditable_v2_genesis(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as external:
+            root = Path(workspace)
+            target = Path(external)
+            config = root / "config.json"
+            source = root / "source.txt"
+            source.write_text("recover me", encoding="utf-8")
+            write_json(config, {"disaster_recovery": {
+                "enabled": True,
+                "target_directory": external,
+                "include_paths": ["source.txt"],
+            }})
+            legacy_archive = target / "atlas-backup-v1.zip"
+            legacy_archive.write_bytes(b"legacy snapshot")
+            latest = root / "runtime" / "latest.json"
+            write_json(latest, {
+                "schema_version": 1,
+                "date": "2026-07-11",
+                "archive": str(legacy_archive),
+                "archive_sha256": DR.sha256(legacy_archive),
+            })
+
+            result = DR.create_snapshot(date="2026-07-12", root=root, config_path=config, latest_path=latest)
+            manifest = json.loads(Path(result["manifest_sidecar"]).read_text(encoding="utf-8"))
+
+            self.assertIsNone(result["previous_manifest_sha256"])
+            self.assertEqual(result["legacy_previous_archive_sha256"], DR.sha256(legacy_archive))
+            self.assertEqual(manifest["legacy_predecessor"]["schema_version"], 1)
+
+            legacy_archive.write_bytes(b"tampered")
+            write_json(latest, {
+                "schema_version": 1,
+                "archive": str(legacy_archive),
+                "archive_sha256": "0" * 64,
+            })
+            with self.assertRaisesRegex(ValueError, "archive integrity check failed"):
+                DR.create_snapshot(date="2026-07-12", root=root, config_path=config, latest_path=latest)
 
     def test_backup_rejects_workspace_target(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:
@@ -72,7 +132,14 @@ class ResilienceControlTests(unittest.TestCase):
 
             self.assertEqual(payload["status"], "attention_required")
             self.assertEqual(payload["findings"][0]["id"], "A1")
+            self.assertTrue(payload["requires_acknowledgement"])
+            self.assertEqual(payload["delivery_state"], "pending")
             self.assertTrue((runtime / "alerts" / "latest.json").is_file())
+
+            retried = ALERTS.retry_alert("2026-07-12", runtime_root=runtime)
+            acknowledged = ALERTS.acknowledge_alert("2026-07-12", "operator", runtime_root=runtime)
+            self.assertEqual(len(retried["delivery_attempts"]), 2)
+            self.assertEqual(acknowledged["delivery_state"], "acknowledged")
 
     def test_alert_payload_includes_current_self_healing_issue_schema(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:

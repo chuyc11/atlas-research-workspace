@@ -24,7 +24,7 @@ INTELLIGENCE = load_module("news_intelligence_test_module", SCRIPTS / "news_inte
 
 
 class NewsIntelligenceTests(unittest.TestCase):
-    def test_freshness_filter_removes_old_dated_items_and_keeps_undated_discovery(self) -> None:
+    def test_freshness_filter_removes_old_items_and_quarantines_undated_discovery(self) -> None:
         output = {
             "items": [
                 {"title": "fresh", "published": "Fri, 10 Jul 2026 12:00:00 GMT"},
@@ -38,9 +38,10 @@ class NewsIntelligenceTests(unittest.TestCase):
             reference_time=datetime(2026, 7, 11, 12, tzinfo=timezone.utc),
         )
 
-        self.assertEqual({item["title"] for item in output["items"]}, {"fresh", "undated"})
+        self.assertEqual({item["title"] for item in output["items"]}, {"fresh"})
+        self.assertEqual({item["title"] for item in output["undated_items"]}, {"undated"})
         self.assertEqual(output["freshness"]["stale_filtered"], 1)
-        self.assertEqual(output["freshness"]["undated_retained"], 1)
+        self.assertEqual(output["freshness"]["undated_quarantined"], 1)
 
     def test_related_multi_region_sources_form_a_deep_research_dossier(self) -> None:
         discovery = {

@@ -142,6 +142,48 @@ def component_repository_check(name: str, path: Path) -> Check:
     )
 
 
+def git_repository_provenance(name: str, path: Path) -> dict[str, Any]:
+    git = shutil.which("git")
+    if not git or not (path / ".git").exists():
+        return {"name": name, "path": relative_path(path), "available": False, "release_ready": False}
+    head = capture_command([git, "rev-parse", "HEAD"], cwd=path)
+    branch = capture_command([git, "branch", "--show-current"], cwd=path)
+    status = capture_command([git, "status", "--porcelain", "--untracked-files=normal"], cwd=path)
+    remotes = capture_command([git, "remote"], cwd=path)
+    commands_passed = all(result.returncode == 0 for result in (head, branch, status, remotes))
+    dirty_paths = [line for line in status.stdout.splitlines() if line.strip()] if status.returncode == 0 else []
+    remote_names = sorted(line.strip() for line in remotes.stdout.splitlines() if line.strip()) if remotes.returncode == 0 else []
+    payload = {
+        "name": name,
+        "path": relative_path(path),
+        "available": commands_passed,
+        "commit": head.stdout.strip() if head.returncode == 0 else None,
+        "branch": branch.stdout.strip() if branch.returncode == 0 else None,
+        "clean": commands_passed and not dirty_paths,
+        "dirty_path_count": len(dirty_paths),
+        "remote_names": remote_names,
+        "remote_count": len(remote_names),
+    }
+    payload["release_ready"] = bool(payload["available"] and payload["clean"] and payload["commit"] and remote_names)
+    return payload
+
+
+def build_workspace_lock() -> dict[str, Any]:
+    repositories = [
+        git_repository_provenance("root", ROOT),
+        git_repository_provenance("site", SITE_ROOT),
+        git_repository_provenance("trading-core", TRADING_ROOT),
+    ]
+    payload = {
+        "schema_version": 1,
+        "generated_at": utc_now(),
+        "repositories": repositories,
+        "release_reproducible": all(repository["release_ready"] for repository in repositories),
+    }
+    payload["content_sha256"] = stable_hash(payload)
+    return payload
+
+
 def latest_report() -> tuple[str, Path]:
     candidates: list[tuple[str, Path]] = []
     if OUTPUTS_ROOT.exists():
@@ -229,6 +271,53 @@ def read_json_file(path: Path, default: Any = None) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def audit_record_hash(payload: dict[str, Any]) -> str:
+    normalized = dict(payload)
+    chain = normalized.get("audit_chain")
+    if isinstance(chain, dict):
+        normalized["audit_chain"] = {key: value for key, value in chain.items() if key != "entry_sha256"}
+    return stable_hash(normalized)
+
+
+def audit_cycle_history(history_root: Path) -> dict[str, Any]:
+    errors: list[str] = []
+    legacy_record_count = 0
+    chained_record_count = 0
+    previous_hash: str | None = None
+    previous_sequence = 0
+    for path in sorted(history_root.glob("*.json")) if history_root.exists() else []:
+        try:
+            payload = read_json_file(path)
+        except (OSError, json.JSONDecodeError) as exc:
+            errors.append(f"{path.name}: unreadable audit JSON: {exc}")
+            continue
+        chain = payload.get("audit_chain") if isinstance(payload, dict) else None
+        if not isinstance(chain, dict):
+            if chained_record_count:
+                errors.append(f"{path.name}: unchained record appears after hash-chain genesis")
+            legacy_record_count += 1
+            continue
+        chained_record_count += 1
+        actual_hash = audit_record_hash(payload)
+        if chain.get("entry_sha256") != actual_hash:
+            errors.append(f"{path.name}: entry hash mismatch")
+        expected_sequence = previous_sequence + 1
+        if chain.get("sequence") != expected_sequence:
+            errors.append(f"{path.name}: expected sequence {expected_sequence}, got {chain.get('sequence')}")
+        if chain.get("previous_audit_sha256") != previous_hash:
+            errors.append(f"{path.name}: previous audit hash mismatch")
+        previous_hash = actual_hash
+        previous_sequence = expected_sequence
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "legacy_record_count": legacy_record_count,
+        "chained_record_count": chained_record_count,
+        "last_audit_sha256": previous_hash,
+        "next_sequence": previous_sequence + 1,
+    }
+
+
 def read_jsonl_file(path: Path) -> list[dict[str, Any]]:
     rows: list[dict[str, Any]] = []
     if not path.exists():
@@ -289,6 +378,20 @@ def ledger_event_id(prefix: str, identity: dict[str, Any]) -> str:
     return f"{prefix}-{stable_hash(identity)[:24].upper()}"
 
 
+def discover_briefing_temp_files(kind: str) -> list[Path]:
+    """Return both legacy underscore and current hyphenated daily temp files."""
+    if kind not in {"orders", "prices"}:
+        raise ValueError(f"unsupported briefing temp file kind: {kind}")
+    briefing_data = BRIEFING_ROOT / "data"
+    if not briefing_data.exists():
+        return []
+    patterns = (f"temp_{kind}_*.json", f"temp-{kind}-*.json")
+    return sorted(
+        {path for pattern in patterns for path in briefing_data.glob(pattern)},
+        key=lambda path: str(path),
+    )
+
+
 def virtual_ledger_source_files() -> list[Path]:
     files = [
         BRIEFING_ROOT / "data" / "paper_trades_us.jsonl",
@@ -296,10 +399,8 @@ def virtual_ledger_source_files() -> list[Path]:
         BRIEFING_ROOT / "data" / "paper_portfolio_us.json",
         BRIEFING_ROOT / "data" / "paper_portfolio_china.json",
     ]
-    briefing_data = BRIEFING_ROOT / "data"
-    if briefing_data.exists():
-        files.extend(sorted(briefing_data.glob("temp_orders_*.json")))
-        files.extend(sorted(briefing_data.glob("temp_prices_*.json")))
+    files.extend(discover_briefing_temp_files("orders"))
+    files.extend(discover_briefing_temp_files("prices"))
     replay_root = TRADING_ROOT / "data" / "replays" / "global_briefing"
     if replay_root.exists():
         files.extend(sorted((replay_root / "trades").glob("*.jsonl")))
@@ -315,7 +416,9 @@ def build_cycle_fingerprint(date: str) -> dict[str, Any]:
         TRADING_ROOT / "data" / "macro_signals" / f"macro_signals-{date}.jsonl",
         SITE_ROOT / "app" / "briefing.generated.json",
         BRIEFING_ROOT / "data" / f"temp_orders_{date}.json",
+        BRIEFING_ROOT / "data" / f"temp-orders-{date}.json",
         BRIEFING_ROOT / "data" / f"temp_prices_{date}.json",
+        BRIEFING_ROOT / "data" / f"temp-prices-{date}.json",
         *virtual_ledger_source_files(),
     ]
     records = [
@@ -366,6 +469,8 @@ def canonicalize_global_paper_trade(row: dict[str, Any], source_path: Path, line
         "notional": notional,
         "fee": maybe_float(row.get("fee")),
         "tax": maybe_float(row.get("tax")),
+        "cash_after": maybe_float(row.get("cash_after")) if row.get("cash_after") is not None else None,
+        "equity_after": maybe_float(row.get("equity_after")) if row.get("equity_after") is not None else None,
         "status": status,
         "trade_id": str(row.get("trade_id") or event_id),
         "order_id": str(row.get("order_id") or event_id.replace("TRADE", "ORDER")),
@@ -439,7 +544,7 @@ def load_temp_orders(path: Path) -> list[dict[str, Any]]:
 def temp_order_date(path: Path, row: dict[str, Any]) -> str:
     if row.get("date"):
         return str(row["date"])
-    match = re.search(r"temp_orders_(\d{4}-\d{2}-\d{2})\.json$", path.name)
+    match = re.search(r"temp(?:_|-)orders(?:_|-)(\d{4}-\d{2}-\d{2})\.json$", path.name)
     return match.group(1) if match else ""
 
 
@@ -530,13 +635,154 @@ def load_virtual_account_snapshots() -> dict[str, Any]:
     return accounts
 
 
+def event_source_locator(event: dict[str, Any]) -> tuple[str, str, int]:
+    return (
+        str(event.get("source_ledger") or ""),
+        str(event.get("source_path") or ""),
+        int(event.get("source_line") or 0),
+    )
+
+
+def audit_ledger_continuity(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
+    """Fail closed when a previously committed source row disappears or mutates."""
+    if not VIRTUAL_LEDGER_PATH.exists():
+        return {
+            "previous_ledger_present": False,
+            "previous_event_count": 0,
+            "preserved_event_count": 0,
+            "added_event_count": len(events),
+            "mutated_locators": [],
+            "deleted_locators": [],
+            "blocking_reasons": [],
+        }
+    try:
+        previous_events = read_jsonl_file(VIRTUAL_LEDGER_PATH)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "previous_ledger_present": True,
+            "previous_event_count": None,
+            "preserved_event_count": 0,
+            "added_event_count": 0,
+            "mutated_locators": [],
+            "deleted_locators": [],
+            "blocking_reasons": [f"cannot verify previous canonical ledger: {type(exc).__name__}: {exc}"],
+        }
+    previous_by_locator = {event_source_locator(event): event for event in previous_events}
+    current_by_locator = {event_source_locator(event): event for event in events}
+    deleted = sorted(set(previous_by_locator) - set(current_by_locator))
+    mutated = sorted(
+        locator
+        for locator in set(previous_by_locator) & set(current_by_locator)
+        if previous_by_locator[locator].get("source_hash") != current_by_locator[locator].get("source_hash")
+        or previous_by_locator[locator].get("ledger_event_id") != current_by_locator[locator].get("ledger_event_id")
+    )
+    blocking = [f"previous canonical event source deleted: {locator}" for locator in deleted]
+    blocking.extend(f"previous canonical event source mutated: {locator}" for locator in mutated)
+    preserved = len(set(previous_by_locator) & set(current_by_locator)) - len(mutated)
+    return {
+        "previous_ledger_present": True,
+        "previous_event_count": len(previous_events),
+        "preserved_event_count": preserved,
+        "added_event_count": len(set(current_by_locator) - set(previous_by_locator)),
+        "mutated_locators": [list(locator) for locator in mutated],
+        "deleted_locators": [list(locator) for locator in deleted],
+        "blocking_reasons": blocking,
+    }
+
+
+def normalized_position_key(exchange: Any, symbol: Any) -> str:
+    exchange_text = str(exchange or "").strip().upper()
+    symbol_text = str(symbol or "").strip().upper()
+    return f"{exchange_text}:{symbol_text}" if exchange_text else symbol_text
+
+
+def reconcile_virtual_accounts(
+    events: Sequence[dict[str, Any]], account_state: dict[str, Any]
+) -> dict[str, Any]:
+    """Replay filled trades and compare quantities/cash with account snapshots."""
+    blocking: list[str] = []
+    accounts: list[dict[str, Any]] = []
+    for account_id, snapshot in sorted(account_state.items()):
+        filled = [
+            event
+            for event in events
+            if event.get("account_id") == account_id
+            and event.get("event_type") in {"virtual_trade", "isolated_replay_trade"}
+        ]
+        replayed: dict[str, float] = {}
+        for event in filled:
+            key = normalized_position_key(
+                event.get("exchange") if snapshot.get("virtual_account_scope") != "REPLAY" else None,
+                event.get("symbol"),
+            )
+            direction = 1.0 if event.get("side") == "BUY" else -1.0
+            replayed[key] = replayed.get(key, 0.0) + direction * maybe_float(event.get("filled_quantity"))
+        raw_positions = snapshot.get("positions", {})
+        if isinstance(raw_positions, dict):
+            position_rows = list(raw_positions.values())
+        elif isinstance(raw_positions, list):
+            position_rows = raw_positions
+        else:
+            position_rows = []
+            blocking.append(f"account {account_id}: positions must be an object or list")
+        actual: dict[str, float] = {}
+        for position in position_rows:
+            if not isinstance(position, dict):
+                blocking.append(f"account {account_id}: position row must be an object")
+                continue
+            key = normalized_position_key(
+                position.get("exchange") if snapshot.get("virtual_account_scope") != "REPLAY" else None,
+                position.get("symbol"),
+            )
+            actual[key] = actual.get(key, 0.0) + maybe_float(position.get("quantity"))
+        mismatches: list[dict[str, Any]] = []
+        for key in sorted(set(replayed) | set(actual)):
+            expected_quantity = replayed.get(key, 0.0)
+            actual_quantity = actual.get(key, 0.0)
+            tolerance = max(1e-8, abs(expected_quantity) * 1e-9)
+            if abs(expected_quantity - actual_quantity) > tolerance:
+                mismatch = {
+                    "position": key,
+                    "replayed_quantity": expected_quantity,
+                    "snapshot_quantity": actual_quantity,
+                }
+                mismatches.append(mismatch)
+                blocking.append(f"account {account_id}: position reconciliation failed {mismatch}")
+        cash_events = [event for event in filled if event.get("cash_after") is not None]
+        cash_match: bool | None = None
+        replayed_cash: float | None = None
+        if cash_events and snapshot.get("virtual_account_scope") != "REPLAY":
+            replayed_cash = maybe_float(cash_events[-1].get("cash_after"))
+            snapshot_cash = maybe_float(snapshot.get("cash"))
+            cash_match = abs(replayed_cash - snapshot_cash) <= max(1e-6, abs(replayed_cash) * 1e-9)
+            if not cash_match:
+                blocking.append(
+                    f"account {account_id}: cash reconciliation failed "
+                    f"replayed={replayed_cash} snapshot={snapshot_cash}"
+                )
+        accounts.append(
+            {
+                "account_id": account_id,
+                "filled_trade_count": len(filled),
+                "position_count": len(actual),
+                "position_mismatches": mismatches,
+                "cash_replayed": replayed_cash,
+                "cash_snapshot": snapshot.get("cash"),
+                "cash_match": cash_match,
+            }
+        )
+    return {"accounts": accounts, "blocking_reasons": blocking, "passed": not blocking}
+
+
 def audit_virtual_execution_ledger(
     events: Sequence[dict[str, Any]],
     account_state: dict[str, Any],
     *,
     warnings: Sequence[str] = (),
+    source_expectations: Sequence[dict[str, Any]] = (),
+    source_errors: Sequence[str] = (),
 ) -> dict[str, Any]:
-    blocking: list[str] = []
+    blocking: list[str] = list(source_errors)
     ids = [str(event.get("ledger_event_id", "")) for event in events]
     if len(ids) != len(set(ids)):
         blocking.append("duplicate ledger_event_id detected")
@@ -544,9 +790,12 @@ def audit_virtual_execution_ledger(
     required_trade_fields = {"trade_id", "order_id", "date", "account_id", "symbol", "side", "filled_price", "filled_quantity", "status"}
     required_non_empty = {"ledger_event_id", "event_type", "date", "account_id", "side", "status"}
     source_counts: dict[str, int] = {}
+    source_path_counts: dict[str, int] = {}
     for event in events:
         event_id = str(event.get("ledger_event_id") or "missing-event-id")
         source_counts[str(event.get("source_ledger"))] = source_counts.get(str(event.get("source_ledger")), 0) + 1
+        source_path = str(event.get("source_path") or "")
+        source_path_counts[source_path] = source_path_counts.get(source_path, 0) + 1
         missing = sorted(field for field in required_trade_fields if field not in event)
         if missing:
             blocking.append(f"{event_id}: missing required fields {missing}")
@@ -598,6 +847,25 @@ def audit_virtual_execution_ledger(
         forbidden = sorted(nested_forbidden_keys(account))
         if forbidden:
             blocking.append(f"account {account_id}: forbidden broker/live keys {forbidden}")
+    for expectation in source_expectations:
+        path = str(expectation.get("path") or "")
+        if expectation.get("required") and not expectation.get("present"):
+            blocking.append(f"required virtual ledger source missing: {path}")
+        expected_count = expectation.get("expected_event_count")
+        if expected_count is not None and source_path_counts.get(path, 0) != expected_count:
+            blocking.append(
+                f"virtual ledger source count mismatch: {path} "
+                f"expected={expected_count} actual={source_path_counts.get(path, 0)}"
+            )
+    snapshot_paths = {str(account.get("source_path") or "") for account in account_state.values()}
+    for expectation in source_expectations:
+        if expectation.get("kind") == "account_snapshot" and expectation.get("present"):
+            if str(expectation.get("path") or "") not in snapshot_paths:
+                blocking.append(f"account snapshot was not loaded: {expectation.get('path')}")
+    reconciliation = reconcile_virtual_accounts(events, account_state)
+    blocking.extend(reconciliation["blocking_reasons"])
+    continuity = audit_ledger_continuity(events)
+    blocking.extend(continuity["blocking_reasons"])
     audit_content = {
         "ledger_id": LEDGER_ID,
         "schema_version": LEDGER_SCHEMA_VERSION,
@@ -620,6 +888,10 @@ def audit_virtual_execution_ledger(
         "event_count": len(events),
         "account_count": len(account_state),
         "source_counts": source_counts,
+        "source_path_counts": source_path_counts,
+        "source_expectations": list(source_expectations),
+        "reconciliation": reconciliation,
+        "continuity": continuity,
         "legacy_sources_read_only": [
             relative_path(BRIEFING_ROOT / "data" / "paper_trades_us.jsonl"),
             relative_path(BRIEFING_ROOT / "data" / "paper_trades_china.jsonl"),
@@ -632,6 +904,8 @@ def audit_virtual_execution_ledger(
             "real_broker_orders_allowed": False,
             "external_broker_connection": False,
             "live_trading": False,
+            "historical_source_mutation_fails_closed": True,
+            "account_snapshots_reconciled": reconciliation["passed"],
         },
     }
     return payload
@@ -640,29 +914,74 @@ def audit_virtual_execution_ledger(
 def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any]:
     events: list[dict[str, Any]] = []
     warnings: list[str] = []
+    source_errors: list[str] = []
+    source_expectations: list[dict[str, Any]] = []
     for source_ledger, path in {
         "global_briefing_paper_us": BRIEFING_ROOT / "data" / "paper_trades_us.jsonl",
         "global_briefing_paper_china": BRIEFING_ROOT / "data" / "paper_trades_china.jsonl",
     }.items():
+        expectation = {
+            "kind": "event_ledger",
+            "source_ledger": source_ledger,
+            "path": relative_path(path),
+            "required": True,
+            "present": path.exists(),
+            "expected_event_count": None,
+        }
+        source_expectations.append(expectation)
         if not path.exists():
             warnings.append(f"missing source ledger: {relative_path(path)}")
             continue
-        for line_number, row in enumerate(read_jsonl_file(path), 1):
+        rows = read_jsonl_file(path)
+        expectation["expected_event_count"] = len(rows)
+        for line_number, row in enumerate(rows, 1):
             events.append(canonicalize_global_paper_trade(row, path, line_number, source_ledger))
 
-    briefing_data = BRIEFING_ROOT / "data"
-    if briefing_data.exists():
-        for path in sorted(briefing_data.glob("temp_orders_*.json")):
-            for order_index, row in enumerate(load_temp_orders(path), 1):
-                events.append(canonicalize_temp_order_intent(row, path, order_index))
+    temp_order_dates: dict[str, list[Path]] = {}
+    for path in discover_briefing_temp_files("orders"):
+        rows = load_temp_orders(path)
+        source_expectations.append(
+            {
+                "kind": "event_ledger",
+                "source_ledger": "global_briefing_temp_orders",
+                "path": relative_path(path),
+                "required": True,
+                "present": True,
+                "expected_event_count": len(rows),
+            }
+        )
+        date = temp_order_date(path, rows[0] if rows else {})
+        if date:
+            temp_order_dates.setdefault(date, []).append(path)
+        for order_index, row in enumerate(rows, 1):
+            events.append(canonicalize_temp_order_intent(row, path, order_index))
+    for date, paths in temp_order_dates.items():
+        non_empty = [path for path in paths if load_temp_orders(path)]
+        if len(non_empty) > 1:
+            source_errors.append(
+                f"multiple non-empty temp order files for {date}: "
+                + ", ".join(relative_path(path) for path in non_empty)
+            )
 
     replay_trade_root = TRADING_ROOT / "data" / "replays" / "global_briefing" / "trades"
     if replay_trade_root.exists():
         for path in sorted(replay_trade_root.glob("*.jsonl")):
-            for line_number, row in enumerate(read_jsonl_file(path), 1):
+            rows = read_jsonl_file(path)
+            source_expectations.append(
+                {
+                    "kind": "event_ledger",
+                    "source_ledger": "global_briefing_isolated_replay",
+                    "path": relative_path(path),
+                    "required": True,
+                    "present": True,
+                    "expected_event_count": len(rows),
+                }
+            )
+            for line_number, row in enumerate(rows, 1):
                 events.append(canonicalize_replay_trade(row, path, line_number))
     else:
         warnings.append(f"missing replay trade source directory: {relative_path(replay_trade_root)}")
+        source_errors.append(f"required replay trade source directory missing: {relative_path(replay_trade_root)}")
 
     events = sorted(
         events,
@@ -675,6 +994,30 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         ),
     )
     account_state = load_virtual_account_snapshots()
+    for path in (
+        BRIEFING_ROOT / "data" / "paper_portfolio_us.json",
+        BRIEFING_ROOT / "data" / "paper_portfolio_china.json",
+    ):
+        source_expectations.append(
+            {
+                "kind": "account_snapshot",
+                "path": relative_path(path),
+                "required": True,
+                "present": path.exists(),
+                "expected_event_count": None,
+            }
+        )
+    replay_account_root = TRADING_ROOT / "data" / "replays" / "global_briefing" / "accounts"
+    for path in sorted(replay_account_root.glob("account-*.json")) if replay_account_root.exists() else []:
+        source_expectations.append(
+            {
+                "kind": "account_snapshot",
+                "path": relative_path(path),
+                "required": True,
+                "present": True,
+                "expected_event_count": None,
+            }
+        )
     content_hash = stable_hash({"events": events, "accounts": account_state})
     previous_state = read_json_file(VIRTUAL_LEDGER_STATE_PATH, default={})
     generated_at = utc_now()
@@ -689,11 +1032,26 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         "accounts": account_state,
         "event_count": len(events),
     }
-    audit = audit_virtual_execution_ledger(events, account_state, warnings=warnings)
+    audit = audit_virtual_execution_ledger(
+        events,
+        account_state,
+        warnings=warnings,
+        source_expectations=source_expectations,
+        source_errors=source_errors,
+    )
     write_performed = bool(write_files and audit["overall_passed"])
     if write_performed:
         atomic_write_jsonl(VIRTUAL_LEDGER_PATH, events)
         atomic_write_json(VIRTUAL_LEDGER_STATE_PATH, state_payload)
+        # Re-audit against the just-established canonical baseline so the first
+        # successful write and every idempotent replay produce identical audit bytes.
+        audit = audit_virtual_execution_ledger(
+            events,
+            account_state,
+            warnings=warnings,
+            source_expectations=source_expectations,
+            source_errors=source_errors,
+        )
         atomic_write_json(VIRTUAL_LEDGER_AUDIT_PATH, audit)
         atomic_write_text(
             VIRTUAL_LEDGER_AUDIT_PATH.with_suffix(".md"),
@@ -858,7 +1216,10 @@ def build_cycle_audit_markdown(payload: dict[str, Any]) -> str:
         f"- cycle_id={payload['cycle_id']}",
         f"- run_id={payload.get('run_id')}",
         f"- date={payload['date']}",
-        f"- overall_passed={str(payload['overall_passed']).lower()}",
+        f"- gate_scope={payload.get('gate_scope', 'legacy')}",
+        f"- operational_gate_passed={str(payload.get('operational_gate_passed', payload['overall_passed'])).lower()}",
+        f"- release_candidate_passed={str(payload.get('release_candidate_passed', False)).lower()}",
+        f"- research_promotion_passed={str(payload.get('research_promotion_passed', False)).lower()}",
         f"- blocking_reasons={payload['blocking_reasons']}",
         "",
         "## Stages",
@@ -1167,6 +1528,10 @@ def command_alerts(args: argparse.Namespace) -> int:
     command = [sys.executable, str(BRIEFING_ROOT / "scripts" / "alert_dispatch.py"), "--date", args.date]
     if args.json:
         command.append("--json")
+    if args.ack_by:
+        command.extend(["--ack-by", args.ack_by])
+    if args.retry:
+        command.append("--retry")
     return run_command(command)
 
 
@@ -1357,27 +1722,37 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         blocking.append("replay/shadow validation gate failed")
 
     tests_rc: int | None = None
+    full_tests_requested = bool(getattr(args, "full_tests", False))
     if args.skip_tests:
         stages.append({"name": "targeted_integration_tests", "status": "skipped", "detail": {"skip_tests": True, "full_suite": False}})
         blocking.append("targeted integration tests were skipped")
     else:
-        test_args = argparse.Namespace(skip_site=args.skip_site, skip_trading_core=args.skip_trading_core)
+        test_args = argparse.Namespace(
+            skip_site=args.skip_site,
+            skip_trading_core=args.skip_trading_core,
+            full=full_tests_requested,
+        )
         try:
             tests_rc = command_test(test_args)
         except Exception as exc:
             tests_rc = 1
             blocking.append(f"continuous tests raised {type(exc).__name__}: {exc}")
         test_scope = {
-            "kind": "targeted_integration_suite",
-            "full_suite": False,
+            "kind": "full_regression_suite" if full_tests_requested else "targeted_integration_suite",
+            "full_suite": full_tests_requested,
             "root_unittest_discovery": True,
             "briefing_unittest_discovery": True,
-            "trading_core_selected_file_count": 0 if args.skip_trading_core else 8,
+            "trading_core_selected_file_count": 0 if args.skip_trading_core else None if full_tests_requested else 8,
             "site_test_included": not args.skip_site,
         }
         stages.append({"name": "targeted_integration_tests", "status": "passed" if tests_rc == 0 else "failed", "detail": {"returncode": tests_rc, "scope": test_scope}})
         if tests_rc != 0:
             blocking.append(f"targeted integration tests failed with returncode {tests_rc}")
+
+    history_root = RUN_AUDIT_ROOT / "history" / date
+    history_integrity_before = audit_cycle_history(history_root)
+    if not history_integrity_before["passed"]:
+        blocking.extend(f"run audit history integrity: {error}" for error in history_integrity_before["errors"])
 
     ledger_write_allowed = bool(
         not args.dry_run
@@ -1415,6 +1790,7 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         "skip_site": bool(args.skip_site),
         "skip_trading_core": bool(args.skip_trading_core),
         "force_site": bool(args.force_site),
+        "full_tests": full_tests_requested,
     }
     idempotency_key = stable_hash(
         {
@@ -1429,6 +1805,20 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
     idempotent_replay = previous_key == idempotency_key and previous_passed and not args.force
     finished_at = utc_now()
     run_id = f"{cycle_id}-RUN-{finished_at.replace(':', '').replace('-', '').replace('.', '')}"
+    operational_gate_passed = not blocking
+    workspace_lock = build_workspace_lock()
+    research_promotion_passed = bool(
+        replay_shadow.get("strategy_evidence_passed") is True
+        and replay_shadow.get("shadow_promotion_gate", {}).get("evidence_passed") is True
+    )
+    release_candidate_passed = bool(
+        operational_gate_passed
+        and idempotent_replay
+        and full_tests_requested
+        and not args.skip_site
+        and not args.skip_trading_core
+        and workspace_lock["release_reproducible"]
+    )
 
     audit_payload = {
         "cycle_id": cycle_id,
@@ -1440,7 +1830,11 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         "execution_profile": execution_profile,
         "idempotency_key": idempotency_key,
         "idempotent_replay": idempotent_replay,
-        "overall_passed": not blocking,
+        "gate_scope": "daily_operational",
+        "overall_passed": operational_gate_passed,
+        "operational_gate_passed": operational_gate_passed,
+        "release_candidate_passed": release_candidate_passed,
+        "research_promotion_passed": research_promotion_passed,
         "blocking_reasons": blocking,
         "stages": stages,
         "fingerprint_before": fingerprint_before,
@@ -1472,22 +1866,34 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
             "canonical_write_blocked_by_upstream_gate": bool(not ledger_write_allowed and not args.dry_run),
             "replay_and_shadow_validation": replay_shadow["overall_passed"],
             "targeted_integration_test_gate": tests_rc == 0,
-            "full_test_suite_executed": False,
+            "full_test_suite_executed": full_tests_requested and tests_rc == 0,
             "run_audit_written": not args.dry_run,
-            "immutable_run_history": not args.dry_run,
+            "immutable_run_history": history_integrity_before["passed"] and not args.dry_run,
             "real_broker_orders_allowed": False,
         },
+        "history_integrity_before": history_integrity_before,
+        "workspace_lock": workspace_lock,
     }
+    audit_payload["audit_chain"] = {
+        "schema_version": 1,
+        "sequence": history_integrity_before["next_sequence"],
+        "previous_audit_sha256": history_integrity_before["last_audit_sha256"],
+        "legacy_record_count_at_genesis": history_integrity_before["legacy_record_count"],
+    }
+    audit_payload["audit_chain"]["entry_sha256"] = audit_record_hash(audit_payload)
     audit_json_path = RUN_AUDIT_ROOT / f"atlas-cycle-{date}.json"
     audit_md_path = RUN_AUDIT_ROOT / f"ATLAS_CYCLE_RUN_AUDIT-{date}.md"
-    history_root = RUN_AUDIT_ROOT / "history" / date
     history_json_path = history_root / f"{run_id}.json"
     history_md_path = history_root / f"{run_id}.md"
     if not args.dry_run:
+        atomic_write_json(history_json_path, audit_payload)
+        history_integrity_after = audit_cycle_history(history_root)
+        if not history_integrity_after["passed"]:
+            raise RuntimeError("run audit history verification failed: " + "; ".join(history_integrity_after["errors"]))
+        atomic_write_text(history_md_path, build_cycle_audit_markdown(audit_payload))
         atomic_write_json(audit_json_path, audit_payload)
         atomic_write_text(audit_md_path, build_cycle_audit_markdown(audit_payload))
-        atomic_write_json(history_json_path, audit_payload)
-        atomic_write_text(history_md_path, build_cycle_audit_markdown(audit_payload))
+        atomic_write_json(ATLAS_RUNTIME_ROOT / "workspace-lock.json", workspace_lock)
         atomic_write_json(
             CYCLE_STATE_PATH,
             {
@@ -1630,6 +2036,8 @@ def build_parser() -> argparse.ArgumentParser:
     alerts = subparsers.add_parser("alerts", help="Prepare the audited Codex task-inbox alert payload.")
     alerts.add_argument("--date", type=valid_iso_date, required=True)
     alerts.add_argument("--json", action="store_true")
+    alerts.add_argument("--ack-by", help="Record who acknowledged the date-aligned alert payload.")
+    alerts.add_argument("--retry", action="store_true", help="Prepare the next delivery attempt or escalate.")
     alerts.set_defaults(handler=command_alerts)
 
     cycle = subparsers.add_parser("cycle", help="Run the gated ATLAS virtual trading/evolution cycle.")
@@ -1641,6 +2049,7 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--skip-tests", action="store_true", help="Skip the continuous test gate.")
     cycle.add_argument("--skip-site", action="store_true", help="Skip site tests inside the continuous test gate.")
     cycle.add_argument("--skip-trading-core", action="store_true", help="Skip trading-core tests inside the continuous test gate.")
+    cycle.add_argument("--full-tests", action="store_true", help="Run the complete regression suite and record release-candidate evidence.")
     cycle.set_defaults(handler=command_cycle)
 
     tests = subparsers.add_parser("test", help="Run the cross-project integration test suite.")
