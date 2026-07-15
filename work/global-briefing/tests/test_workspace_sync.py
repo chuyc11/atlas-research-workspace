@@ -32,6 +32,14 @@ SITE_SYNC = load_module(
 )
 
 
+def requires_runtime_report(report_date: str):
+    report = ROOT / "outputs" / f"每日全球晨间简报-{report_date}.md"
+    return unittest.skipUnless(
+        report.is_file(),
+        f"requires local runtime briefing artifact for {report_date}",
+    )
+
+
 class WorkspaceSyncTests(unittest.TestCase):
     def test_date_validation_rejects_nonexistent_calendar_date(self) -> None:
         with self.assertRaises(argparse.ArgumentTypeError):
@@ -104,6 +112,7 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertIn("--dry-run", commands[4])
         self.assertIn("--dry-run", commands[5])
 
+    @requires_runtime_report("2026-07-10")
     def test_current_report_builds_quality_checked_payload(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-10")
         raw = report_path.read_bytes()
@@ -163,12 +172,14 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(health["rssStaleOrUnknownPct"], 66.67)
         self.assertTrue(any("时间戳" in item for item in health["limitations"]))
 
+    @requires_runtime_report("2026-07-14")
     def test_current_report_exposes_nonempty_observation_table(self) -> None:
         report_path, _report_date = SITE_SYNC.report_for_date("2026-07-14")
         audit = SITE_SYNC.report_quality_audit(report_path.read_text(encoding="utf-8"))
 
         self.assertGreaterEqual(audit["observationCount"], 1)
 
+    @requires_runtime_report("2026-07-12")
     def test_v2_report_builds_with_numeric_probabilities_and_complete_events(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
         payload = SITE_SYNC.build_payload(report_path.read_text(encoding="utf-8"), report_date, 1, "v2-sha")
@@ -245,6 +256,7 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(current["selfHealing"]["status"], "healthy")
         self.assertEqual(current["selfHealing"]["passed"], 10)
 
+    @requires_runtime_report("2026-07-12")
     def test_self_healing_telemetry_does_not_change_site_content_identity(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
         baseline = SITE_SYNC.site_input_hash(report_path.read_bytes(), report_date)
@@ -259,6 +271,7 @@ class WorkspaceSyncTests(unittest.TestCase):
 
         self.assertEqual(changed_telemetry, baseline)
 
+    @requires_runtime_report("2026-07-12")
     def test_cycle_telemetry_is_not_part_of_editorial_content_identity(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
         with patch.object(SITE_SYNC, "build_system_status", side_effect=AssertionError("must not be called")):
@@ -266,6 +279,7 @@ class WorkspaceSyncTests(unittest.TestCase):
 
         self.assertRegex(content_hash, r"^[0-9a-f]{64}$")
 
+    @requires_runtime_report("2026-07-12")
     def test_improvement_telemetry_is_date_aligned_and_not_content_identity(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
         baseline = SITE_SYNC.site_input_hash(report_path.read_bytes(), report_date)
@@ -314,6 +328,7 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertNotIn("pending_report", state)
         self.assertNotIn("pending_date", state)
 
+    @requires_runtime_report("2026-07-12")
     def test_payload_identity_detects_telemetry_changes_without_changing_content_identity(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
         content_hash = SITE_SYNC.site_input_hash(report_path.read_bytes(), report_date)
@@ -358,6 +373,7 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertFalse(blocked["ready"])
         self.assertTrue(any("backup" in reason for reason in blocked["reasons"]))
 
+    @requires_runtime_report("2026-07-12")
     def test_frozen_publication_snapshot_is_retry_stable_and_rejects_silent_report_drift(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
         raw = report_path.read_bytes()
@@ -416,8 +432,92 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(selected["as_of"], "2026-07-09")
 
     def test_historical_site_portfolio_is_reconstructed_without_future_positions(self) -> None:
-        us = SITE_SYNC.portfolio("US", "2026-06-14")
-        china = SITE_SYNC.portfolio("CHINA", "2026-06-14")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_dir = root / "data"
+            data_dir.mkdir()
+            config_path = root / "paper_trading.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "accounts": {
+                            "US": {
+                                "account_id": "us-test",
+                                "initial_cash": 100000,
+                                "base_currency": "USD",
+                                "trades_file": "data/us.jsonl",
+                            },
+                            "CHINA": {
+                                "account_id": "china-test",
+                                "initial_cash": 100000,
+                                "base_currency": "CNY",
+                                "trades_file": "data/china.jsonl",
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            future_state = {
+                "mode": "paper_trading",
+                "as_of_date": "2026-07-15",
+                "cash": 90000,
+                "positions": {"future": {"symbol": "CIBR", "quantity": 1}},
+            }
+            (data_dir / "paper_portfolio_us.json").write_text(json.dumps(future_state), encoding="utf-8")
+            (data_dir / "paper_portfolio_china.json").write_text(json.dumps(future_state), encoding="utf-8")
+            (data_dir / "us.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "date": "2026-06-10",
+                                "action": "BUY",
+                                "symbol": "AAPL",
+                                "exchange": "NASDAQ",
+                                "currency": "USD",
+                                "quantity": 1,
+                                "price": 100,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "date": "2026-07-01",
+                                "action": "BUY",
+                                "symbol": "CIBR",
+                                "exchange": "NYSE",
+                                "currency": "USD",
+                                "quantity": 1,
+                                "price": 50,
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (data_dir / "china.jsonl").write_text(
+                json.dumps(
+                    {
+                        "date": "2026-06-10",
+                        "action": "BUY",
+                        "symbol": "510300.SH",
+                        "exchange": "SSE",
+                        "currency": "CNY",
+                        "quantity": 100,
+                        "price": 4,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(SITE_SYNC, "ROOT", root),
+                patch.object(SITE_SYNC, "DATA_DIR", data_dir),
+                patch.object(SITE_SYNC, "PAPER_CONFIG_PATH", config_path),
+            ):
+                us = SITE_SYNC.portfolio("US", "2026-06-14")
+                china = SITE_SYNC.portfolio("CHINA", "2026-06-14")
 
         self.assertNotIn("CIBR", {item["symbol"] for item in us["positions"]})
         self.assertEqual(china["baseCurrency"], "CNY")

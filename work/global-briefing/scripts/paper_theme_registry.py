@@ -62,9 +62,9 @@ def exclusive_lock(path: Path, timeout_seconds: float = 5.0):
         try:
             descriptor = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
             os.write(descriptor, f"pid={os.getpid()}\n".encode("ascii"))
-        except FileExistsError:
+        except FileExistsError as exc:
             if time.monotonic() >= deadline:
-                raise TimeoutError(f"Timed out waiting for paper theme registry lock {lock_path}")
+                raise TimeoutError(f"Timed out waiting for paper theme registry lock {lock_path}") from exc
             time.sleep(0.05)
     try:
         yield

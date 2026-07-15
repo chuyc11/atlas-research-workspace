@@ -295,6 +295,14 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertIn("--strict", command)
         self.assertIn("--json", command)
 
+    def test_full_test_mode_runs_unfiltered_trading_core_suite(self) -> None:
+        args = argparse.Namespace(skip_site=True, skip_trading_core=False, full=True)
+        with patch.object(atlas, "run_command", return_value=0) as run:
+            self.assertEqual(atlas.command_test(args), 0)
+
+        core_call = next(call for call in run.call_args_list if call.kwargs.get("cwd") == self.trading)
+        self.assertEqual(core_call.args[0], [atlas.sys.executable, "-m", "pytest"])
+
 
 if __name__ == "__main__":
     unittest.main()

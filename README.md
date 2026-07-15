@@ -21,7 +21,7 @@ trading-core isolated replay ledger 现在作为只读来源保留；ATLAS 规�
 ```powershell
 python -m pip install -r requirements.txt
 Set-Location src
-npm install
+npm ci
 Set-Location ..
 ```
 
@@ -54,6 +54,26 @@ python atlas.py sync --date 2026-07-10 --dry-run
 ```powershell
 python atlas.py test
 ```
+
+默认命令运行根层全部测试、global-briefing 全部测试、trading-core 的跨项目集成门禁，以及前端构建测试。
+发布候选可运行完整 trading-core 回归（耗时明显更长）：
+
+```powershell
+python atlas.py test --full
+```
+
+根仓开发者的快速质量门禁：
+
+```powershell
+python -m pip install -r requirements-dev.txt
+python -m ruff check atlas.py tests work/global-briefing/scripts work/global-briefing/tests
+python -m pytest -q
+```
+
+根目录直接执行 `pytest` 只会收集根层与 global-briefing 测试，不会误收集 `src`、trading-core 或
+`external_research` 中独立项目的测试。
+
+当前工程质量问题、已完成修复和后续优先级见 [QUALITY_AUDIT.md](QUALITY_AUDIT.md)。
 
 审计内容质量、预测契约和概率校准就绪度：
 
@@ -126,6 +146,9 @@ atlas doctor
 根目录如果出现空 `.git/`，不要直接覆盖或假定历史不存在。先备份工作区并确认原远端、备份或
 工作树元数据；无法恢复时，再明确选择建立新的集成仓库。`src/` 与
 `work/trading-core/` 仍保留各自独立的 Git 历史。
+
+`atlas doctor` 会报告两个子仓的 commit、分支、工作树状态和是否配置远端。缺少远端或存在未提交改动
+会显示警告：这不影响本地研究，但会阻断可重复发布。三个仓库必须分别通过自己的质量门禁。
 
 ## 虚拟执行与自我进化边界
 

@@ -1,6 +1,12 @@
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
+.coverage
+coverage.xml
+htmlcov/
+build/
+dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/

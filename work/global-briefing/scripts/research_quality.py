@@ -1070,7 +1070,7 @@ def audit_prediction_records(
 def core_story_blocks(text: str) -> list[dict[str, str]]:
     matches = list(re.finditer(r"^###\s+核心主线[：:]\s*(.+?)\s*$", text, re.MULTILINE))
     blocks: list[dict[str, str]] = []
-    for index, match in enumerate(matches):
+    for match in matches:
         next_heading = re.search(r"^#{1,3}\s+", text[match.end():], re.MULTILINE)
         end = match.end() + next_heading.start() if next_heading else len(text)
         blocks.append({"title": match.group(1).strip(), "body": text[match.end():end]})

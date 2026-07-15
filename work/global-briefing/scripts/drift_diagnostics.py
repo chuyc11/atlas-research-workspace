@@ -426,10 +426,14 @@ def distribution_js(left: Counter[str], right: Counter[str]) -> float | None:
     right_total = sum(right.values())
     p = [left[key] / left_total for key in keys]
     q = [right[key] / right_total for key in keys]
-    m = [(a + b) / 2 for a, b in zip(p, q)]
+    m = [(a + b) / 2 for a, b in zip(p, q, strict=True)]
 
     def kl(values: list[float], middle: list[float]) -> float:
-        return sum(value * math.log2(value / mid) for value, mid in zip(values, middle) if value > 0 and mid > 0)
+        return sum(
+            value * math.log2(value / mid)
+            for value, mid in zip(values, middle, strict=True)
+            if value > 0 and mid > 0
+        )
 
     return round((kl(p, m) + kl(q, m)) / 2, 6)
 

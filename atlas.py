@@ -103,6 +103,45 @@ def capture_command(
     )
 
 
+def component_repository_check(name: str, path: Path) -> Check:
+    """Report whether a separately governed workspace component is reproducible."""
+    git = shutil.which("git")
+    if not path.exists():
+        return Check(f"{name} repository", "warn", "component path is missing", required=False)
+    if not git:
+        return Check(f"{name} repository", "warn", "git is unavailable", required=False)
+    if not (path / ".git").exists():
+        return Check(
+            f"{name} repository",
+            "warn",
+            "component has no independent .git metadata",
+            required=False,
+        )
+
+    head = capture_command([git, "rev-parse", "--short=12", "HEAD"], cwd=path)
+    branch = capture_command([git, "branch", "--show-current"], cwd=path)
+    status = capture_command([git, "status", "--porcelain", "--untracked-files=normal"], cwd=path)
+    remotes = capture_command([git, "remote"], cwd=path)
+    if any(result.returncode != 0 for result in (head, branch, status, remotes)):
+        return Check(f"{name} repository", "warn", "git metadata could not be inspected", required=False)
+
+    dirty_count = len([line for line in status.stdout.splitlines() if line.strip()])
+    remote_names = [line.strip() for line in remotes.stdout.splitlines() if line.strip()]
+    details = [
+        f"commit={head.stdout.strip() or 'unknown'}",
+        f"branch={branch.stdout.strip() or 'detached'}",
+        f"worktree={'clean' if dirty_count == 0 else f'dirty({dirty_count})'}",
+        f"remotes={','.join(remote_names) if remote_names else 'missing'}",
+    ]
+    repository_ready = dirty_count == 0 and bool(remote_names)
+    return Check(
+        f"{name} repository",
+        "ok" if repository_ready else "warn",
+        "; ".join(details),
+        required=False,
+    )
+
+
 def latest_report() -> tuple[str, Path]:
     candidates: list[tuple[str, Path]] = []
     if OUTPUTS_ROOT.exists():
@@ -882,6 +921,13 @@ def doctor_checks() -> list[Check]:
     for name, path in required_paths.items():
         checks.append(Check(name, "ok" if path.exists() else "error", str(path.relative_to(ROOT))))
 
+    checks.extend(
+        [
+            component_repository_check("trading-core", TRADING_ROOT),
+            component_repository_check("ATLAS site", SITE_ROOT),
+        ]
+    )
+
     missing_modules = [
         module
         for module in ("yfinance", "akshare", "baostock", "tushare")
@@ -895,18 +941,21 @@ def doctor_checks() -> list[Check]:
         )
     )
 
-    core_version = capture_command(
-        [sys.executable, "-m", "trading_core.entrypoint", "--version"],
-        cwd=TRADING_ROOT,
-        trading_core=True,
-    )
-    checks.append(
-        Check(
-            "trading-core CLI",
-            "ok" if core_version.returncode == 0 else "error",
-            (core_version.stdout or core_version.stderr).strip(),
+    if TRADING_ROOT.exists():
+        core_version = capture_command(
+            [sys.executable, "-m", "trading_core.entrypoint", "--version"],
+            cwd=TRADING_ROOT,
+            trading_core=True,
         )
-    )
+        checks.append(
+            Check(
+                "trading-core CLI",
+                "ok" if core_version.returncode == 0 else "error",
+                (core_version.stdout or core_version.stderr).strip(),
+            )
+        )
+    else:
+        checks.append(Check("trading-core CLI", "error", "component path is missing"))
 
     try:
         report_date, report_path = latest_report()
@@ -1149,7 +1198,7 @@ def cycle_lock(date: str):
     for _attempt in range(2):
         try:
             descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        except FileExistsError as exc:
             try:
                 existing = read_json_file(lock_path, default={})
             except (OSError, ValueError):
@@ -1165,7 +1214,7 @@ def cycle_lock(date: str):
             if stale:
                 lock_path.unlink(missing_ok=True)
                 continue
-            raise RuntimeError(f"ATLAS cycle already running: {existing}")
+            raise RuntimeError(f"ATLAS cycle already running: {existing}") from exc
         else:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
@@ -1505,19 +1554,20 @@ def command_test(args: argparse.Namespace) -> int:
         return 1
 
     if not args.skip_trading_core:
-        core_tests = [
-            sys.executable,
-            "-m",
-            "pytest",
-            "tests/test_global_briefing_integration.py",
-            "tests/test_global_briefing_integration_robustness.py",
-            "tests/test_signal_schema.py",
-            "tests/test_entrypoint.py",
-            "tests/test_macro_signal_refresh.py",
-            "tests/test_promotion_gate.py",
-            "tests/test_promotion_evidence.py",
-            "tests/test_cli_stage_boundaries.py",
-        ]
+        core_tests = [sys.executable, "-m", "pytest"]
+        if not getattr(args, "full", False):
+            core_tests.extend(
+                [
+                    "tests/test_global_briefing_integration.py",
+                    "tests/test_global_briefing_integration_robustness.py",
+                    "tests/test_signal_schema.py",
+                    "tests/test_entrypoint.py",
+                    "tests/test_macro_signal_refresh.py",
+                    "tests/test_promotion_gate.py",
+                    "tests/test_promotion_evidence.py",
+                    "tests/test_cli_stage_boundaries.py",
+                ]
+            )
         if run_command(core_tests, cwd=TRADING_ROOT, trading_core=True) != 0:
             return 1
 
@@ -1596,6 +1646,7 @@ def build_parser() -> argparse.ArgumentParser:
     tests = subparsers.add_parser("test", help="Run the cross-project integration test suite.")
     tests.add_argument("--skip-site", action="store_true")
     tests.add_argument("--skip-trading-core", action="store_true")
+    tests.add_argument("--full", action="store_true", help="Run the complete trading-core regression suite.")
     tests.set_defaults(handler=command_test)
 
     build_site = subparsers.add_parser("build-site", help="Build and test the ATLAS web surface.")

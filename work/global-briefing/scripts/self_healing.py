@@ -962,12 +962,12 @@ def self_healing_lock(engine: SelfHealingEngine):
     for _ in range(2):
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        except FileExistsError as exc:
             stale, _evidence = engine.lock_is_stale(path)
             if stale:
                 path.unlink(missing_ok=True)
                 continue
-            raise RuntimeError("self-healing run already active")
+            raise RuntimeError("self-healing run already active") from exc
         else:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False)

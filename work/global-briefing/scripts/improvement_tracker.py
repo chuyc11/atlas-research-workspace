@@ -314,7 +314,7 @@ class ImprovementTracker:
                 review = row.get("review", {})
                 prediction_id = str(row.get("prediction_id") or "")
                 original = original_v2[prediction_id]
-                if review.get("observed_outcome") not in {0, 1, False, True}:
+                if review.get("observed_outcome") not in {0, 1}:
                     errors.append(f"{prediction_id}: missing observed_outcome")
                 if not review.get("evidence") and not review.get("resolution_evidence") and not row.get("evidence"):
                     errors.append(f"{prediction_id}: missing resolution evidence")

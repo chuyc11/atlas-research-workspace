@@ -36,7 +36,7 @@ IMPACT_TERMS = {
     "oil", "gas", "shipping", "hormuz", "inflation", "rates", "central", "bank", "recession", "trade",
     "china", "russia", "ukraine", "iran", "israel", "nato", "ai", "chip", "semiconductor", "climate",
     "heatwave", "earthquake", "wildfire", "flood", "storm", "blackout", "outbreak", "ebola", "pandemic",
-    "regulation", "regulator", "lawsuit", "court", "privacy", "default", "shipping", "supply",
+    "regulation", "regulator", "lawsuit", "court", "privacy", "default", "supply",
 }
 MARKET_CATEGORIES = {"economy", "energy", "technology", "markets", "macro", "finance", "supply_chain", "military"}
 SUBSTANTIVE_CATEGORIES = MARKET_CATEGORIES | {

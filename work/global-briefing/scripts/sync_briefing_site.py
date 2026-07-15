@@ -1160,7 +1160,7 @@ def report_quality_audit(text: str) -> dict[str, Any]:
     core_audits: list[dict[str, Any]] = []
     story_enforce_from = str(research_policy.get("story_evidence_enforce_from_date") or "9999-12-31")
     story_evidence_enforced = report_date >= story_enforce_from
-    for index, match in enumerate(core_matches):
+    for match in core_matches:
         next_heading = re.search(r"^#{1,3}\s+", text[match.end():], re.MULTILINE)
         block_end = match.end() + next_heading.start() if next_heading else len(text)
         body = text[match.end():block_end]

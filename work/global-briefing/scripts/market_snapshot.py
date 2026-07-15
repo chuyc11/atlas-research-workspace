@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
-import sys
 import time
 import urllib.parse
 import urllib.request

@@ -4,6 +4,11 @@ on:
   pull_request:
   push:
     branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: root-quality-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -13,32 +18,20 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.12"
-      - name: Compile control plane
-        run: >-
-          python -m py_compile
-          atlas.py
-          work/global-briefing/scripts/self_healing.py
-          work/global-briefing/scripts/improvement_tracker.py
-          work/global-briefing/scripts/disaster_recovery.py
-          work/global-briefing/scripts/alert_dispatch.py
-          work/global-briefing/scripts/rss_collect.py
-          work/global-briefing/scripts/china_market.py
-          work/global-briefing/scripts/research_quality.py
-          work/global-briefing/scripts/sync_briefing_site.py
-      - name: Run file-isolated control-plane tests
-        run: >-
-          python -m unittest -v
-          tests.test_atlas_cycle
-          work.global-briefing.tests.test_self_healing
-          work.global-briefing.tests.test_improvement_tracker
-          work.global-briefing.tests.test_research_quality
-          work.global-briefing.tests.test_evolution_policy
-          work.global-briefing.tests.test_paper_trading_fees
-          work.global-briefing.tests.test_paper_trading_transactions
-          work.global-briefing.tests.test_rss_collect_security
-          work.global-briefing.tests.test_source_routing
-          work.global-briefing.tests.test_resilience_controls
+          cache: pip
+      - name: Install root quality tooling
+        run: python -m pip install -r requirements-dev.txt
+      - name: Compile the complete control plane
+        run: python -m compileall -q atlas.py work/global-briefing/scripts
+      - name: Run static analysis
+        run: python -m ruff check atlas.py tests work/global-briefing/scripts work/global-briefing/tests
+      - name: Run all root-owned tests
+        run: python -m pytest -q
+      - name: Verify package entry point
+        run: |
+          python -m pip install -e . --no-deps
+          atlas --help

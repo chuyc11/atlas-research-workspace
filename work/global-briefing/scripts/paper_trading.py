@@ -321,7 +321,7 @@ def account_lock(config: dict[str, Any]):
     for _attempt in range(2):
         try:
             descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError:
+        except FileExistsError as exc:
             try:
                 existing = json.loads(path.read_text(encoding="utf-8"))
                 created = datetime.fromisoformat(str(existing.get("created_at", "")))
@@ -331,7 +331,7 @@ def account_lock(config: dict[str, Any]):
             if stale:
                 path.unlink(missing_ok=True)
                 continue
-            raise RuntimeError(f"Paper-trading account is locked: {config.get('account_id')}")
+            raise RuntimeError(f"Paper-trading account is locked: {config.get('account_id')}") from exc
         else:
             with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
                 json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
@@ -1394,4 +1394,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
