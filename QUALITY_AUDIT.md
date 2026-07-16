@@ -38,7 +38,7 @@ Git 远端且本轮修复尚未提交。系统现会生成三仓来源锁，并�
 
 ## 验证证据
 
-- 根仓完整门禁：134 passed、1 subtest passed；覆盖率 64.11%，高于 60% 阈值。
+- 根仓完整门禁：145 passed、1 subtest passed，覆盖率 65.78%；干净克隆为 137 passed、8 个历史工件测试显式 skipped、覆盖率 60.35%，高于 60% 阈值。
 - 根仓安全门禁：Ruff、Bandit、detect-secrets 通过；两份 Python manifest 的 `pip-audit --strict` 均为 0 个已知漏洞。
 - trading-core 本轮全量回归：2,151 passed、1 skipped、0 failed，耗时 1,025.61 秒。
 - trading-core 专项秘密扫描：5 条已分类引用、0 条未审查发现；令牌、私钥、云凭据等高置信插件保持启用。

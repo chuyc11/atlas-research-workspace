@@ -5,7 +5,10 @@ import json
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
@@ -30,6 +33,138 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 class ResilienceControlTests(unittest.TestCase):
+    def test_backup_configuration_and_file_selection_fail_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            invalid_json = root / "array.json"
+            invalid_json.write_text("[]", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "expected a JSON object"):
+                DR.read_json(invalid_json)
+
+            disabled = root / "disabled.json"
+            write_json(disabled, {"disaster_recovery": {"enabled": False}})
+            with self.assertRaisesRegex(ValueError, "must be enabled"):
+                DR.load_config(disabled)
+
+            source = root / "work" / "global-briefing" / "source.txt"
+            source.parent.mkdir(parents=True)
+            source.write_text("source", encoding="utf-8")
+            scratch = root / "work" / "global-briefing" / "tmp" / "scratch.txt"
+            scratch.parent.mkdir(parents=True)
+            scratch.write_text("scratch", encoding="utf-8")
+            backup_output = root / "work" / "shared" / "atlas" / "backups" / "latest.json"
+            backup_output.parent.mkdir(parents=True)
+            backup_output.write_text("{}", encoding="utf-8")
+            selected = DR.iter_files(root, ["missing", "work"])
+            self.assertEqual(selected, [source.resolve()])
+
+    def test_git_bundle_creation_validates_tool_repository_and_command(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            stage = root / "stage"
+            stage.mkdir()
+            with patch.object(DR.shutil, "which", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "git executable"):
+                    DR.create_git_bundles(root, [], stage)
+
+            with patch.object(DR.shutil, "which", return_value="git"):
+                with self.assertRaisesRegex(ValueError, "repository is missing"):
+                    DR.create_git_bundles(root, ["missing"], stage)
+
+            (root / ".git").mkdir()
+            failed = SimpleNamespace(returncode=1, stdout="", stderr="bundle failed")
+            with (
+                patch.object(DR.shutil, "which", return_value="git"),
+                patch.object(DR.subprocess, "run", return_value=failed),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "bundle failed"):
+                    DR.create_git_bundles(root, ["."], stage)
+
+            def create_bundle(command: list[str], **_kwargs):
+                Path(command[5]).write_bytes(b"valid bundle")
+                return SimpleNamespace(returncode=0, stdout="created", stderr="")
+
+            with (
+                patch.object(DR.shutil, "which", return_value="git"),
+                patch.object(DR.subprocess, "run", side_effect=create_bundle),
+            ):
+                entries = DR.create_git_bundles(root, ["."], stage)
+            self.assertEqual(entries[0][0], "_atlas_git_bundles/workspace-root.bundle")
+            self.assertEqual(entries[0][2], ".")
+            self.assertTrue(entries[0][1].is_file())
+
+    def test_restore_drill_rejects_unsafe_missing_and_modified_members(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+
+            missing_manifest = root / "missing-manifest.zip"
+            with zipfile.ZipFile(missing_manifest, "w") as archive:
+                archive.writestr("data.txt", "data")
+            passed, errors = DR.verify_archive(missing_manifest, {"files": []})
+            self.assertFalse(passed)
+            self.assertTrue(any("embedded manifest" in error for error in errors))
+
+            unsafe_manifest = {"files": []}
+            unsafe = root / "unsafe.zip"
+            with zipfile.ZipFile(unsafe, "w") as archive:
+                archive.writestr("../escape.txt", "escape")
+                archive.writestr("_atlas_backup_manifest.json", json.dumps(unsafe_manifest))
+            passed, errors = DR.verify_archive(unsafe, unsafe_manifest)
+            self.assertFalse(passed)
+            self.assertTrue(any("unsafe member" in error for error in errors))
+
+            modified_manifest = {
+                "files": [{"path": "data.txt", "sha256": "0" * 64, "kind": "workspace_file"}],
+            }
+            modified = root / "modified.zip"
+            with zipfile.ZipFile(modified, "w") as archive:
+                archive.writestr("data.txt", "data")
+                archive.writestr("_atlas_backup_manifest.json", json.dumps(modified_manifest))
+            passed, errors = DR.verify_archive(modified, modified_manifest)
+            self.assertFalse(passed)
+            self.assertTrue(any("hash mismatch" in error for error in errors))
+
+            missing_file_manifest = {
+                "files": [{"path": "absent.txt", "sha256": "0" * 64, "kind": "workspace_file"}],
+            }
+            missing_file = root / "missing-file.zip"
+            with zipfile.ZipFile(missing_file, "w") as archive:
+                archive.writestr("_atlas_backup_manifest.json", json.dumps(missing_file_manifest))
+            passed, errors = DR.verify_archive(missing_file, missing_file_manifest)
+            self.assertFalse(passed)
+            self.assertTrue(any("missing: absent.txt" in error for error in errors))
+
+    def test_restore_drill_requires_a_working_git_for_bundle_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            bundle = root / "repo.bundle"
+            bundle.write_bytes(b"bundle evidence")
+            manifest = {
+                "files": [{
+                    "path": "repo.bundle",
+                    "sha256": DR.sha256(bundle),
+                    "kind": "git_bundle",
+                }],
+            }
+            archive_path = root / "bundle.zip"
+            with zipfile.ZipFile(archive_path, "w") as archive:
+                archive.write(bundle, "repo.bundle")
+                archive.writestr("_atlas_backup_manifest.json", json.dumps(manifest))
+
+            with patch.object(DR.shutil, "which", return_value=None):
+                passed, errors = DR.verify_archive(archive_path, manifest)
+            self.assertFalse(passed)
+            self.assertTrue(any("without git" in error for error in errors))
+
+            completed = SimpleNamespace(returncode=1, stdout="", stderr="invalid")
+            with (
+                patch.object(DR.shutil, "which", return_value="git"),
+                patch.object(DR.subprocess, "run", return_value=completed),
+            ):
+                passed, errors = DR.verify_archive(archive_path, manifest)
+            self.assertFalse(passed)
+            self.assertTrue(any("invalid git bundle" in error for error in errors))
+
     def test_repository_backup_config_covers_uncommitted_first_party_sources(self) -> None:
         config = DR.load_config(DR.CONFIG_PATH)
         includes = set(config["include_paths"])
