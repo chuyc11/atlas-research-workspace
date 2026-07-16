@@ -59,6 +59,62 @@ def compact(value: str, limit: int = 280) -> str:
     return value[: limit - 1].rstrip("，。；;,. ") + "…"
 
 
+EDITORIAL_LABELS = (
+    "确认事实",
+    "分析判断",
+    "为什么重要",
+    "后续影响",
+    "政策验证",
+    "硬证据",
+    "因果链",
+    "事实",
+    "判断",
+    "结论",
+    "机制",
+    "传导",
+    "反证",
+    "证伪",
+    "验证",
+)
+
+
+def sanitize_editorial_text(value: str, limit: int = 280) -> str:
+    """Turn report scaffolding into clean public-facing prose."""
+    cleaned = compact(value, max(limit * 3, 900))
+    cleaned = re.sub(r"(?:\s*[|｜]\s*){2,}", "；", cleaned)
+    cleaned = re.sub(r"\s*[|｜]\s*", "；", cleaned)
+    label_pattern = "|".join(re.escape(label) for label in EDITORIAL_LABELS)
+    cleaned = re.sub(rf"^(?:(?:{label_pattern})\s*[：:]\s*)+", "", cleaned)
+    cleaned = re.sub(r"([；。！？])(?:\s*\1)+", r"\1", cleaned)
+    cleaned = cleaned.strip(" ：:；;|｜-–—\t\r\n")
+    return compact(cleaned, limit)
+
+
+def labelled_value(value: str, labels: tuple[str, ...], limit: int = 280) -> str:
+    """Extract one explicitly labelled editorial clause from a report block."""
+    normalized = compact(value, 2400)
+    all_labels = "|".join(re.escape(label) for label in EDITORIAL_LABELS)
+    requested = "|".join(re.escape(label) for label in labels)
+    match = re.search(
+        rf"(?:^|[。！？；;]\s*)(?:{requested})\s*[：:]\s*(.+?)"
+        rf"(?=(?:[。！？；;]\s*(?:{all_labels})\s*[：:])|$)",
+        normalized,
+    )
+    return sanitize_editorial_text(match.group(1), limit) if match else ""
+
+
+def markdown_table_rows(lines: list[str]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in lines:
+        if not line.strip().startswith("|"):
+            continue
+        cells = [sanitize_editorial_text(cell, 360) for cell in line.strip().strip("|").split("|")]
+        if not cells or all(re.fullmatch(r"[-: ]+", cell or "-") for cell in cells):
+            continue
+        rows.append(cells)
+    return rows[1:] if len(rows) >= 2 else []
+
+
 def load_json(path: Path, default: Any) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
@@ -319,22 +375,28 @@ def event_from_item(item: str, category: str, time_label: str) -> dict[str, str]
     link = re.search(r"\[([^\]]+)\]\((https?://[^)]+)\)", item)
     bold = re.search(r"\*\*([^*]+)\*\*", item)
     content_only = re.sub(r"\[([^\]]+)\]\((?:https?://[^)]+)\)", "", item)
-    clean = compact(content_only, 900)
-    title = compact(bold.group(1) if bold else re.split(r"[。！？]", clean, maxsplit=1)[0], 72)
+    clean = sanitize_editorial_text(content_only, 900)
+    bold_title = sanitize_editorial_text(bold.group(1), 72) if bold else ""
+    title_source = bold_title or re.split(r"[，,。！？；;]", clean, maxsplit=1)[0]
+    title = sanitize_editorial_text(title_source, 72)
     remainder = clean
     if title and remainder.startswith(title):
-        remainder = remainder[len(title) :].lstrip("：:。 ")
+        remainder = remainder[len(title) :].lstrip("：:。，,；;！？ ")
     if len(title.rstrip("：:")) < 10 and remainder:
         first_clause = re.split(r"[。；;]", remainder, maxsplit=1)[0]
-        title = compact(f"{title.rstrip('：:')}：{first_clause}", 58)
+        title = sanitize_editorial_text(f"{title.rstrip('：:')}：{first_clause}", 58)
     sentences = [s.strip() for s in re.split(r"(?<=[。！？])", remainder) if s.strip()]
-    implication = ""
-    for sentence in sentences:
-        if any(token in sentence for token in ("分析判断", "后续影响", "为什么重要", "验证")):
-            implication = compact(re.sub(r"^(分析判断|后续影响|为什么重要)[：:]?", "", sentence), 260)
-            break
+    implication = labelled_value(
+        content_only,
+        ("分析判断", "为什么重要", "后续影响", "机制", "传导", "因果链"),
+        260,
+    )
     if not implication and len(remainder) <= 400:
-        clauses = [compact(value, 260) for value in re.split(r"[；;]", remainder) if compact(value, 260)]
+        clauses = [
+            sanitize_editorial_text(value, 260)
+            for value in re.split(r"[；;]", remainder)
+            if sanitize_editorial_text(value, 260)
+        ]
         if len(clauses) > 1:
             implication = clauses[-1]
     if not implication:
@@ -346,16 +408,16 @@ def event_from_item(item: str, category: str, time_label: str) -> dict[str, str]
             "宏观": "关注价格、利率、汇率与库存数据能否确认当前市场方向。",
             "中国": "关注成交宽度、政策执行与盈利数据能否确认结构性行情。",
         }.get(category, "关注下一项可核验的执行与价格信号。")
-    body = compact("".join(sentences[:2]) if sentences else remainder, 320)
+    body = sanitize_editorial_text("".join(sentences[:2]) if sentences else remainder, 320)
     if len(body) < 12:
-        body = compact(clean, 230)
+        body = sanitize_editorial_text(clean, 230)
     return {
         "category": category,
         "time": time_label,
         "title": title or f"{category}关键更新",
-        "cardTitle": compact(title or f"{category}关键更新", 78),
+        "cardTitle": sanitize_editorial_text(title or f"{category}关键更新", 78),
         "body": body or "本期报告已记录新的事实、影响路径与后续验证点。",
-        "implication": implication,
+        "implication": sanitize_editorial_text(implication, 260),
         "source": compact(link.group(1), 30) if link else "查看来源",
         "href": link.group(2) if link else "#sources",
     }
@@ -380,7 +442,32 @@ def parse_events(sections: dict[str, list[str]], predictions: list[dict[str, Any
             items = [prose] if prose else []
         if items:
             event: dict[str, Any] = event_from_item(items[0], category, label)
-            event["facts"] = [plain_markdown(item) for item in items[:3] if plain_markdown(item)]
+            core_heading = next(
+                (
+                    sanitize_editorial_text(match.group(1), 78)
+                    for line in lines
+                    if (match := re.match(r"^###\s+核心主线[：:]\s*(.+?)\s*$", line.strip()))
+                ),
+                "",
+            )
+            if core_heading:
+                event["title"] = core_heading
+                event["cardTitle"] = core_heading
+            section_text = "。".join(items)
+            section_implication = labelled_value(
+                section_text,
+                ("分析判断", "为什么重要", "后续影响", "机制", "传导", "因果链"),
+                260,
+            )
+            if section_implication:
+                event["implication"] = section_implication
+            event["facts"] = [
+                sanitize_editorial_text(plain_markdown(item), 420)
+                for item in items[:3]
+                if sanitize_editorial_text(plain_markdown(item), 420)
+            ]
+            if core_heading and event["facts"]:
+                event["body"] = event["facts"][0]
             event["sources"] = markdown_links("\n".join(lines), limit=8) or fallback_event_sources(category, all_sources)
             events.append(event)
     if len(events) < 7:
@@ -1327,6 +1414,40 @@ def report_quality_audit(text: str) -> dict[str, Any]:
     }
 
 
+def public_hero_copy(
+    sections: dict[str, list[str]],
+    events: list[dict[str, Any]],
+) -> tuple[str, str, str]:
+    lead = events[0]["body"] if events else "最新一期全球简报已经生成，等待进一步验证。"
+    core_items = numbered_items(find_section(sections, "核心摘要"))
+    core_bold = re.search(r"\*\*([^*]+)\*\*", core_items[0]) if core_items else None
+    core_rows = markdown_table_rows(find_section(sections, "核心摘要"))
+    if core_rows:
+        first_core = core_rows[0]
+        core_headline = sanitize_editorial_text(first_core[0], 34)
+        core_fact = sanitize_editorial_text(first_core[1] if len(first_core) > 1 else "", 220)
+        core_analysis = sanitize_editorial_text(first_core[2] if len(first_core) > 2 else "", 260)
+        core_verification = sanitize_editorial_text(first_core[3] if len(first_core) > 3 else "", 180)
+        lead = "；".join(value for value in (core_fact, core_analysis) if value)
+        editor_note = f"接下来验证{core_verification}。" if core_verification else ""
+    else:
+        core_headline = (
+            compact(core_bold.group(1), 34)
+            if core_bold
+            else plain_markdown(core_items[0], 34)
+            if core_items
+            else compact(events[0]["title"], 34)
+            if events
+            else "全球风险等待下一项验证"
+        )
+        editor_note = ""
+    if not editor_note:
+        editor_note = events[0]["implication"] if events else "关注事实、执行与资产价格之间的传导。"
+    if editor_note == lead:
+        editor_note = "下一步只接受公开执行文本、现场数据与收盘价格的交叉确认。"
+    return core_headline, lead, editor_note
+
+
 def build_payload(text: str, report_date: str, report_count: int, sha256: str) -> dict[str, Any]:
     sections = split_sections(text)
     predictions = predictions_for_date(report_date)
@@ -1362,10 +1483,7 @@ def build_payload(text: str, report_date: str, report_count: int, sha256: str) -
     risk_temperature = min(100, 20 + high_count * 8 + medium_count * 4 + len(risks) * 5)
     posture = "选择性防御" if risk_temperature >= 72 else "谨慎均衡" if risk_temperature >= 64 else "适度进取"
     health = source_health(report_date)
-    lead = events[0]["body"] if events else "最新一期全球简报已经生成，等待进一步验证。"
-    core_items = numbered_items(find_section(sections, "核心摘要"))
-    core_bold = re.search(r"\*\*([^*]+)\*\*", core_items[0]) if core_items else None
-    core_headline = compact(core_bold.group(1), 34) if core_bold else plain_markdown(core_items[0], 34) if core_items else compact(events[0]["title"], 34) if events else "全球风险等待下一项验证"
+    core_headline, lead, editor_note = public_hero_copy(sections, events)
     portfolio_lines = find_section(sections, "虚拟炒股账户", "虚拟交易账户", "虚拟账户")
     forecast_reviews = [plain_markdown(item, 360) for item in bullet_items(find_section(sections, "昨日预测复盘", "预测复盘"))[:8]]
     framework_updates = [plain_markdown(item, 260) for item in numbered_items(find_section(sections, "预测框架更新", "框架更新"))[:8]]
@@ -1386,7 +1504,7 @@ def build_payload(text: str, report_date: str, report_count: int, sha256: str) -
             "eyebrow": "每日全球晨间简报",
             "headline": split_headline(core_headline),
             "dek": lead,
-            "editorNote": events[0]["analysis"] if events else "关注事实、执行与资产价格之间的传导。",
+            "editorNote": editor_note,
         },
         "metrics": {
             "riskTemperature": risk_temperature,

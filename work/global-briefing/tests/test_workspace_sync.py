@@ -59,6 +59,38 @@ class WorkspaceSyncTests(unittest.TestCase):
             ["official release"],
         )
 
+    def test_editorial_scaffolding_is_removed_from_public_copy(self) -> None:
+        cleaned = SITE_SYNC.sanitize_editorial_text(
+            "结论：确认事实不等于分析判断｜｜后续验证",
+            120,
+        )
+
+        self.assertEqual(cleaned, "确认事实不等于分析判断；后续验证")
+        self.assertNotIn("｜｜", cleaned)
+
+    def test_core_summary_table_produces_distinct_public_hero_copy(self) -> None:
+        sections = {
+            "一、核心摘要": [
+                "|决策主线|确认事实|分析判断|下一验证|",
+                "|---|---|---|---|",
+                "|霍尔木兹风险重新压过外交窗口|美国恢复港口封锁|航运风险上升|协议文本、船流、战争险|",
+            ]
+        }
+        events = [
+            {
+                "title": "备用标题",
+                "body": "备用正文",
+                "implication": "备用验证",
+            }
+        ]
+
+        headline, dek, editor_note = SITE_SYNC.public_hero_copy(sections, events)
+
+        self.assertEqual(headline, "霍尔木兹风险重新压过外交窗口")
+        self.assertEqual(dek, "美国恢复港口封锁；航运风险上升")
+        self.assertEqual(editor_note, "接下来验证协议文本、船流、战争险。")
+        self.assertEqual(len({headline, dek, editor_note}), 3)
+
     def test_v2_matching_requires_shared_evidence_url(self) -> None:
         predictions = [
             {
@@ -179,6 +211,24 @@ class WorkspaceSyncTests(unittest.TestCase):
         audit = SITE_SYNC.report_quality_audit(report_path.read_text(encoding="utf-8"))
 
         self.assertGreaterEqual(audit["observationCount"], 1)
+
+    @requires_runtime_report("2026-07-15")
+    def test_revised_report_builds_distinct_clean_public_copy(self) -> None:
+        report_path, report_date = SITE_SYNC.report_for_date("2026-07-15")
+        payload = SITE_SYNC.build_payload(report_path.read_text(encoding="utf-8"), report_date, 1, "revised-sha")
+        serialized = json.dumps(payload, ensure_ascii=False)
+        headline = "".join(payload["hero"]["headline"])
+
+        self.assertEqual(headline, "霍尔木兹风险重新压过外交窗口")
+        self.assertNotEqual(headline, payload["hero"]["dek"])
+        self.assertNotEqual(payload["hero"]["dek"], payload["hero"]["editorNote"])
+        self.assertNotIn("｜｜", serialized)
+        self.assertTrue(
+            all(
+                not event["cardTitle"].startswith(("结论：", "确认事实：", "分析判断：", "判断："))
+                for event in payload["events"]
+            )
+        )
 
     @requires_runtime_report("2026-07-12")
     def test_v2_report_builds_with_numeric_probabilities_and_complete_events(self) -> None:
