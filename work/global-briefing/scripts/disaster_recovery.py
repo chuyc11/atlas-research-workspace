@@ -45,12 +45,12 @@ EXCLUDED_PARTS = {
     ".venv",
     ".next",
     ".wrangler",
-    "tmp",
     "dist",
     "node_modules",
     ".git",
     "external_research",
 }
+EXCLUDED_RELATIVE_ROOTS = (Path("work/global-briefing/tmp"),)
 
 
 def utc_now() -> str:
@@ -125,12 +125,14 @@ def iter_files(root: Path, includes: Iterable[str]) -> list[Path]:
         for path in candidates:
             if not path.is_file() or any(part in EXCLUDED_PARTS for part in path.parts):
                 continue
+            relative_path = path.resolve().relative_to(root.resolve())
+            if any(excluded == relative_path or excluded in relative_path.parents for excluded in EXCLUDED_RELATIVE_ROOTS):
+                continue
             try:
                 path.resolve().relative_to(latest_resolved)
                 continue
             except ValueError:
                 pass
-            path.resolve().relative_to(root.resolve())
             files.add(path.resolve())
     return sorted(files, key=lambda value: value.as_posix())
 
