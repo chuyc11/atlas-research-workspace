@@ -205,6 +205,75 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(health["rssStaleOrUnknownPct"], 66.67)
         self.assertTrue(any("时间戳" in item for item in health["limitations"]))
 
+    def test_source_health_treats_24_to_72_hour_items_as_declared_background(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary)
+            (data_dir / "rss-items-2026-07-14.json").write_text(
+                json.dumps({
+                    "generated_at": "2026-07-14T23:59:59+08:00",
+                    "items": [
+                        {"source": "A", "published": "Tue, 14 Jul 2026 04:00:00 GMT"},
+                        {"source": "A", "published": "Sun, 12 Jul 2026 04:00:00 GMT"},
+                        {"source": "A", "published": "unknown"},
+                    ],
+                    "errors": [],
+                    "fallbacks": [],
+                }),
+                encoding="utf-8",
+            )
+            (data_dir / "china-market-snapshot-2026-07-14.json").write_text("{}", encoding="utf-8")
+            (data_dir / "market-snapshot-2026-07-14.json").write_text("{}", encoding="utf-8")
+            sources = data_dir / "sources.json"
+            settings = data_dir / "settings.json"
+            sources.write_text(json.dumps({"sources": [{"name": "A", "rss": "https://a.example/rss"}]}), encoding="utf-8")
+            settings.write_text(
+                json.dumps({"news_research_policy": {"collection_lookback_hours": 72}}),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(SITE_SYNC, "DATA_DIR", data_dir),
+                patch.object(SITE_SYNC, "SOURCES_CONFIG_PATH", sources),
+                patch.object(SITE_SYNC, "SETTINGS_CONFIG_PATH", settings),
+            ):
+                health = SITE_SYNC.source_health("2026-07-14")
+
+        self.assertEqual(health["rssBackgroundCount"], 1)
+        self.assertEqual(health["rssStaleCount"], 0)
+        self.assertEqual(health["rssStaleOrUnknownPct"], 33.33)
+
+    def test_source_health_infers_legacy_china_price_date_only_after_local_close(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            data_dir = Path(temporary)
+            (data_dir / "rss-items-2026-07-14.json").write_text(
+                json.dumps({"generated_at": "2026-07-14T23:59:59+08:00", "items": [], "errors": [], "fallbacks": []}),
+                encoding="utf-8",
+            )
+            (data_dir / "china-market-snapshot-2026-07-14.json").write_text(
+                json.dumps({
+                    "generated_at": "2026-07-14T08:05:00+00:00",
+                    "items": [
+                        {"symbol": "510300.SH", "price": 4.8, "fetched_at": "2026-07-14T08:05:00+00:00"},
+                        {"symbol": "159915.SZ", "price": 3.8, "fetched_at": "2026-07-14T06:00:00+00:00"},
+                    ],
+                    "errors": [],
+                }),
+                encoding="utf-8",
+            )
+            (data_dir / "market-snapshot-2026-07-14.json").write_text("{}", encoding="utf-8")
+            sources = data_dir / "sources.json"
+            settings = data_dir / "settings.json"
+            sources.write_text(json.dumps({"sources": []}), encoding="utf-8")
+            settings.write_text(json.dumps({"news_research_policy": {"collection_lookback_hours": 72}}), encoding="utf-8")
+            with (
+                patch.object(SITE_SYNC, "DATA_DIR", data_dir),
+                patch.object(SITE_SYNC, "SOURCES_CONFIG_PATH", sources),
+                patch.object(SITE_SYNC, "SETTINGS_CONFIG_PATH", settings),
+            ):
+                health = SITE_SYNC.source_health("2026-07-14")
+
+        self.assertEqual(health["chinaInferredPriceDateItemCount"], 1)
+        self.assertEqual(health["chinaMissingPriceDateItemCount"], 1)
+
     @requires_runtime_report("2026-07-14")
     def test_current_report_exposes_nonempty_observation_table(self) -> None:
         report_path, _report_date = SITE_SYNC.report_for_date("2026-07-14")

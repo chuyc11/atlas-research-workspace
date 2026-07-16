@@ -447,31 +447,40 @@ class SelfHealingEngine:
     def probe_site(self, date: str) -> list[ProbeResult]:
         script = self.briefing_root / "scripts" / "sync_briefing_site.py"
         completed, payload = self.command_json(
-            [sys.executable, str(script), "--date", date, "--dry-run"]
+            [sys.executable, str(script), "--date", date, "--candidate-only"]
         )
         site_data = self.site_root / "app" / "briefing.generated.json"
         generated = read_json(site_data, {})
         expected_hash = str((payload or {}).get("sha256") or "")
         actual_hash = str(generated.get("contentHash") or "") if isinstance(generated, dict) else ""
-        payload_ok = bool(
+        candidate_ok = bool(
             completed.returncode == 0
+            and (payload or {}).get("status") == "candidate_valid"
             and expected_hash
-            and actual_hash == expected_hash
-            and generated.get("reportDate") == date
         )
+        deployed_matches = bool(actual_hash == expected_hash and generated.get("reportDate") == date)
         freshness = self.result(
             "site_payload_freshness",
-            payload_ok,
+            candidate_ok,
             site_data,
-            "site payload matches current report inputs" if payload_ok else "site payload is stale or invalid",
+            (
+                "site payload matches current report inputs"
+                if candidate_ok and deployed_matches
+                else "candidate site payload is valid and awaits publication refresh"
+                if candidate_ok
+                else "candidate site payload is invalid"
+            ),
             evidence={
                 "expected_hash": expected_hash,
                 "actual_hash": actual_hash,
                 "report_date": generated.get("reportDate") if isinstance(generated, dict) else None,
+                "candidate_valid": candidate_ok,
+                "deployed_matches": deployed_matches,
+                "publication_refresh_required": candidate_ok and not deployed_matches,
                 "returncode": completed.returncode,
                 "stderr": completed.stderr[-1000:],
             },
-            fixer="regenerate_site_payload",
+            fixer=None,
         )
         state_path = self.briefing_root / "data" / "site-sync-state.json"
         state = read_json(state_path, {})

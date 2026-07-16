@@ -277,6 +277,43 @@ class ImprovementTrackerTests(unittest.TestCase):
         self.assertEqual(action["last_evaluation"]["outcome"], "pass")
         self.assertEqual(action["last_evaluation"]["evidence"]["errors"], [])
 
+    def test_new_review_integrity_scores_market_only_reviews_at_mapping_level(self) -> None:
+        predictions = self.root / "work" / "global-briefing" / "data" / "predictions.jsonl"
+        predictions.parent.mkdir(parents=True, exist_ok=True)
+        rows = [
+            {
+                "schema_version": 2,
+                "prediction_id": "2026-07-12-P01",
+                "date": "2026-07-12",
+                "deadline": "2026-07-13",
+            },
+            {
+                "prediction_id": "2026-07-12-P01",
+                "date": "2026-07-14",
+                "status": "active",
+                "review": {
+                    "resolution_scope": "market",
+                    "review_date": "2026-07-14",
+                    "market_resolution": [
+                        {
+                            "evaluation_deadline": "2026-07-13",
+                            "observed_outcome": 1,
+                            "evidence": [{"source": "Market", "url": "https://example.com/market"}],
+                        }
+                    ],
+                },
+            },
+        ]
+        predictions.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        self.tracker.run("2026-07-12", apply_safe=False, strict=False)
+        self.write_quality("2026-07-14", passed=True)
+
+        _rc, report = self.tracker.run("2026-07-14", apply_safe=False, strict=False)
+        action = next(item for item in report["actions"] if item["spec"]["source_key"] == "review-explicit-scoring")
+
+        self.assertEqual(action["last_evaluation"]["outcome"], "pass")
+        self.assertEqual(action["last_evaluation"]["evidence"]["errors"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -593,6 +593,45 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertFalse(historical["operational_passed"])
         self.assertTrue(historical["v2_contract"]["review_errors"])
 
+    def test_explicit_revision_cutoff_uses_later_append_only_correction_without_rewriting_history(self) -> None:
+        original = v2_prediction()
+        invalid = market_review(review_date="2026-07-15")
+        invalid["review"]["market_resolution"][0]["start_price_date"] = "2026-07-12"
+        corrected = market_review(review_date="2026-07-16")
+        corrected["review"]["market_resolution"][0].update(
+            {
+                "symbol_start_price": 100.0,
+                "symbol_end_price": 102.0,
+                "benchmark_start_price": 100.0,
+                "benchmark_end_price": 101.0,
+            }
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "report.md"
+            report.write_text("## 2026-07-15 每日全球晨间简报\n修订日期：2026-07-16\n", encoding="utf-8")
+            payload = MODULE.build_quality_report(
+                date="2026-07-15",
+                evaluation_cutoff="2026-07-16",
+                records=[original, invalid, corrected],
+                report_path=report,
+                settings={
+                    "prediction_contract": {"enforce_from_date": "2026-07-12"},
+                    "review_queue": {
+                        "block_deployment_on_unresolved_due_v2_market": True,
+                        "block_deployment_on_unresolved_due_v2_market_from_date": "2026-07-15",
+                        "market_resolution_price_recompute_enforce_from_date": "2026-07-16",
+                    },
+                    "research_evaluation": {"minimum_sample": 30},
+                    "news_research_policy": {"enforce_from_date": "9999-12-31"},
+                },
+            )
+
+        self.assertTrue(payload["revised"])
+        self.assertEqual(payload["evaluation_cutoff"], "2026-07-16")
+        self.assertTrue(payload["operational_passed"])
+        self.assertFalse(payload["research_ready"])
+        self.assertTrue(payload["prediction_audit"]["v2_contract"]["superseded_review_errors"])
+
     def test_market_resolution_recomputes_returns_from_raw_prices_after_enforcement(self) -> None:
         original = v2_prediction()
         original["market_mapping"][0]["evaluation"] = {

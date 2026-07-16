@@ -924,7 +924,11 @@ def source_health(report_date: str) -> dict[str, Any]:
     reference = datetime.fromisoformat(str(rss.get("generated_at") or f"{report_date}T23:59:59+08:00"))
     if reference.tzinfo is None:
         reference = reference.replace(tzinfo=timezone(timedelta(hours=8)))
+    settings = load_json(SETTINGS_CONFIG_PATH, {})
+    news_policy = settings.get("news_research_policy", {}) if isinstance(settings, dict) else {}
+    lookback_hours = max(24, int(news_policy.get("collection_lookback_hours") or 72))
     fresh_items = 0
+    background_items = 0
     stale_items = 0
     freshness = rss.get("freshness", {}) if isinstance(rss.get("freshness"), dict) else {}
     unknown_timestamp_items = int(freshness.get("undated_quarantined") or 0)
@@ -941,6 +945,8 @@ def source_health(report_date: str) -> dict[str, Any]:
             age_hours = (reference.astimezone(timezone.utc) - published.astimezone(timezone.utc)).total_seconds() / 3600
             if 0 <= age_hours <= 24:
                 fresh_items += 1
+            elif 24 < age_hours <= lookback_hours:
+                background_items += 1
             else:
                 stale_items += 1
         except (TypeError, ValueError, OverflowError):
@@ -957,6 +963,7 @@ def source_health(report_date: str) -> dict[str, Any]:
         int(item.get("items") or 0) for item in china_fallbacks if isinstance(item, dict)
     )
     china_missing_price_date_items = 0
+    china_inferred_price_date_items = 0
     china_stale_price_items = 0
     market_items = market.get("items", []) if isinstance(market, dict) else []
     prior_close_market_items = 0
@@ -975,11 +982,24 @@ def source_health(report_date: str) -> dict[str, Any]:
     for item in china_items:
         if not isinstance(item, dict) or item.get("price") is None:
             continue
-        if not item.get("price_date"):
+        price_date_value = item.get("price_date")
+        if not price_date_value:
+            fetched_at = str(item.get("fetched_at") or china.get("generated_at") or "")
+            try:
+                fetched = datetime.fromisoformat(fetched_at.replace("Z", "+00:00"))
+                if fetched.tzinfo is None:
+                    fetched = fetched.replace(tzinfo=timezone.utc)
+                fetched_local = fetched.astimezone(timezone(timedelta(hours=8)))
+                if fetched_local.date() == report_day and fetched_local.hour >= 16:
+                    price_date_value = report_date
+                    china_inferred_price_date_items += 1
+            except ValueError:
+                price_date_value = None
+        if not price_date_value:
             china_missing_price_date_items += 1
             continue
         try:
-            china_price_day = Date.fromisoformat(str(item["price_date"])[:10])
+            china_price_day = Date.fromisoformat(str(price_date_value)[:10])
         except ValueError:
             china_missing_price_date_items += 1
             continue
@@ -1005,7 +1025,7 @@ def source_health(report_date: str) -> dict[str, Any]:
     score -= min(15, round((100 - rss_coverage_pct) * 0.15))
     if market_items and stale_market_items == len(market_items):
         score -= 8
-    rss_item_count = fresh_items + stale_items + unknown_timestamp_items
+    rss_item_count = fresh_items + background_items + stale_items + unknown_timestamp_items
     stale_or_unknown_pct = round(
         (stale_items + unknown_timestamp_items) / rss_item_count * 100,
         2,
@@ -1030,6 +1050,11 @@ def source_health(report_date: str) -> dict[str, Any]:
             f"中国行情时间戳受限：{china_missing_price_date_items} 条缺少价格日期、"
             f"{china_stale_price_items} 条超过一个营业日。"
         )
+    if china_inferred_price_date_items:
+        limitations.append(
+            f"中国行情有 {china_inferred_price_date_items} 条旧版记录未显式写入价格日期；"
+            "因其在报告日16:00后抓取，按报告日收盘作保守推断。"
+        )
     if stale_market_items:
         limitations.append(f"全球行情 {stale_market_items}/{len(market_items)} 条价格日期早于报告日。")
     return {
@@ -1037,6 +1062,8 @@ def source_health(report_date: str) -> dict[str, Any]:
         "score": score,
         "rssItemCount": len(items),
         "rssFresh24hCount": fresh_items,
+        "rssBackgroundCount": background_items,
+        "rssLookbackHours": lookback_hours,
         "rssStaleCount": stale_items,
         "rssUnknownTimestampCount": unknown_timestamp_items,
         "rssStaleOrUnknownPct": stale_or_unknown_pct,
@@ -1047,6 +1074,7 @@ def source_health(report_date: str) -> dict[str, Any]:
         "chinaFallbackItemCount": china_fallback_items,
         "chinaItemCount": len(china_items),
         "chinaMissingPriceDateItemCount": china_missing_price_date_items,
+        "chinaInferredPriceDateItemCount": china_inferred_price_date_items,
         "chinaStalePriceItemCount": china_stale_price_items,
         "staleMarketItemCount": stale_market_items,
         "priorCloseMarketItemCount": prior_close_market_items,
@@ -1940,6 +1968,11 @@ def main() -> int:
     )
     parser.add_argument("--force", action="store_true", help="Regenerate even when the newest hash is already deployed.")
     parser.add_argument(
+        "--candidate-only",
+        action="store_true",
+        help="Build and validate the unfrozen candidate payload without reading or writing publication state.",
+    )
+    parser.add_argument(
         "--refresh-publication-snapshot",
         action="store_true",
         help="Create an explicit same-day snapshot revision after all closed-loop gates have been rerun.",
@@ -2018,6 +2051,23 @@ def main() -> int:
             continue
         if match.group(1) <= report_date:
             report_count += 1
+    candidate_payload = build_payload(text, report_date, report_count, sha256)
+    candidate_payload_hash = payload_sha256(candidate_payload)
+    candidate_errors = validate_payload(candidate_payload)
+    if candidate_errors:
+        print(json.dumps({"status": "error", "date": report_date, "errors": candidate_errors}, ensure_ascii=False, indent=2))
+        return 2
+    if args.candidate_only:
+        print(json.dumps({
+            "status": "candidate_valid",
+            "sha256": sha256,
+            "payload_sha256": candidate_payload_hash,
+            "report": str(report_path),
+            "date": report_date,
+            "events": len(candidate_payload["events"]),
+            "scenarios": len(candidate_payload["scenarios"]),
+        }, ensure_ascii=False))
+        return 0
     snapshot: dict[str, Any] | None = None
     snapshot_status = "not_ready"
     if not args.refresh_publication_snapshot:
@@ -2035,7 +2085,7 @@ def main() -> int:
         payload = snapshot["payload"]
         snapshot_status = "frozen"
     else:
-        payload = build_payload(text, report_date, report_count, sha256)
+        payload = candidate_payload
     payload_hash = payload_sha256(payload)
     validation_errors = validate_payload(payload)
     if validation_errors:

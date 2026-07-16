@@ -116,6 +116,25 @@ class SelfHealingTests(unittest.TestCase):
         self.assertEqual(payload["last_deployed_sha"], "same")
         self.assertTrue(self.engine.probe_site("2026-07-12")[1].passed)
 
+    def test_valid_candidate_does_not_deadlock_on_stale_deployed_payload(self) -> None:
+        site_data = self.root / "src" / "app" / "briefing.generated.json"
+        write_json(site_data, {"reportDate": "2026-07-12", "contentHash": "old"})
+        completed = type("Completed", (), {"returncode": 0, "stderr": ""})()
+        candidate = {
+            "status": "candidate_valid",
+            "sha256": "new",
+            "payload_sha256": "payload-new",
+            "date": "2026-07-12",
+        }
+
+        with patch.object(self.engine, "command_json", return_value=(completed, candidate)):
+            freshness = self.engine.probe_site("2026-07-12")[0]
+
+        self.assertTrue(freshness.passed)
+        self.assertTrue(freshness.evidence["candidate_valid"])
+        self.assertTrue(freshness.evidence["publication_refresh_required"])
+        self.assertFalse(freshness.evidence["deployed_matches"])
+
     def test_high_risk_issue_never_auto_fixes(self) -> None:
         finding = self.engine.result(
             "research_operational_gate",

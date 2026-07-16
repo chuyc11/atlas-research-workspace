@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import subprocess
@@ -249,7 +250,26 @@ class ImprovementTracker:
             ),
         ]
 
-    def source_health(self) -> dict[str, Any]:
+    def source_health(self, date: str | None = None) -> dict[str, Any]:
+        sync_script = self.briefing_root / "scripts" / "sync_briefing_site.py"
+        if date and sync_script.is_file():
+            module_name = f"atlas_source_health_{stable_hash(str(self.root))[:12]}"
+            spec = importlib.util.spec_from_file_location(module_name, sync_script)
+            if spec and spec.loader:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                try:
+                    spec.loader.exec_module(module)
+                    module.DATA_DIR = self.briefing_root / "data"
+                    module.SOURCES_CONFIG_PATH = self.briefing_root / "config" / "sources.json"
+                    module.SETTINGS_CONFIG_PATH = self.briefing_root / "config" / "settings.json"
+                    health = module.source_health(date)
+                    if isinstance(health, dict):
+                        return health
+                except (OSError, ValueError, ImportError):
+                    pass
+                finally:
+                    sys.modules.pop(module_name, None)
         payload = read_json(self.site_data, {})
         return payload.get("metrics", {}).get("sourceHealth", {}) if isinstance(payload, dict) else {}
 
@@ -267,7 +287,7 @@ class ImprovementTracker:
             errors = list(contract.get("errors") or []) + list(contract.get("review_errors") or [])
             return Evaluation("pass" if not errors else "fail", "v2 契约通过" if not errors else "v2 契约仍有错误", {"errors": errors})
         if spec.acceptance_key == "source_health":
-            health = self.source_health()
+            health = self.source_health(date)
             score = int(health.get("score") or 0) if isinstance(health, dict) else 0
             report_audit = self.quality(date).get("report_audit", {})
             core_stories_passed = report_audit.get("all_core_stories_passed") is True
@@ -302,7 +322,7 @@ class ImprovementTracker:
             )
             return Evaluation("pass" if passed else "fail", detail, evidence)
         if spec.acceptance_key == "no_stale_market_data":
-            health = self.source_health()
+            health = self.source_health(date)
             stale = int(health.get("staleMarketItemCount") or 0) if isinstance(health, dict) else 0
             return Evaluation("pass" if stale == 0 else "fail", f"过期市场数据 {stale} 条", {"stale_market_items": stale})
         if spec.acceptance_key == "report_quality":
@@ -325,14 +345,51 @@ class ImprovementTracker:
                 review = row.get("review", {})
                 prediction_id = str(row.get("prediction_id") or "")
                 original = original_v2[prediction_id]
-                if review.get("observed_outcome") not in {0, 1}:
+                market_results = review.get("market_resolution")
+                has_market_results = isinstance(market_results, list) and bool(market_results)
+                scope = str(
+                    review.get("resolution_scope")
+                    or row.get("resolution_scope")
+                    or ("combined" if has_market_results and review.get("observed_outcome") in {0, 1} else "market" if has_market_results else "event")
+                ).lower()
+                if scope in {"event", "combined"} and review.get("observed_outcome") not in {0, 1}:
                     errors.append(f"{prediction_id}: missing observed_outcome")
-                if not review.get("evidence") and not review.get("resolution_evidence") and not row.get("evidence"):
+                if (
+                    scope in {"event", "combined"}
+                    and not review.get("evidence")
+                    and not review.get("resolution_evidence")
+                    and not row.get("evidence")
+                ):
                     errors.append(f"{prediction_id}: missing resolution evidence")
                 review_date = str(review.get("review_date") or row.get("date") or "")[:10]
                 deadline = str(original.get("deadline") or "")[:10]
-                if deadline and review_date and review_date < deadline and review.get("terminal_evidence") is not True:
+                if (
+                    scope in {"event", "combined"}
+                    and deadline
+                    and review_date
+                    and review_date < deadline
+                    and review.get("terminal_evidence") is not True
+                ):
                     errors.append(f"{prediction_id}: closed before deadline without terminal_evidence")
+                if scope in {"market", "combined"}:
+                    if not has_market_results:
+                        errors.append(f"{prediction_id}: missing market_resolution")
+                    for result in market_results if isinstance(market_results, list) else []:
+                        if not isinstance(result, dict):
+                            errors.append(f"{prediction_id}: invalid market_resolution entry")
+                            continue
+                        if result.get("observed_outcome") not in {0, 1}:
+                            errors.append(f"{prediction_id}: market_resolution missing observed_outcome")
+                        if not result.get("evidence"):
+                            errors.append(f"{prediction_id}: market_resolution missing evidence")
+                        evaluation_deadline = str(result.get("evaluation_deadline") or "")[:10]
+                        if (
+                            evaluation_deadline
+                            and review_date
+                            and review_date < evaluation_deadline
+                            and result.get("terminal_evidence") is not True
+                        ):
+                            errors.append(f"{prediction_id}: market_resolution closed before evaluation deadline")
                 if str(row.get("status") or "").lower() in {"partial", "wrong", "expired"}:
                     score = row.get("score") if isinstance(row.get("score"), dict) else review.get("score")
                     required_scores = {"direction", "timing", "transmission", "calibration"}

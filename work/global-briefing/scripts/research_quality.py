@@ -520,7 +520,11 @@ def original_records(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [row for row in records if not isinstance(row.get("review"), dict)]
 
 
-def latest_reviews(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+def latest_reviews(
+    records: list[dict[str, Any]],
+    *,
+    as_of: date_type | None = None,
+) -> dict[str, dict[str, Any]]:
     latest: dict[str, dict[str, Any]] = {}
     for row in records:
         prediction_id = str(row.get("prediction_id") or "")
@@ -535,6 +539,12 @@ def latest_reviews(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         current = latest.get(prediction_id)
         current_day = str((current or {}).get("review", {}).get("review_date") or (current or {}).get("date") or "")
         candidate_day = str(row.get("review", {}).get("review_date") or row.get("date") or "")
+        if as_of is not None:
+            try:
+                if parse_date(candidate_day) > as_of:
+                    continue
+            except (TypeError, ValueError):
+                continue
         if current is None or candidate_day >= current_day:
             latest[prediction_id] = row
     return latest
@@ -896,7 +906,7 @@ def proper_scoring_metrics(
         prediction_id = str(row.get("prediction_id") or "")
         if prediction_id and prediction_id not in original_by_id:
             original_by_id[prediction_id] = row
-    reviews = latest_reviews(records)
+    reviews = latest_reviews(records, as_of=cutoff_day)
     all_matured = {key: row for key, row in original_by_id.items() if is_matured_as_of(row, cutoff_day)}
     matured_v2 = {
         key: row
@@ -1160,7 +1170,7 @@ def audit_prediction_records(
     family_registry: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     originals = original_records(records)
-    reviews = latest_reviews(records)
+    reviews = latest_reviews(records, as_of=parse_date(cutoff))
     all_review_rows = [row for row in records if isinstance(row.get("review"), dict)]
     counts = Counter(str(row.get("prediction_id") or "") for row in originals)
     duplicate_original_ids = sorted(key for key, count in counts.items() if key and count > 1)
@@ -1564,7 +1574,11 @@ def build_quality_report(
     records: list[dict[str, Any]],
     report_path: Path,
     settings: dict[str, Any],
+    evaluation_cutoff: str | None = None,
 ) -> dict[str, Any]:
+    cutoff = evaluation_cutoff or date
+    if parse_date(cutoff) < parse_date(date):
+        raise ValueError("evaluation_cutoff cannot precede the report date")
     contract = settings.get("prediction_contract", {})
     enforce_from = str(contract.get("enforce_from_date") or "9999-12-31")
     research_config = settings.get("research_evaluation", {})
@@ -1576,7 +1590,7 @@ def build_quality_report(
     )
     prediction_audit = audit_prediction_records(
         records,
-        cutoff=date,
+        cutoff=cutoff,
         enforce_from_date=enforce_from,
         evaluation_config=research_config,
         review_policy=settings.get("review_queue", {}),
@@ -1595,6 +1609,8 @@ def build_quality_report(
     return {
         "schema_version": 1,
         "date": date,
+        "evaluation_cutoff": cutoff,
+        "revised": cutoff != date,
         "generated_at": datetime.now().astimezone().isoformat(),
         "operational_passed": operational_passed,
         "research_ready": research_ready,
@@ -1624,7 +1640,16 @@ def main(argv: list[str] | None = None) -> int:
         settings = read_json(args.settings)
         records = read_jsonl(args.predictions)
         report = args.report or DEFAULT_OUTPUTS / f"每日全球晨间简报-{args.date}.md"
-        payload = build_quality_report(date=args.date, records=records, report_path=report, settings=settings)
+        report_text = report.read_text(encoding="utf-8-sig") if report.is_file() else ""
+        revision_match = re.search(r"修订日期[：:]\s*(20\d{2}-\d{2}-\d{2})", report_text[:1200])
+        evaluation_cutoff = revision_match.group(1) if revision_match else args.date
+        payload = build_quality_report(
+            date=args.date,
+            records=records,
+            report_path=report,
+            settings=settings,
+            evaluation_cutoff=evaluation_cutoff,
+        )
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(json.dumps({"status": "error", "error": str(exc)}, ensure_ascii=False))
         return 2
