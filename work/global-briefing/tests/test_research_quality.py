@@ -300,6 +300,25 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertEqual(result["distinct_domain_count"], 2)
         self.assertEqual(result["thesis_layer_counts"]["falsification_signal"], 3)
 
+    def test_missing_enforced_report_is_an_explicit_operational_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            report = Path(directory) / "missing.md"
+            audit = MODULE.audit_report(report, {}, enforce=True)
+            payload = MODULE.build_quality_report(
+                date="2026-07-14",
+                records=[v2_prediction(), resolved_review(), market_review()],
+                report_path=report,
+                settings={
+                    "prediction_contract": {"enforce_from_date": "2026-07-12"},
+                    "research_evaluation": {"minimum_sample": 1},
+                    "news_research_policy": {"enforce_from_date": "2026-07-12"},
+                },
+            )
+
+        self.assertTrue(audit["enforced"])
+        self.assertFalse(audit["passed"])
+        self.assertIn("dated report is missing", payload["blocking_reasons"])
+
     def test_report_gate_applies_five_layer_and_source_roles_only_to_marked_core_stories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "report.md"
@@ -533,6 +552,46 @@ class ResearchQualityTests(unittest.TestCase):
 
         self.assertTrue(any("not a comparable market session" in item for item in errors))
         self.assertTrue(any("last comparable session" in item for item in errors))
+
+    def test_later_valid_append_only_market_correction_supersedes_blocking_error(self) -> None:
+        original = v2_prediction()
+        invalid = market_review(review_date="2026-07-15")
+        invalid["review"]["market_resolution"][0]["start_price_date"] = "2026-07-12"
+        corrected = market_review(review_date="2026-07-16")
+        corrected["review"]["market_resolution"][0].update(
+            {
+                "symbol_start_price": 100.0,
+                "symbol_end_price": 102.0,
+                "benchmark_start_price": 100.0,
+                "benchmark_end_price": 101.0,
+            }
+        )
+        result = MODULE.audit_prediction_records(
+            [original, invalid, corrected],
+            cutoff="2026-07-16",
+            enforce_from_date="2026-07-12",
+            review_policy={
+                "block_deployment_on_unresolved_due_v2_market": True,
+                "block_deployment_on_unresolved_due_v2_market_from_date": "2026-07-15",
+                "market_resolution_price_recompute_enforce_from_date": "2026-07-16",
+            },
+        )
+
+        self.assertTrue(result["operational_passed"])
+        self.assertEqual(result["v2_contract"]["review_errors"], [])
+        self.assertTrue(result["v2_contract"]["superseded_review_errors"])
+        self.assertEqual(result["unresolved_matured_v2_market_mapping_ids"], [])
+
+        historical = MODULE.audit_prediction_records(
+            [original, invalid, corrected],
+            cutoff="2026-07-15",
+            enforce_from_date="2026-07-12",
+            review_policy={
+                "market_resolution_price_recompute_enforce_from_date": "2026-07-16",
+            },
+        )
+        self.assertFalse(historical["operational_passed"])
+        self.assertTrue(historical["v2_contract"]["review_errors"])
 
     def test_market_resolution_recomputes_returns_from_raw_prices_after_enforcement(self) -> None:
         original = v2_prediction()

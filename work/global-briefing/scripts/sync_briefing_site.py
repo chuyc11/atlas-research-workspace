@@ -1576,6 +1576,50 @@ def payload_sha256(payload: Any) -> str:
     return hashlib.sha256(serialized_payload(payload).encode("utf-8")).hexdigest()
 
 
+def deployment_verification_errors(
+    artifact_path: Path,
+    *,
+    expected_content_hash: str,
+    expected_payload_sha256: str,
+    deployment_url: str,
+    now: datetime | None = None,
+) -> tuple[list[str], dict[str, Any]]:
+    artifact = load_json(artifact_path, {})
+    errors: list[str] = []
+    if not artifact_path.exists() or not artifact:
+        return [f"production verification artifact is missing or invalid: {artifact_path}"], {}
+    if artifact.get("schema_version") != 1:
+        errors.append("production verification artifact schema_version must be 1")
+    if artifact.get("passed") is not True:
+        errors.append("production verification artifact did not pass")
+    if str(artifact.get("expected_content_hash") or "") != expected_content_hash:
+        errors.append("production verification content hash does not match --mark-deployed")
+    if str(artifact.get("site_payload_sha256") or "") != expected_payload_sha256:
+        errors.append("production verification payload hash does not match current site data")
+    expected_url = deployment_url.rstrip("/")
+    artifact_url = str(artifact.get("deployment_url") or "").rstrip("/")
+    if not expected_url or urlparse(expected_url).scheme.lower() != "https":
+        errors.append("--deployment-url must be an HTTPS URL")
+    if artifact_url != expected_url:
+        errors.append("production verification URL does not match --deployment-url")
+    if artifact.get("source_isolation", {}).get("passed") is not True:
+        errors.append("production source-isolation verification did not pass")
+    if artifact.get("live", {}).get("passed") is not True:
+        errors.append("production live-response verification did not pass")
+    checked_at = str(artifact.get("checked_at") or "")
+    try:
+        checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
+        if checked.tzinfo is None:
+            raise ValueError("timezone is required")
+        current = now or datetime.now(timezone.utc)
+        age = current.astimezone(timezone.utc) - checked.astimezone(timezone.utc)
+        if age < -timedelta(minutes=5) or age > timedelta(hours=24):
+            errors.append("production verification artifact is stale or future-dated")
+    except ValueError:
+        errors.append("production verification checked_at is invalid")
+    return errors, artifact
+
+
 def write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -1771,6 +1815,11 @@ def main() -> int:
     parser.add_argument("--dry-run", action="store_true", help="Parse and validate without writing site data or sync state.")
     parser.add_argument("--mark-deployed", metavar="SHA256", help="Mark a previously generated content hash as successfully deployed.")
     parser.add_argument("--deployment-url", default="", help="Production URL stored with --mark-deployed.")
+    parser.add_argument(
+        "--verification-artifact",
+        type=Path,
+        help="Fresh passing artifact from verify_production_site.py; required by --mark-deployed.",
+    )
     parser.add_argument("--force", action="store_true", help="Regenerate even when the newest hash is already deployed.")
     parser.add_argument(
         "--refresh-publication-snapshot",
@@ -1783,6 +1832,22 @@ def main() -> int:
     if args.mark_deployed:
         current_payload = load_json(SITE_DATA, {})
         current_payload_sha = payload_sha256(current_payload) if isinstance(current_payload, dict) else ""
+        report_date = str(current_payload.get("reportDate") or "") if isinstance(current_payload, dict) else ""
+        verification_path = args.verification_artifact or DATA_DIR / f"production-verification-{report_date}.json"
+        verification_errors, verification = deployment_verification_errors(
+            verification_path,
+            expected_content_hash=args.mark_deployed,
+            expected_payload_sha256=current_payload_sha,
+            deployment_url=args.deployment_url,
+        )
+        if verification_errors:
+            print(json.dumps({
+                "status": "error",
+                "error": "cannot mark deployment without fresh production verification",
+                "verification_artifact": str(verification_path),
+                "reasons": verification_errors,
+            }, ensure_ascii=False))
+            return 2
         state.update({
             "last_deployed_sha": args.mark_deployed,
             "last_deployed_payload_sha": current_payload_sha,
@@ -1790,6 +1855,9 @@ def main() -> int:
             "last_deployed_snapshot_sha256": state.get("pending_snapshot_sha256"),
             "last_deployed_at": datetime.now(timezone.utc).isoformat(),
             "deployment_url": args.deployment_url,
+            "last_deployment_verified_at": verification.get("checked_at"),
+            "last_deployment_verification_artifact": str(verification_path),
+            "last_deployment_verification_sha256": hashlib.sha256(verification_path.read_bytes()).hexdigest(),
         })
         pending_payload_sha = str(state.get("pending_payload_sha") or "")
         if state.get("pending_sha") == args.mark_deployed and (not pending_payload_sha or pending_payload_sha == current_payload_sha):
@@ -1803,7 +1871,13 @@ def main() -> int:
             ):
                 state.pop(key, None)
         write_json_atomic(STATE_FILE, state)
-        print(json.dumps({"status": "marked", "sha256": args.mark_deployed, "payload_sha256": current_payload_sha, "deployment_url": args.deployment_url}, ensure_ascii=False))
+        print(json.dumps({
+            "status": "marked",
+            "sha256": args.mark_deployed,
+            "payload_sha256": current_payload_sha,
+            "deployment_url": args.deployment_url,
+            "verification_artifact": str(verification_path),
+        }, ensure_ascii=False))
         return 0
 
     try:

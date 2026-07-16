@@ -812,6 +812,74 @@ def validate_v2_review(
     return errors
 
 
+def invalid_market_review_is_superseded(
+    review_row: dict[str, Any],
+    all_review_rows: list[dict[str, Any]],
+    original: dict[str, Any],
+    *,
+    price_recompute_enforce_from_date: str = DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM,
+    as_of: date_type | None = None,
+) -> bool:
+    """Keep append-only audit history without permanently blocking a corrected mapping.
+
+    Only a strictly later, fully valid market/combined review can supersede an invalid
+    market-only review, and it must replace every mapping contained in the invalid row.
+    The original errors remain visible as diagnostics; they are merely removed from the
+    current operational gate once an auditable correction exists.
+    """
+    if review_scope(review_row) != "market":
+        return False
+    review = review_row.get("review")
+    if not isinstance(review, dict):
+        return False
+    invalid_items = review.get("market_resolution")
+    if not isinstance(invalid_items, list) or not invalid_items:
+        return False
+    prediction_id = str(review_row.get("prediction_id") or "")
+    invalid_keys = {
+        market_mapping_key(prediction_id, item)
+        for item in invalid_items
+        if isinstance(item, dict)
+    }
+    if not invalid_keys:
+        return False
+    try:
+        invalid_day = parse_date(review.get("review_date") or review_row.get("date"))
+    except (TypeError, ValueError):
+        return False
+
+    corrected_keys: set[str] = set()
+    for candidate in all_review_rows:
+        if candidate is review_row or str(candidate.get("prediction_id") or "") != prediction_id:
+            continue
+        if review_scope(candidate) not in {"market", "combined"}:
+            continue
+        candidate_review = candidate.get("review")
+        if not isinstance(candidate_review, dict):
+            continue
+        try:
+            candidate_day = parse_date(candidate_review.get("review_date") or candidate.get("date"))
+        except (TypeError, ValueError):
+            continue
+        if candidate_day <= invalid_day or (as_of is not None and candidate_day > as_of):
+            continue
+        if validate_v2_review(
+            candidate,
+            original,
+            price_recompute_enforce_from_date=price_recompute_enforce_from_date,
+        ):
+            continue
+        candidate_items = candidate_review.get("market_resolution")
+        if not isinstance(candidate_items, list):
+            continue
+        corrected_keys.update(
+            market_mapping_key(prediction_id, item)
+            for item in candidate_items
+            if isinstance(item, dict) and str(item.get("status") or "").lower() == "resolved"
+        )
+    return invalid_keys.issubset(corrected_keys)
+
+
 def proper_scoring_metrics(
     records: list[dict[str, Any]],
     *,
@@ -1110,6 +1178,7 @@ def audit_prediction_records(
     enforce_day = parse_date(enforce_from_date)
     v2_errors: list[str] = []
     v2_review_errors: list[str] = []
+    superseded_v2_review_errors: list[str] = []
     v2_applicable = []
     for row in originals:
         try:
@@ -1133,6 +1202,11 @@ def audit_prediction_records(
                     (prediction_contract or {}).get("evidence_reproducibility_enforce_from_date") or ""
                 ) or None,
             ))
+    review_validation_results: list[tuple[dict[str, Any], dict[str, Any], list[str]]] = []
+    price_recompute_enforce_from_date = str(
+        (review_policy or {}).get("market_resolution_price_recompute_enforce_from_date")
+        or DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM
+    )
     for review_row in all_review_rows:
         prediction_id = str(review_row.get("prediction_id") or "")
         original = original_by_id.get(prediction_id)
@@ -1143,16 +1217,28 @@ def audit_prediction_records(
         except (TypeError, ValueError):
             continue
         if original_day >= enforce_day:
-            v2_review_errors.extend(
-                validate_v2_review(
+            review_validation_results.append(
+                (
                     review_row,
                     original,
-                    price_recompute_enforce_from_date=str(
-                        (review_policy or {}).get("market_resolution_price_recompute_enforce_from_date")
-                        or DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM
+                    validate_v2_review(
+                        review_row,
+                        original,
+                        price_recompute_enforce_from_date=price_recompute_enforce_from_date,
                     ),
                 )
             )
+    for review_row, original, errors in review_validation_results:
+        if errors and invalid_market_review_is_superseded(
+            review_row,
+            all_review_rows,
+            original,
+            price_recompute_enforce_from_date=price_recompute_enforce_from_date,
+            as_of=parse_date(cutoff),
+        ):
+            superseded_v2_review_errors.extend(errors)
+        else:
+            v2_review_errors.extend(errors)
     v2_duplicate_ids = sorted(
         prediction_id
         for prediction_id in duplicate_original_ids
@@ -1197,10 +1283,6 @@ def audit_prediction_records(
         prediction_id
         for prediction_id, original in matured_v2.items()
         if not review_is_valid_for_resolution(original, reviews.get(prediction_id))
-    )
-    price_recompute_enforce_from_date = str(
-        (review_policy or {}).get("market_resolution_price_recompute_enforce_from_date")
-        or DEFAULT_MARKET_PRICE_RECOMPUTE_ENFORCE_FROM
     )
     mapping_metrics = market_mapping_metrics(
         records,
@@ -1290,6 +1372,7 @@ def audit_prediction_records(
             "valid_prediction_count": len(v2_applicable) - len({error.split(":", 1)[0] for error in v2_errors}),
             "errors": v2_errors,
             "review_errors": v2_review_errors,
+            "superseded_review_errors": superseded_v2_review_errors,
         },
         "operational_errors": operational_errors,
         "operational_passed": not operational_errors,
@@ -1375,9 +1458,11 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
         return {
             "path": str(report_path),
             "exists": False,
+            "enforced": enforce,
             "errors": ["dated report is missing"],
             "warnings": [],
-            "passed": False,
+            "passed": not enforce,
+            "would_pass_if_enforced": False,
         }
     text = report_path.read_text(encoding="utf-8")
     research_policy = policy if isinstance(policy.get("quality_gate"), dict) else {}

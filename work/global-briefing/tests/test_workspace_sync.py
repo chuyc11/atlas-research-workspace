@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -302,6 +303,7 @@ class WorkspaceSyncTests(unittest.TestCase):
     def test_mark_deployed_clears_matching_pending_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             state_path = Path(temporary) / "site-sync-state.json"
+            verification_path = Path(temporary) / "production-verification.json"
             state_path.write_text(
                 json.dumps(
                     {
@@ -313,9 +315,38 @@ class WorkspaceSyncTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
+            current_payload = SITE_SYNC.load_json(SITE_SYNC.SITE_DATA, {})
+            verified_at = datetime.now(timezone.utc).isoformat()
+            verification_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "checked_at": verified_at,
+                        "deployment_url": "https://example.com",
+                        "expected_content_hash": "abc",
+                        "site_payload_sha256": SITE_SYNC.payload_sha256(current_payload),
+                        "source_isolation": {"passed": True},
+                        "live": {"passed": True},
+                        "passed": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
             with (
                 patch.object(SITE_SYNC, "STATE_FILE", state_path),
-                patch.object(sys, "argv", ["sync_briefing_site.py", "--mark-deployed", "abc", "--deployment-url", "https://example.com"]),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "sync_briefing_site.py",
+                        "--mark-deployed",
+                        "abc",
+                        "--deployment-url",
+                        "https://example.com",
+                        "--verification-artifact",
+                        str(verification_path),
+                    ],
+                ),
                 redirect_stdout(StringIO()),
             ):
                 self.assertEqual(SITE_SYNC.main(), 0)
@@ -327,6 +358,34 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertNotIn("pending_sha", state)
         self.assertNotIn("pending_report", state)
         self.assertNotIn("pending_date", state)
+        self.assertEqual(state["last_deployment_verified_at"], verified_at)
+
+    def test_mark_deployed_rejects_missing_production_verification(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            state_path = Path(temporary) / "site-sync-state.json"
+            state_path.write_text(json.dumps({"pending_sha": "abc"}), encoding="utf-8")
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "sync_briefing_site.py",
+                        "--mark-deployed",
+                        "abc",
+                        "--deployment-url",
+                        "https://example.com",
+                        "--verification-artifact",
+                        str(Path(temporary) / "missing.json"),
+                    ],
+                ),
+                redirect_stdout(StringIO()),
+            ):
+                self.assertEqual(SITE_SYNC.main(), 2)
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertNotIn("last_deployed_sha", state)
 
     @requires_runtime_report("2026-07-12")
     def test_payload_identity_detects_telemetry_changes_without_changing_content_identity(self) -> None:
