@@ -4,8 +4,10 @@ import argparse
 import contextlib
 import io
 import json
+import subprocess
 import tempfile
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
@@ -174,6 +176,149 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertEqual(second["audit"]["source_counts"]["global_briefing_temp_orders"], 1)
         self.assertTrue(second["audit"]["reconciliation"]["passed"])
 
+    def test_raw_virtual_source_rejects_nested_broker_keys_before_canonicalization(self) -> None:
+        trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
+        trade = json.loads(trades_path.read_text(encoding="utf-8").splitlines()[0])
+        trade["metadata"] = {"execution": {"broker_order_id": "REAL-ORDER-1"}}
+        write_jsonl(trades_path, [trade])
+
+        with patch.object(
+            atlas,
+            "canonicalize_global_paper_trade",
+            wraps=atlas.canonicalize_global_paper_trade,
+        ) as canonicalize:
+            failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertEqual(canonicalize.call_count, 0)
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        self.assertTrue(
+            any(
+                "metadata.execution.broker_order_id" in reason
+                for reason in failed["audit"]["blocking_reasons"]
+            )
+        )
+        self.assertFalse((self.ledger_root / "atlas_virtual_execution_ledger.jsonl").exists())
+
+    def test_false_raw_safety_declaration_is_not_overwritten(self) -> None:
+        orders_path = self.briefing / "data" / "temp-orders-2026-07-10.json"
+        payload = json.loads(orders_path.read_text(encoding="utf-8"))
+        payload["orders"][0]["no_real_broker_order"] = False
+        write_json(orders_path, payload)
+
+        with patch.object(
+            atlas,
+            "canonicalize_temp_order_intent",
+            wraps=atlas.canonicalize_temp_order_intent,
+        ) as canonicalize:
+            failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertEqual(canonicalize.call_count, 0)
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertTrue(
+            any(
+                "no_real_broker_order=False" in reason
+                for reason in failed["audit"]["blocking_reasons"]
+            )
+        )
+        raw_event = atlas.canonicalize_temp_order_intent(payload["orders"][0], orders_path, 1)
+        self.assertFalse(raw_event["no_real_broker_order"])
+
+    def test_raw_safety_audit_normalizes_camel_case_and_separator_variants(self) -> None:
+        orders_path = self.briefing / "data" / "temp-orders-2026-07-10.json"
+        payload = json.loads(orders_path.read_text(encoding="utf-8"))
+        payload["orders"][0].update(
+            {
+                "paperTradingOnly": False,
+                "live-Trading": True,
+                "metadata": {"brokerOrderId": "REAL-ORDER-1"},
+            }
+        )
+        write_json(orders_path, payload)
+
+        with patch.object(
+            atlas,
+            "canonicalize_temp_order_intent",
+            wraps=atlas.canonicalize_temp_order_intent,
+        ) as canonicalize:
+            failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        reasons = "\n".join(failed["audit"]["blocking_reasons"])
+        self.assertEqual(canonicalize.call_count, 0)
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertIn("paperTradingOnly=False", reasons)
+        self.assertIn("live-Trading=True", reasons)
+        self.assertIn("metadata.brokerOrderId", reasons)
+
+    def test_invalid_or_negative_ledger_numbers_fail_closed(self) -> None:
+        replay_path = next(
+            (self.trading / "data" / "replays" / "global_briefing" / "trades").glob("*.jsonl")
+        )
+        replay = json.loads(replay_path.read_text(encoding="utf-8").splitlines()[0])
+        replay["fee"] = "oops"
+        write_jsonl(replay_path, [replay])
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        reasons = "\n".join(failed["audit"]["blocking_reasons"])
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        self.assertIn("fee='oops'", reasons)
+        with self.assertRaisesRegex(ValueError, "invalid ledger number"):
+            atlas.maybe_float("oops")
+
+        event = atlas.canonicalize_global_paper_trade(
+            json.loads(
+                (self.briefing / "data" / "paper_trades_us.jsonl")
+                .read_text(encoding="utf-8")
+                .splitlines()[0]
+            ),
+            self.briefing / "data" / "paper_trades_us.jsonl",
+            1,
+            "global_briefing_paper_us",
+        )
+        event.update({"fee": -1, "tax": -2, "notional": -20})
+        audit = atlas.audit_virtual_execution_ledger([event], {})
+        audit_reasons = "\n".join(audit["blocking_reasons"])
+        self.assertIn("negative fee", audit_reasons)
+        self.assertIn("negative tax", audit_reasons)
+        self.assertIn("negative notional", audit_reasons)
+
+    def test_raw_virtual_source_rejects_nonfinite_numeric_strings(self) -> None:
+        trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
+        trade = json.loads(trades_path.read_text(encoding="utf-8").splitlines()[0])
+        trade["price"] = "NaN"
+        write_jsonl(trades_path, [trade])
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        self.assertTrue(
+            any(
+                "non-finite numeric values" in reason and "price='NaN'" in reason
+                for reason in failed["audit"]["blocking_reasons"]
+            )
+        )
+
+    def test_raw_account_snapshot_rejects_nested_broker_fields(self) -> None:
+        portfolio_path = self.briefing / "data" / "paper_portfolio_us.json"
+        portfolio = json.loads(portfolio_path.read_text(encoding="utf-8"))
+        portfolio["positions"]["NASDAQ:TEST"]["routing"] = {"broker_account": "REAL-ACCOUNT"}
+        write_json(portfolio_path, portfolio)
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertTrue(
+            any(
+                "positions.NASDAQ:TEST.routing.broker_account" in reason
+                for reason in failed["audit"]["blocking_reasons"]
+            )
+        )
+        with self.assertRaisesRegex(ValueError, "broker_account"):
+            atlas.load_virtual_account_snapshots()
+
     def test_previous_canonical_source_mutation_fails_closed(self) -> None:
         first = atlas.build_virtual_execution_ledger(write_files=True)
         ledger_path = Path(first["ledger_path"])
@@ -273,6 +418,12 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertEqual(payload["ledger"]["event_count"], 3)
         cycle_state = json.loads((self.runtime / "cycle_state.json").read_text(encoding="utf-8"))
         self.assertTrue(Path(cycle_state["last_history_json"]).exists())
+        self.assertTrue(cycle_state["operational_gate_passed"])
+        self.assertFalse(cycle_state["release_candidate_passed"])
+        self.assertEqual(cycle_state["blocking_reasons"], [])
+        self.assertTrue(payload["release_candidate_evidence"]["sync_passed"])
+        self.assertTrue(payload["release_candidate_evidence"]["canonical_ledger_write_performed"])
+        self.assertTrue(payload["release_candidate_evidence"]["required_stages_passed"])
         self.assertEqual(payload["audit_chain"]["entry_sha256"], atlas.audit_record_hash(payload))
         self.assertTrue(atlas.audit_cycle_history(Path(cycle_state["last_history_json"]).parent)["passed"])
         workspace_lock = json.loads((self.runtime / "workspace-lock.json").read_text(encoding="utf-8"))
@@ -321,6 +472,228 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertFalse(payload["ledger"]["write_performed"])
         self.assertTrue(payload["boundary"]["canonical_write_blocked_by_upstream_gate"])
         self.assertFalse((self.ledger_root / "atlas_virtual_execution_ledger.jsonl").exists())
+
+    def test_skip_sync_blocks_operational_and_release_gates_and_persists_state(self) -> None:
+        args = argparse.Namespace(
+            date="2026-07-10",
+            dry_run=False,
+            force=False,
+            force_site=False,
+            skip_sync=True,
+            skip_tests=False,
+            skip_site=False,
+            skip_trading_core=False,
+            full_tests=True,
+        )
+        replay_shadow = {
+            "overall_passed": True,
+            "safety_gate_passed": True,
+            "strategy_evidence_passed": True,
+            "replay": {"passed": True, "strategy_evidence_passed": True},
+            "shadow_promotion_gate": {
+                "passed": True,
+                "evidence_passed": True,
+                "payload": {"auto_applied": False, "recommended_state": "shadow"},
+            },
+        }
+        with (
+            patch.object(atlas, "doctor_checks", return_value=[atlas.Check("Python", "ok", "3.12")]),
+            patch.object(atlas, "command_sync", return_value=0) as sync,
+            patch.object(atlas, "run_replay_shadow_validation", return_value=replay_shadow),
+            patch.object(atlas, "command_test", return_value=0),
+            patch.object(
+                atlas,
+                "build_workspace_lock",
+                return_value={"release_reproducible": True, "repositories": []},
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(atlas.command_cycle(args), 1)
+
+        sync.assert_not_called()
+        payload = json.loads(
+            (self.runtime / "run_audits" / "atlas-cycle-2026-07-10.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertFalse(payload["operational_gate_passed"])
+        self.assertFalse(payload["release_candidate_passed"])
+        self.assertIn("sync stage was skipped", payload["blocking_reasons"])
+        self.assertFalse(payload["release_candidate_evidence"]["sync_passed"])
+        self.assertFalse(payload["release_candidate_evidence"]["canonical_ledger_write_performed"])
+        self.assertFalse(payload["release_candidate_evidence"]["required_stages_passed"])
+        cycle_state = json.loads((self.runtime / "cycle_state.json").read_text(encoding="utf-8"))
+        self.assertFalse(cycle_state["operational_gate_passed"])
+        self.assertFalse(cycle_state["release_candidate_passed"])
+        self.assertEqual(cycle_state["blocking_reasons"], payload["blocking_reasons"])
+
+    def test_release_required_stages_must_all_pass(self) -> None:
+        stages = [{"name": name, "status": "passed"} for name in atlas.RELEASE_REQUIRED_STAGES]
+        self.assertTrue(atlas.required_cycle_stages_passed(stages))
+        stages[-1]["status"] = "blocked"
+        self.assertFalse(atlas.required_cycle_stages_passed(stages))
+
+    def test_git_release_ready_requires_fetchable_remote(self) -> None:
+        git = atlas.shutil.which("git")
+        self.assertIsNotNone(git)
+        repository = self.root / "repository"
+        repository.mkdir()
+
+        def run_git(*arguments: str, cwd: Path = repository) -> None:
+            subprocess.run(
+                [str(git), *arguments],
+                cwd=cwd,
+                check=True,
+                text=True,
+                encoding="utf-8",
+                capture_output=True,
+            )
+
+        run_git("init")
+        run_git("config", "user.name", "ATLAS Test")
+        run_git("config", "user.email", "atlas@example.invalid")
+        (repository / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        run_git("add", "tracked.txt")
+        run_git("commit", "-m", "initial")
+        run_git("remote", "add", "origin", str(self.root / "missing-remote.git"))
+
+        dead_remote = atlas.git_repository_provenance("test", repository)
+
+        self.assertTrue(dead_remote["available"])
+        self.assertTrue(dead_remote["clean"])
+        self.assertEqual(dead_remote["remote_names"], ["origin"])
+        self.assertFalse(dead_remote["remote_fetchable"])
+        self.assertFalse(dead_remote["release_ready"])
+        self.assertFalse(dead_remote["remote_probes"][0]["fetchable"])
+        self.assertNotIn("missing-remote.git", json.dumps(dead_remote))
+
+        working_remote = self.root / "working-remote.git"
+        run_git("init", "--bare", str(working_remote), cwd=self.root)
+        run_git("remote", "set-url", "origin", str(working_remote))
+
+        unpublished_head = atlas.git_repository_provenance("test", repository)
+
+        self.assertFalse(unpublished_head["remote_fetchable"])
+        self.assertFalse(unpublished_head["remote_probes"][0]["head_advertised"])
+        self.assertFalse(unpublished_head["release_ready"])
+
+        run_git("push", "origin", "HEAD:refs/heads/main")
+        fetchable_remote = atlas.git_repository_provenance("test", repository)
+
+        self.assertTrue(fetchable_remote["remote_fetchable"])
+        self.assertEqual(fetchable_remote["fetchable_remote_names"], ["origin"])
+        self.assertTrue(fetchable_remote["remote_probes"][0]["head_advertised"])
+        self.assertTrue(fetchable_remote["release_ready"])
+
+    def test_workspace_lock_hash_excludes_generated_at(self) -> None:
+        def provenance(name: str, path: Path) -> dict:
+            return {
+                "name": name,
+                "path": str(path),
+                "available": True,
+                "clean": True,
+                "commit": "a" * 40,
+                "remote_fetchable": True,
+                "release_ready": True,
+            }
+
+        with (
+            patch.object(atlas, "git_repository_provenance", side_effect=provenance),
+            patch.object(
+                atlas,
+                "utc_now",
+                side_effect=["2026-07-10T00:00:00Z", "2026-07-10T00:00:01Z"],
+            ),
+        ):
+            first = atlas.build_workspace_lock()
+            second = atlas.build_workspace_lock()
+
+        self.assertNotEqual(first["generated_at"], second["generated_at"])
+        self.assertEqual(first["content_sha256"], second["content_sha256"])
+
+    def test_cycle_idempotency_is_bound_to_workspace_commits(self) -> None:
+        args = argparse.Namespace(
+            date="2026-07-10",
+            dry_run=False,
+            force=False,
+            force_site=False,
+            skip_sync=False,
+            skip_tests=False,
+            skip_site=True,
+            skip_trading_core=True,
+            full_tests=False,
+        )
+        replay_shadow = {
+            "overall_passed": True,
+            "safety_gate_passed": True,
+            "strategy_evidence_passed": False,
+            "replay": {"passed": True},
+            "shadow_promotion_gate": {"passed": True, "payload": {}},
+        }
+
+        with (
+            patch.object(atlas, "doctor_checks", return_value=[atlas.Check("Python", "ok", "3.12")]),
+            patch.object(atlas, "command_sync", return_value=0),
+            patch.object(atlas, "run_replay_shadow_validation", return_value=replay_shadow),
+            patch.object(atlas, "command_test", return_value=0),
+            patch.object(
+                atlas,
+                "build_workspace_lock",
+                side_effect=[
+                    {"content_sha256": "a" * 64, "release_reproducible": False, "repositories": []},
+                    {"content_sha256": "b" * 64, "release_reproducible": False, "repositories": []},
+                ],
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(atlas.command_cycle(args), 0)
+            first_state = json.loads((self.runtime / "cycle_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(atlas.command_cycle(args), 0)
+
+        second_state = json.loads((self.runtime / "cycle_state.json").read_text(encoding="utf-8"))
+        second_audit = json.loads(Path(second_state["last_audit_json"]).read_text(encoding="utf-8"))
+        self.assertNotEqual(first_state["idempotency_key"], second_state["idempotency_key"])
+        self.assertEqual(second_state["workspace_lock_content_sha256"], "b" * 64)
+        self.assertFalse(second_audit["idempotent_replay"])
+
+    def test_configured_report_date_uses_briefing_timezone(self) -> None:
+        settings = self.root / "settings.json"
+        write_json(settings, {"timezone": "Asia/Shanghai"})
+
+        current = atlas.configured_report_date(
+            datetime(2026, 7, 16, 16, 30, tzinfo=UTC),
+            settings_path=settings,
+        )
+
+        self.assertEqual(current.isoformat(), "2026-07-17")
+
+    def test_doctor_node_version_matches_site_and_includes_root_repository(self) -> None:
+        def which(command: str) -> str | None:
+            return "node" if command == "node" else None
+
+        def capture_for(node_version: str):
+            def capture(
+                command: list[str],
+                **_kwargs: object,
+            ) -> subprocess.CompletedProcess[str]:
+                stdout = node_version if command[-1] == "--version" else "ok"
+                return subprocess.CompletedProcess(command, 0, stdout=stdout, stderr="")
+
+            return capture
+
+        for version, expected_status in (("v22.14.0", "error"), ("v22.15.0", "ok")):
+            with self.subTest(version=version):
+                with (
+                    patch.object(atlas.shutil, "which", side_effect=which),
+                    patch.object(atlas, "capture_command", side_effect=capture_for(version)),
+                    patch.object(atlas.importlib.util, "find_spec", return_value=object()),
+                ):
+                    checks = atlas.doctor_checks()
+
+                node_check = next(check for check in checks if check.name == "Node.js")
+                self.assertEqual(node_check.status, expected_status)
+                self.assertIn("required>=22.15.0", node_check.detail)
+                self.assertIn("root repository", {check.name for check in checks})
 
     def test_heal_command_routes_safe_flags_to_control_plane(self) -> None:
         args = argparse.Namespace(

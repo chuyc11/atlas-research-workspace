@@ -5,6 +5,7 @@ import json
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -318,6 +319,7 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertTrue(audit["enforced"])
         self.assertFalse(audit["passed"])
         self.assertIn("dated report is missing", payload["blocking_reasons"])
+        self.assertIsNone(payload["report_sha256"])
 
     def test_report_gate_applies_five_layer_and_source_roles_only_to_marked_core_stories(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -353,6 +355,84 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertEqual(result["source_role_coverage_pct"], 100.0)
         self.assertTrue(result["all_core_stories_passed"])
 
+    def test_report_gate_cannot_split_one_host_with_userinfo_or_ports(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.md"
+            path.write_text(
+                "## 2026-07-15 每日全球晨间简报\n"
+                "## 核心摘要\n## 昨日预测复盘\n## 今日预测与市场映射\n## 风险信号\n## 来源与质量\n"
+                "## 政治与外交\n### 核心主线：域名不可伪造拆分\n"
+                "- **结论：** x\n- **硬证据：** x\n- **机制：** x\n- **反证：** x\n- **证伪：** x\n"
+                "- **证据角色：** 一手来源=[A](https://agency.gov/a); "
+                "事件地区来源=[B](https://agency.gov:443/b); "
+                "外部核验=[C](https://user@agency.gov/c)\n",
+                encoding="utf-8",
+            )
+            policy = {
+                "story_evidence_enforce_from_date": "2026-07-15",
+                "primary_thesis_min_items": 1,
+                "primary_thesis_max_items": 5,
+                "minimum_sources_per_core_story": 3,
+                "minimum_independent_domains_per_core_story": 3,
+                "require_primary_source_for_high_impact_story": True,
+                "quality_gate": {
+                    "minimum_report_characters": 10,
+                    "maximum_report_characters": 10000,
+                    "minimum_distinct_links": 3,
+                    "minimum_distinct_domains": 3,
+                    "primary_domain_suffixes": [".gov"],
+                },
+            }
+
+            result = MODULE.audit_report(path, policy, enforce=True)
+
+        story = result["core_story_audits"][0]
+        self.assertFalse(result["passed"])
+        self.assertEqual(story["independent_domain_count"], 1)
+        self.assertEqual(story["independent_source_family_count"], 1)
+        self.assertFalse(story["role_coverage"]["primary"])
+        self.assertFalse(story["role_coverage"]["event_region"])
+        self.assertFalse(story["role_coverage"]["external_verification"])
+        self.assertFalse(MODULE.direct_auditable_url("https://user@agency.gov/c"))
+        self.assertFalse(MODULE.direct_auditable_url("https://agency.gov:444/c"))
+        self.assertTrue(MODULE.direct_auditable_url("https://agency.gov:443/c"))
+
+    def test_report_gate_rejects_unassigned_body_links_as_evidence_roles(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.md"
+            path.write_text(
+                "## 2026-07-15 每日全球晨间简报\n"
+                "## 核心摘要\n## 昨日预测复盘\n## 今日预测与市场映射\n## 风险信号\n## 来源与质量\n"
+                "## 政治与外交\n### 核心主线：角色不可由正文链接代替\n"
+                "- **结论：** x\n- **硬证据：** x\n- **机制：** x\n- **反证：** x\n- **证伪：** x\n"
+                "- **证据角色：** 一手来源=[Gov](https://agency.gov/release); 事件地区来源=无; 外部核验=无\n"
+                "正文另有两个链接，但未被明确分配证据角色。[Local](https://local.example/story) "
+                "[Wire](https://wire.example/check)\n",
+                encoding="utf-8",
+            )
+            policy = {
+                "story_evidence_enforce_from_date": "2026-07-15",
+                "primary_thesis_min_items": 1,
+                "primary_thesis_max_items": 5,
+                "minimum_sources_per_core_story": 3,
+                "minimum_independent_domains_per_core_story": 2,
+                "require_primary_source_for_high_impact_story": True,
+                "quality_gate": {
+                    "minimum_report_characters": 10,
+                    "maximum_report_characters": 10000,
+                    "minimum_distinct_links": 3,
+                    "minimum_distinct_domains": 3,
+                    "primary_domain_suffixes": [".gov"],
+                },
+            }
+            result = MODULE.audit_report(path, policy, enforce=True)
+
+        self.assertFalse(result["passed"])
+        self.assertIn(
+            "missing linked evidence roles: event_region, external_verification",
+            result["core_story_audits"][0]["errors"],
+        )
+
     def test_storage_rejects_noncompliant_post_enforcement_prediction_before_append(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -375,6 +455,27 @@ class ResearchQualityTests(unittest.TestCase):
                     STORE.append_prediction_records(input_path, "2026-07-12", predictions)
 
             self.assertEqual(predictions.read_text(encoding="utf-8"), "")
+
+    def test_storage_rejects_nonstandard_nan_before_prediction_validation(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            predictions = root / "predictions.jsonl"
+            predictions.write_text("", encoding="utf-8")
+            input_path = root / "input.json"
+            input_path.write_text('{"prediction_id":"P1","probability":NaN}', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "non-standard numeric constant NaN"):
+                STORE.append_prediction_records(input_path, "2026-07-12", predictions)
+
+            self.assertEqual(predictions.read_text(encoding="utf-8"), "")
+
+    def test_quality_reader_rejects_nonstandard_numeric_constants(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            predictions = Path(directory) / "predictions.jsonl"
+            predictions.write_text('{"prediction_id":"P1","probability":NaN}\n', encoding="utf-8")
+
+            with self.assertRaisesRegex(ValueError, "non-standard numeric constant NaN"):
+                MODULE.read_jsonl(predictions)
 
     def test_storage_allows_legacy_review_after_v2_enforcement(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -415,6 +516,67 @@ class ResearchQualityTests(unittest.TestCase):
             self.assertEqual(count, 1)
             self.assertEqual(len(predictions.read_text(encoding="utf-8").splitlines()), 2)
 
+    def test_storage_rejects_payload_date_that_differs_from_run_date(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            predictions = root / "predictions.jsonl"
+            predictions.write_text("", encoding="utf-8")
+            settings = root / "settings.json"
+            settings.write_text(
+                json.dumps({"prediction_contract": {"enforce_from_date": "2026-07-12"}}),
+                encoding="utf-8",
+            )
+            input_path = root / "input.json"
+            input_path.write_text(
+                json.dumps({
+                    "prediction_id": "BACKDATED",
+                    "date": "2026-07-11",
+                    "status": "open",
+                    "scenario": "legacy contract bypass",
+                }),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(STORE, "DEFAULT_SETTINGS", settings),
+                patch.object(STORE, "ensure_files", side_effect=lambda **_: None),
+            ):
+                with self.assertRaisesRegex(ValueError, "must equal run date"):
+                    STORE.append_prediction_records(input_path, "2026-07-17", predictions)
+
+            self.assertEqual(predictions.read_text(encoding="utf-8"), "")
+
+    def test_storage_serializes_concurrent_idempotent_appends(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            predictions = root / "predictions.jsonl"
+            predictions.write_text("", encoding="utf-8")
+            settings = root / "settings.json"
+            settings.write_text(
+                json.dumps({"prediction_contract": {"enforce_from_date": "2026-07-12"}}),
+                encoding="utf-8",
+            )
+            first = root / "first.json"
+            second = root / "second.json"
+            payload = v2_prediction()
+            first.write_text(json.dumps(payload), encoding="utf-8")
+            second.write_text(json.dumps(payload), encoding="utf-8")
+
+            def append(path: Path) -> int:
+                return STORE.append_prediction_records(path, "2026-07-12", predictions)
+
+            with (
+                patch.object(STORE, "DEFAULT_SETTINGS", settings),
+                patch.object(STORE, "ensure_files", side_effect=lambda **_: None),
+                ThreadPoolExecutor(max_workers=2) as executor,
+            ):
+                counts = sorted(executor.map(append, (first, second)))
+
+            self.assertEqual(counts, [0, 1])
+            rows = [json.loads(line) for line in predictions.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["prediction_id"], payload["prediction_id"])
+
     def test_due_review_queue_scans_full_ledger_and_does_not_close_same_day_early(self) -> None:
         overdue = v2_prediction("2026-07-11-P01")
         overdue["date"] = "2026-07-11"
@@ -431,6 +593,21 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertEqual(queue["counts"]["matures_today"], 1)
         self.assertEqual(queue["counts"]["open_not_due"], 1)
         self.assertEqual(queue["due_reviews"][0]["prediction_id"], "2026-07-11-P01")
+
+    def test_due_review_queue_uses_one_canonical_row_per_prediction_id(self) -> None:
+        first = v2_prediction("2026-07-11-P01")
+        first["date"] = "2026-07-11"
+        first["deadline"] = "2026-07-12"
+        first["market_mapping"][0]["evaluation_deadline"] = "2026-07-12"
+        duplicate = dict(first)
+        duplicate["scenario"] = "conflicting duplicate that must not consume another queue slot"
+
+        queue = STORE.due_review_queue("2026-07-13", [first, duplicate])
+
+        self.assertEqual(queue["counts"]["due_reviews"], 1)
+        self.assertEqual(queue["counts"]["duplicate_original_ids"], 1)
+        self.assertEqual(queue["due_reviews"][0]["prediction_id"], "2026-07-11-P01")
+        self.assertEqual(queue["due_reviews"][0]["duplicate_original_count"], 2)
 
     def test_due_review_queue_keeps_invalid_early_review_open_but_skips_mature_review(self) -> None:
         original = v2_prediction()
@@ -609,6 +786,7 @@ class ResearchQualityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             report = Path(directory) / "report.md"
             report.write_text("## 2026-07-15 每日全球晨间简报\n修订日期：2026-07-16\n", encoding="utf-8")
+            report_sha256 = MODULE.hashlib.sha256(report.read_bytes()).hexdigest()
             payload = MODULE.build_quality_report(
                 date="2026-07-15",
                 evaluation_cutoff="2026-07-16",
@@ -627,6 +805,7 @@ class ResearchQualityTests(unittest.TestCase):
             )
 
         self.assertTrue(payload["revised"])
+        self.assertEqual(payload["report_sha256"], report_sha256)
         self.assertEqual(payload["evaluation_cutoff"], "2026-07-16")
         self.assertTrue(payload["operational_passed"])
         self.assertFalse(payload["research_ready"])
@@ -692,6 +871,38 @@ class ResearchQualityTests(unittest.TestCase):
 
             self.assertEqual(count, 0)
             self.assertEqual(len(predictions.read_text(encoding="utf-8").splitlines()), 2)
+
+    def test_storage_rejects_conflicting_review_with_same_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = v2_prediction()
+            review = resolved_review()
+            predictions = root / "predictions.jsonl"
+            original_text = (
+                json.dumps(original, ensure_ascii=False)
+                + "\n"
+                + json.dumps(review, ensure_ascii=False)
+                + "\n"
+            )
+            predictions.write_text(original_text, encoding="utf-8")
+            conflicting = json.loads(json.dumps(review))
+            conflicting["review"]["notes"] = "same identity, different evidence"
+            input_path = root / "review.json"
+            input_path.write_text(json.dumps(conflicting, ensure_ascii=False), encoding="utf-8")
+            settings = root / "settings.json"
+            settings.write_text(
+                json.dumps({"prediction_contract": {"enforce_from_date": "2026-07-12"}}),
+                encoding="utf-8",
+            )
+
+            with (
+                patch.object(STORE, "DEFAULT_SETTINGS", settings),
+                patch.object(STORE, "ensure_files", side_effect=lambda **_: None),
+            ):
+                with self.assertRaisesRegex(ValueError, "already exists with different content"):
+                    STORE.append_prediction_records(input_path, "2026-07-14", predictions)
+
+            self.assertEqual(predictions.read_text(encoding="utf-8"), original_text)
 
     def test_unresolved_matured_v2_blocks_only_after_deadline_day(self) -> None:
         original = v2_prediction()

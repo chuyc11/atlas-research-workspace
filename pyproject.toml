@@ -8,10 +8,14 @@ version = "0.1.0"
 description = "Unified command surface for the global briefing, trading research core, and ATLAS site."
 readme = "README.md"
 requires-python = ">=3.11"
+dependencies = [
+  "cryptography==48.0.1",
+]
 
 [project.optional-dependencies]
 dev = [
   "defusedxml==0.7.1",
+  "cryptography==48.0.1",
   "bandit==1.9.4",
   "detect-secrets==1.5.0",
   "pip-audit==2.10.1",

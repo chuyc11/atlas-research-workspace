@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
@@ -17,12 +18,14 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date as Date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
 ROOT = Path(__file__).resolve().parent
 BRIEFING_ROOT = ROOT / "work" / "global-briefing"
 TRADING_ROOT = ROOT / "work" / "trading-core"
 SITE_ROOT = ROOT / "src"
+BRIEFING_SETTINGS_PATH = BRIEFING_ROOT / "config" / "settings.json"
 OUTPUTS_ROOT = ROOT / "outputs"
 ATLAS_RUNTIME_ROOT = ROOT / "work" / "shared" / "atlas"
 VIRTUAL_LEDGER_ROOT = ATLAS_RUNTIME_ROOT / "virtual_execution"
@@ -37,6 +40,16 @@ REPLAY_EVALUATION_PATTERN = re.compile(
 )
 LEDGER_ID = "atlas-virtual-execution-ledger-v1"
 LEDGER_SCHEMA_VERSION = 1
+GIT_REMOTE_PROBE_TIMEOUT_SECONDS = 5
+MINIMUM_NODE_VERSION = (22, 15, 0)
+RELEASE_REQUIRED_STAGES = (
+    "doctor",
+    "sync",
+    "canonical_virtual_ledger_audit",
+    "replay_shadow_gate",
+    "targeted_integration_tests",
+    "canonical_virtual_ledger_commit",
+)
 FORBIDDEN_LEDGER_KEYS = {
     "broker_order_id",
     "broker_account",
@@ -44,6 +57,50 @@ FORBIDDEN_LEDGER_KEYS = {
     "live_order_id",
     "external_order_id",
     "real_order_id",
+}
+SAFETY_FLAGS_REQUIRED_TRUE = {
+    "paper_trading_only",
+    "no_real_broker_order",
+}
+SAFETY_FLAGS_REQUIRED_FALSE = {
+    "external_broker_connection",
+    "live_trading",
+    "real_broker_orders_allowed",
+}
+NORMALIZED_FORBIDDEN_LEDGER_KEYS = {
+    re.sub(r"[^a-z0-9]", "", key.casefold()) for key in FORBIDDEN_LEDGER_KEYS
+}
+NORMALIZED_SAFETY_FLAGS_REQUIRED_TRUE = {
+    re.sub(r"[^a-z0-9]", "", key.casefold()) for key in SAFETY_FLAGS_REQUIRED_TRUE
+}
+NORMALIZED_SAFETY_FLAGS_REQUIRED_FALSE = {
+    re.sub(r"[^a-z0-9]", "", key.casefold()) for key in SAFETY_FLAGS_REQUIRED_FALSE
+}
+NORMALIZED_LEDGER_NUMERIC_KEYS = {
+    "cash",
+    "cashafter",
+    "equity",
+    "equityafter",
+    "fee",
+    "filledprice",
+    "filledquantity",
+    "grossvalue",
+    "initialcash",
+    "notional",
+    "price",
+    "quantity",
+    "realizedpnl",
+    "tax",
+}
+NORMALIZED_NON_NEGATIVE_LEDGER_NUMERIC_KEYS = {
+    "fee",
+    "filledprice",
+    "filledquantity",
+    "grossvalue",
+    "notional",
+    "price",
+    "quantity",
+    "tax",
 }
 
 
@@ -91,6 +148,7 @@ def capture_command(
     *,
     cwd: Path = ROOT,
     trading_core: bool = False,
+    timeout: float | None = None,
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         list(command),
@@ -100,7 +158,65 @@ def capture_command(
         encoding="utf-8",
         errors="replace",
         capture_output=True,
+        timeout=timeout,
     )
+
+
+def probe_git_remotes(
+    git: str,
+    path: Path,
+    remote_names: Sequence[str],
+    *,
+    head_commit: str,
+) -> dict[str, Any]:
+    """Verify that the exact local HEAD is advertised by at least one configured remote."""
+    probes: list[dict[str, Any]] = []
+    for remote in remote_names:
+        try:
+            result = capture_command(
+                [git, "-c", "credential.interactive=never", "ls-remote", remote],
+                cwd=path,
+                timeout=GIT_REMOTE_PROBE_TIMEOUT_SECONDS,
+            )
+            advertised_commits = {
+                line.split()[0]
+                for line in result.stdout.splitlines()
+                if len(line.split()) >= 2 and re.fullmatch(r"[0-9a-fA-F]{40}", line.split()[0])
+            }
+            head_advertised = bool(head_commit and head_commit in advertised_commits)
+            fetchable = result.returncode == 0 and head_advertised
+            probes.append(
+                {
+                    "remote": remote,
+                    "fetchable": fetchable,
+                    "head_advertised": head_advertised,
+                    "returncode": result.returncode,
+                    "detail": (
+                        "head_advertised"
+                        if fetchable
+                        else "head_not_advertised"
+                        if result.returncode == 0
+                        else "probe_failed"
+                    ),
+                }
+            )
+        except subprocess.TimeoutExpired:
+            probes.append(
+                {
+                    "remote": remote,
+                    "fetchable": False,
+                    "returncode": None,
+                    "detail": "probe_timeout",
+                }
+            )
+    fetchable_remote_names = sorted(
+        str(probe["remote"]) for probe in probes if probe["fetchable"] is True
+    )
+    return {
+        "remote_fetchable": bool(fetchable_remote_names),
+        "fetchable_remote_names": fetchable_remote_names,
+        "remote_probes": probes,
+    }
 
 
 def component_repository_check(name: str, path: Path) -> Check:
@@ -118,7 +234,7 @@ def component_repository_check(name: str, path: Path) -> Check:
             required=False,
         )
 
-    head = capture_command([git, "rev-parse", "--short=12", "HEAD"], cwd=path)
+    head = capture_command([git, "rev-parse", "HEAD"], cwd=path)
     branch = capture_command([git, "branch", "--show-current"], cwd=path)
     status = capture_command([git, "status", "--porcelain", "--untracked-files=normal"], cwd=path)
     remotes = capture_command([git, "remote"], cwd=path)
@@ -127,13 +243,23 @@ def component_repository_check(name: str, path: Path) -> Check:
 
     dirty_count = len([line for line in status.stdout.splitlines() if line.strip()])
     remote_names = [line.strip() for line in remotes.stdout.splitlines() if line.strip()]
+    head_commit = head.stdout.strip()
+    remote_status = probe_git_remotes(git, path, remote_names, head_commit=head_commit)
     details = [
-        f"commit={head.stdout.strip() or 'unknown'}",
+        f"commit={head_commit[:12] or 'unknown'}",
         f"branch={branch.stdout.strip() or 'detached'}",
         f"worktree={'clean' if dirty_count == 0 else f'dirty({dirty_count})'}",
         f"remotes={','.join(remote_names) if remote_names else 'missing'}",
+        (
+            "fetchable_remotes="
+            + (
+                ",".join(remote_status["fetchable_remote_names"])
+                if remote_status["fetchable_remote_names"]
+                else "none"
+            )
+        ),
     ]
-    repository_ready = dirty_count == 0 and bool(remote_names)
+    repository_ready = dirty_count == 0 and remote_status["remote_fetchable"]
     return Check(
         f"{name} repository",
         "ok" if repository_ready else "warn",
@@ -153,18 +279,26 @@ def git_repository_provenance(name: str, path: Path) -> dict[str, Any]:
     commands_passed = all(result.returncode == 0 for result in (head, branch, status, remotes))
     dirty_paths = [line for line in status.stdout.splitlines() if line.strip()] if status.returncode == 0 else []
     remote_names = sorted(line.strip() for line in remotes.stdout.splitlines() if line.strip()) if remotes.returncode == 0 else []
+    head_commit = head.stdout.strip() if head.returncode == 0 else ""
+    remote_status = probe_git_remotes(git, path, remote_names, head_commit=head_commit)
     payload = {
         "name": name,
         "path": relative_path(path),
         "available": commands_passed,
-        "commit": head.stdout.strip() if head.returncode == 0 else None,
+        "commit": head_commit or None,
         "branch": branch.stdout.strip() if branch.returncode == 0 else None,
         "clean": commands_passed and not dirty_paths,
         "dirty_path_count": len(dirty_paths),
         "remote_names": remote_names,
         "remote_count": len(remote_names),
+        **remote_status,
     }
-    payload["release_ready"] = bool(payload["available"] and payload["clean"] and payload["commit"] and remote_names)
+    payload["release_ready"] = bool(
+        payload["available"]
+        and payload["clean"]
+        and payload["commit"]
+        and payload["remote_fetchable"]
+    )
     return payload
 
 
@@ -180,7 +314,9 @@ def build_workspace_lock() -> dict[str, Any]:
         "repositories": repositories,
         "release_reproducible": all(repository["release_ready"] for repository in repositories),
     }
-    payload["content_sha256"] = stable_hash(payload)
+    payload["content_sha256"] = stable_hash(
+        {key: value for key, value in payload.items() if key != "generated_at"}
+    )
     return payload
 
 
@@ -233,7 +369,13 @@ def utc_now() -> str:
 
 
 def stable_json(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def stable_hash(payload: Any) -> str:
@@ -257,18 +399,52 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
-    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(
+        path,
+        json.dumps(payload, allow_nan=False, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def atomic_write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
-    text = "".join(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n" for row in rows)
+    text = "".join(
+        json.dumps(row, allow_nan=False, ensure_ascii=False, sort_keys=True) + "\n"
+        for row in rows
+    )
     atomic_write_text(path, text)
+
+
+def strict_json_loads(text: str, *, source: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"{source} contains non-standard numeric constant {value}")
+
+    return json.loads(text, parse_constant=reject_constant)
 
 
 def read_json_file(path: Path, default: Any = None) -> Any:
     if not path.exists():
         return default
-    return json.loads(path.read_text(encoding="utf-8"))
+    return strict_json_loads(path.read_text(encoding="utf-8"), source=str(path))
+
+
+def configured_report_date(
+    now: datetime | None = None,
+    *,
+    settings_path: Path = BRIEFING_SETTINGS_PATH,
+) -> Date:
+    settings = read_json_file(settings_path, default={})
+    timezone_name = (
+        str(settings.get("timezone") or "Asia/Shanghai")
+        if isinstance(settings, dict)
+        else "Asia/Shanghai"
+    )
+    try:
+        timezone = ZoneInfo(timezone_name)
+    except ZoneInfoNotFoundError as exc:
+        raise ValueError(f"invalid briefing timezone: {timezone_name}") from exc
+    current = now or datetime.now(UTC)
+    if current.tzinfo is None or current.utcoffset() is None:
+        raise ValueError("report date requires a timezone-aware datetime")
+    return current.astimezone(timezone).date()
 
 
 def audit_record_hash(payload: dict[str, Any]) -> str:
@@ -327,8 +503,8 @@ def read_jsonl_file(path: Path) -> list[dict[str, Any]]:
         if not text:
             continue
         try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
+            payload = strict_json_loads(text, source=f"{path}:{line_number}")
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"{path}:{line_number}: invalid JSONL: {exc}") from exc
         if not isinstance(payload, dict):
             raise ValueError(f"{path}:{line_number}: JSONL row must be an object")
@@ -337,12 +513,23 @@ def read_jsonl_file(path: Path) -> list[dict[str, Any]]:
 
 
 def maybe_float(value: Any, default: float = 0.0) -> float:
-    if value is None or value == "":
+    if value is None:
         return default
+    if isinstance(value, bool):
+        raise ValueError("boolean values are not valid ledger numbers")
+    if isinstance(value, str) and not value.strip():
+        raise ValueError("empty strings are not valid ledger numbers")
     try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+        number = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"invalid ledger number: {value!r}") from exc
+    if not math.isfinite(number):
+        raise ValueError(f"non-finite ledger number: {value!r}")
+    return number
+
+
+def normalized_ledger_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).casefold())
 
 
 def nested_forbidden_keys(payload: Any, prefix: str = "") -> list[str]:
@@ -350,13 +537,95 @@ def nested_forbidden_keys(payload: Any, prefix: str = "") -> list[str]:
     if isinstance(payload, dict):
         for key, value in payload.items():
             path = f"{prefix}.{key}" if prefix else str(key)
-            if str(key).lower() in FORBIDDEN_LEDGER_KEYS:
+            if normalized_ledger_key(key) in NORMALIZED_FORBIDDEN_LEDGER_KEYS:
                 found.append(path)
             found.extend(nested_forbidden_keys(value, path))
     elif isinstance(payload, list):
         for index, value in enumerate(payload):
             found.extend(nested_forbidden_keys(value, f"{prefix}[{index}]"))
     return found
+
+
+def nested_unsafe_safety_declarations(payload: Any, prefix: str = "") -> list[str]:
+    found: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            normalized_key = normalized_ledger_key(key)
+            if normalized_key in NORMALIZED_SAFETY_FLAGS_REQUIRED_TRUE and value is not True:
+                found.append(f"{path}={value!r}")
+            if normalized_key in NORMALIZED_SAFETY_FLAGS_REQUIRED_FALSE and value is not False:
+                found.append(f"{path}={value!r}")
+            found.extend(nested_unsafe_safety_declarations(value, path))
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            found.extend(nested_unsafe_safety_declarations(value, f"{prefix}[{index}]"))
+    return found
+
+
+def nested_nonfinite_values(payload: Any, prefix: str = "") -> list[str]:
+    found: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            found.extend(nested_nonfinite_values(value, path))
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            found.extend(nested_nonfinite_values(value, f"{prefix}[{index}]"))
+    elif isinstance(payload, float) and not math.isfinite(payload):
+        found.append(f"{prefix}={payload!r}")
+    elif isinstance(payload, str) and payload.strip().casefold() in {
+        "nan",
+        "+nan",
+        "-nan",
+        "inf",
+        "+inf",
+        "-inf",
+        "infinity",
+        "+infinity",
+        "-infinity",
+    }:
+        found.append(f"{prefix}={payload!r}")
+    return found
+
+
+def nested_invalid_numeric_values(payload: Any, prefix: str = "") -> list[str]:
+    found: list[str] = []
+    if isinstance(payload, dict):
+        for key, value in payload.items():
+            path = f"{prefix}.{key}" if prefix else str(key)
+            normalized_key = normalized_ledger_key(key)
+            if normalized_key in NORMALIZED_LEDGER_NUMERIC_KEYS and value is not None:
+                try:
+                    number = maybe_float(value)
+                except ValueError as exc:
+                    found.append(f"{path}={value!r} ({exc})")
+                else:
+                    if normalized_key in NORMALIZED_NON_NEGATIVE_LEDGER_NUMERIC_KEYS and number < 0:
+                        found.append(f"{path}={value!r} (must be non-negative)")
+            found.extend(nested_invalid_numeric_values(value, path))
+    elif isinstance(payload, list):
+        for index, value in enumerate(payload):
+            found.extend(nested_invalid_numeric_values(value, f"{prefix}[{index}]"))
+    return found
+
+
+def raw_virtual_source_safety_errors(payload: Any, source_path: Path, record: str) -> list[str]:
+    locator = f"{relative_path(source_path)}:{record}"
+    errors: list[str] = []
+    forbidden = sorted(nested_forbidden_keys(payload))
+    if forbidden:
+        errors.append(f"{locator}: raw virtual source contains forbidden broker/live keys {forbidden}")
+    unsafe_declarations = sorted(nested_unsafe_safety_declarations(payload))
+    if unsafe_declarations:
+        errors.append(f"{locator}: raw virtual source contains unsafe safety declarations {unsafe_declarations}")
+    nonfinite = sorted(nested_nonfinite_values(payload))
+    if nonfinite:
+        errors.append(f"{locator}: raw virtual source contains non-finite numeric values {nonfinite}")
+    invalid_numeric = sorted(nested_invalid_numeric_values(payload))
+    if invalid_numeric:
+        errors.append(f"{locator}: raw virtual source contains invalid numeric values {invalid_numeric}")
+    return errors
 
 
 def is_iso_date(value: Any) -> bool:
@@ -478,9 +747,9 @@ def canonicalize_global_paper_trade(row: dict[str, Any], source_path: Path, line
         "scenario": row.get("scenario"),
         "reason": row.get("reason"),
         "risk": row.get("risk"),
-        "paper_trading_only": bool(row.get("paper_trading_only", True)),
+        "paper_trading_only": row.get("paper_trading_only", True) is True,
         "isolated_replay": False,
-        "no_real_broker_order": True,
+        "no_real_broker_order": row.get("no_real_broker_order", True) is True,
     }
 
 
@@ -522,9 +791,9 @@ def canonicalize_replay_trade(row: dict[str, Any], source_path: Path, line_numbe
         "scenario": "isolated historical replay",
         "reason": row.get("reason"),
         "risk": None,
-        "paper_trading_only": True,
+        "paper_trading_only": row.get("paper_trading_only", True) is True,
         "isolated_replay": bool(row.get("isolated", True)),
-        "no_real_broker_order": True,
+        "no_real_broker_order": row.get("no_real_broker_order", True) is True,
     }
 
 
@@ -588,13 +857,13 @@ def canonicalize_temp_order_intent(row: dict[str, Any], source_path: Path, order
         "scenario": row.get("scenario"),
         "reason": row.get("reason"),
         "risk": row.get("risk"),
-        "paper_trading_only": True,
+        "paper_trading_only": row.get("paper_trading_only", True) is True,
         "isolated_replay": False,
-        "no_real_broker_order": True,
+        "no_real_broker_order": row.get("no_real_broker_order", True) is True,
     }
 
 
-def load_virtual_account_snapshots() -> dict[str, Any]:
+def load_virtual_account_snapshots(*, source_errors: list[str] | None = None) -> dict[str, Any]:
     accounts: dict[str, Any] = {}
     for account, path in {
         "US": BRIEFING_ROOT / "data" / "paper_portfolio_us.json",
@@ -602,6 +871,12 @@ def load_virtual_account_snapshots() -> dict[str, Any]:
     }.items():
         payload = read_json_file(path, default=None)
         if isinstance(payload, dict):
+            safety_errors = raw_virtual_source_safety_errors(payload, path, "document")
+            if safety_errors:
+                if source_errors is None:
+                    raise ValueError("; ".join(safety_errors))
+                source_errors.extend(safety_errors)
+                continue
             account_id = str(payload.get("account_id") or f"global-briefing-{account.lower()}-paper-trading")
             accounts[account_id] = {
                 "source_system": "global-briefing",
@@ -613,13 +888,23 @@ def load_virtual_account_snapshots() -> dict[str, Any]:
                 "realized_pnl": maybe_float(payload.get("realized_pnl")),
                 "positions": payload.get("positions", {}),
                 "last_prices": payload.get("last_prices", {}),
-                "paper_trading_only": payload.get("mode") == "paper_trading",
+                "paper_trading_only": (
+                    payload.get("mode") == "paper_trading"
+                    and payload.get("paper_trading_only", True) is True
+                ),
+                "no_real_broker_order": payload.get("no_real_broker_order", True) is True,
             }
     replay_account_root = TRADING_ROOT / "data" / "replays" / "global_briefing" / "accounts"
     if replay_account_root.exists():
         for path in sorted(replay_account_root.glob("account-*.json")):
             payload = read_json_file(path, default=None)
             if isinstance(payload, dict):
+                safety_errors = raw_virtual_source_safety_errors(payload, path, "document")
+                if safety_errors:
+                    if source_errors is None:
+                        raise ValueError("; ".join(safety_errors))
+                    source_errors.extend(safety_errors)
+                    continue
                 account_id = str(payload.get("replay_id") or path.stem)
                 accounts[account_id] = {
                     "source_system": "trading-core",
@@ -630,7 +915,8 @@ def load_virtual_account_snapshots() -> dict[str, Any]:
                     "equity": maybe_float(payload.get("equity")),
                     "positions": payload.get("positions", []),
                     "isolated_replay": payload.get("isolated") is True,
-                    "paper_trading_only": True,
+                    "paper_trading_only": payload.get("paper_trading_only", True) is True,
+                    "no_real_broker_order": payload.get("no_real_broker_order", True) is True,
                 }
     return accounts
 
@@ -799,7 +1085,11 @@ def audit_virtual_execution_ledger(
         missing = sorted(field for field in required_trade_fields if field not in event)
         if missing:
             blocking.append(f"{event_id}: missing required fields {missing}")
-        empty = sorted(field for field in required_non_empty if event.get(field) in {None, ""})
+        empty = sorted(
+            field
+            for field in required_non_empty
+            if event.get(field) is None or event.get(field) == ""
+        )
         if empty:
             blocking.append(f"{event_id}: empty required fields {empty}")
         if event.get("ledger_id") != LEDGER_ID:
@@ -810,10 +1100,34 @@ def audit_virtual_execution_ledger(
             blocking.append(f"{event_id}: no_real_broker_order is not true")
         if str(event.get("side")).upper() not in allowed_sides:
             blocking.append(f"{event_id}: unsupported side {event.get('side')!r}")
-        if maybe_float(event.get("filled_quantity")) < 0:
+        numeric_values: dict[str, float | None] = {}
+        for field in (
+            "filled_quantity",
+            "filled_price",
+            "notional",
+            "fee",
+            "tax",
+            "cash_after",
+            "equity_after",
+        ):
+            if field not in event or event.get(field) is None:
+                numeric_values[field] = None
+                continue
+            try:
+                numeric_values[field] = maybe_float(event.get(field))
+            except ValueError as exc:
+                numeric_values[field] = None
+                blocking.append(f"{event_id}: invalid {field}: {exc}")
+        quantity = numeric_values.get("filled_quantity")
+        price = numeric_values.get("filled_price")
+        if quantity is not None and quantity < 0:
             blocking.append(f"{event_id}: negative quantity")
-        if maybe_float(event.get("filled_price")) < 0:
+        if price is not None and price < 0:
             blocking.append(f"{event_id}: negative price")
+        for field in ("notional", "fee", "tax"):
+            value = numeric_values.get(field)
+            if value is not None and value < 0:
+                blocking.append(f"{event_id}: negative {field}")
         if not is_iso_date(event.get("date")):
             blocking.append(f"{event_id}: invalid date {event.get('date')!r}")
         event_type = event.get("event_type")
@@ -822,17 +1136,17 @@ def audit_virtual_execution_ledger(
         if event_type in {"virtual_trade", "isolated_replay_trade"}:
             if str(event.get("side")).upper() not in {"BUY", "SELL"}:
                 blocking.append(f"{event_id}: filled trade must be BUY or SELL")
-            if maybe_float(event.get("filled_quantity")) <= 0 or maybe_float(event.get("filled_price")) <= 0:
+            if quantity is None or price is None or quantity <= 0 or price <= 0:
                 blocking.append(f"{event_id}: filled trade requires positive quantity and price")
         if event_type == "isolated_replay_trade" and event.get("isolated_replay") is not True:
             blocking.append(f"{event_id}: replay trade is not isolated")
         if event_type == "virtual_hold":
             if str(event.get("side")).upper() != "HOLD" or event.get("status") != "HELD":
                 blocking.append(f"{event_id}: virtual hold must use HOLD/HELD")
-            if maybe_float(event.get("filled_quantity")) != 0:
+            if quantity is None or quantity != 0:
                 blocking.append(f"{event_id}: virtual hold quantity must be zero")
         if event_type == "virtual_order_intent" and str(event.get("side")).upper() in {"BUY", "SELL"}:
-            if maybe_float(event.get("filled_quantity")) <= 0 or maybe_float(event.get("filled_price")) <= 0:
+            if quantity is None or price is None or quantity <= 0 or price <= 0:
                 blocking.append(f"{event_id}: order intent requires positive quantity and price")
         forbidden = sorted(nested_forbidden_keys(event))
         if forbidden:
@@ -842,6 +1156,8 @@ def audit_virtual_execution_ledger(
     for account_id, account in account_state.items():
         if account.get("paper_trading_only") is not True:
             blocking.append(f"account {account_id}: paper_trading_only is not true")
+        if account.get("no_real_broker_order") is not True:
+            blocking.append(f"account {account_id}: no_real_broker_order is not true")
         if account.get("virtual_account_scope") == "REPLAY" and account.get("isolated_replay") is not True:
             blocking.append(f"account {account_id}: replay account is not isolated")
         forbidden = sorted(nested_forbidden_keys(account))
@@ -935,6 +1251,10 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         rows = read_jsonl_file(path)
         expectation["expected_event_count"] = len(rows)
         for line_number, row in enumerate(rows, 1):
+            safety_errors = raw_virtual_source_safety_errors(row, path, f"line {line_number}")
+            if safety_errors:
+                source_errors.extend(safety_errors)
+                continue
             events.append(canonicalize_global_paper_trade(row, path, line_number, source_ledger))
 
     temp_order_dates: dict[str, list[Path]] = {}
@@ -954,6 +1274,10 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         if date:
             temp_order_dates.setdefault(date, []).append(path)
         for order_index, row in enumerate(rows, 1):
+            safety_errors = raw_virtual_source_safety_errors(row, path, f"order {order_index}")
+            if safety_errors:
+                source_errors.extend(safety_errors)
+                continue
             events.append(canonicalize_temp_order_intent(row, path, order_index))
     for date, paths in temp_order_dates.items():
         non_empty = [path for path in paths if load_temp_orders(path)]
@@ -978,6 +1302,10 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
                 }
             )
             for line_number, row in enumerate(rows, 1):
+                safety_errors = raw_virtual_source_safety_errors(row, path, f"line {line_number}")
+                if safety_errors:
+                    source_errors.extend(safety_errors)
+                    continue
                 events.append(canonicalize_replay_trade(row, path, line_number))
     else:
         warnings.append(f"missing replay trade source directory: {relative_path(replay_trade_root)}")
@@ -993,7 +1321,7 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
             str(event.get("ledger_event_id", "")),
         ),
     )
-    account_state = load_virtual_account_snapshots()
+    account_state = load_virtual_account_snapshots(source_errors=source_errors)
     for path in (
         BRIEFING_ROOT / "data" / "paper_portfolio_us.json",
         BRIEFING_ROOT / "data" / "paper_portfolio_china.json",
@@ -1267,8 +1595,9 @@ def doctor_checks() -> list[Check]:
     if node:
         completed = capture_command([node, "--version"])
         version = completed.stdout.strip() or completed.stderr.strip()
-        node_ok = completed.returncode == 0 and parse_version(version) >= (22, 13, 0)
-        checks.append(Check("Node.js", "ok" if node_ok else "error", version or "version unavailable"))
+        node_ok = completed.returncode == 0 and parse_version(version) >= MINIMUM_NODE_VERSION
+        detail = f"{version or 'version unavailable'}; required>=22.15.0"
+        checks.append(Check("Node.js", "ok" if node_ok else "error", detail))
     else:
         checks.append(Check("Node.js", "error", "not found"))
 
@@ -1284,6 +1613,7 @@ def doctor_checks() -> list[Check]:
 
     checks.extend(
         [
+            component_repository_check("root", ROOT),
             component_repository_check("trading-core", TRADING_ROOT),
             component_repository_check("ATLAS site", SITE_ROOT),
         ]
@@ -1320,14 +1650,14 @@ def doctor_checks() -> list[Check]:
 
     try:
         report_date, report_path = latest_report()
-        report_age_days = (Date.today() - Date.fromisoformat(report_date)).days
+        report_age_days = (configured_report_date() - Date.fromisoformat(report_date)).days
         report_fresh = 0 <= report_age_days <= 3
         checks.append(Check(
             "latest briefing",
             "ok" if report_fresh else "error",
             f"{report_date} ({report_path.name}); age_days={report_age_days}; max_age_days=3",
         ))
-    except FileNotFoundError as exc:
+    except (FileNotFoundError, ValueError) as exc:
         report_date = ""
         checks.append(Check("latest briefing", "error", str(exc)))
 
@@ -1365,6 +1695,18 @@ def doctor_checks() -> list[Check]:
             required=False,
         )
     )
+    source_policy = SITE_ROOT / "security" / "dependency-source-policy.mjs"
+    if node and source_policy.exists():
+        source_check = capture_command([node, str(source_policy)], cwd=SITE_ROOT)
+        source_detail = (source_check.stdout or source_check.stderr).strip()
+        checks.append(
+            Check(
+                "site dependency sources",
+                "ok" if source_check.returncode == 0 else "error",
+                source_detail or "dependency source policy returned no output",
+                required=False,
+            )
+        )
     return checks
 
 
@@ -1532,6 +1874,10 @@ def command_alerts(args: argparse.Namespace) -> int:
         command.extend(["--ack-by", args.ack_by])
     if args.retry:
         command.append("--retry")
+    if args.receipt_destination:
+        command.extend(["--receipt-destination", args.receipt_destination])
+    if args.receipt_id:
+        command.extend(["--receipt-id", args.receipt_id])
     return run_command(command)
 
 
@@ -1603,6 +1949,11 @@ def command_cycle(args: argparse.Namespace) -> int:
         return 2
 
 
+def required_cycle_stages_passed(stages: Sequence[dict[str, Any]]) -> bool:
+    statuses = {str(stage.get("name")): stage.get("status") for stage in stages}
+    return all(statuses.get(name) == "passed" for name in RELEASE_REQUIRED_STAGES)
+
+
 def _command_cycle_locked(args: argparse.Namespace) -> int:
     try:
         date = args.date or latest_report()[0]
@@ -1634,6 +1985,7 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
     sync_rc: int | None = None
     if args.skip_sync:
         stages.append({"name": "sync", "status": "skipped", "detail": "skip_sync=true"})
+        blocking.append("sync stage was skipped")
     elif doctor_blocking:
         stages.append({"name": "sync", "status": "blocked", "detail": "doctor gate failed"})
     else:
@@ -1770,6 +2122,12 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         except Exception as exc:
             blocking.append(f"canonical ledger commit raised {type(exc).__name__}: {exc}")
             ledger_result["write_performed"] = False
+        if not ledger_result.get("write_performed"):
+            blocking.append("canonical ledger write was not performed after all upstream gates passed")
+        if not ledger_audit.get("overall_passed"):
+            blocking.extend(
+                f"ledger commit:{reason}" for reason in ledger_audit.get("blocking_reasons", [])
+            )
     stages.append({
         "name": "canonical_virtual_ledger_commit",
         "status": "passed" if ledger_result.get("write_performed") else "dry_run" if args.dry_run else "blocked",
@@ -1781,8 +2139,15 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
     })
 
     fingerprint_after = build_cycle_fingerprint(date)
+    workspace_lock = build_workspace_lock()
+    workspace_lock_content_sha256 = str(workspace_lock.get("content_sha256") or "")
     previous_state = read_json_file(CYCLE_STATE_PATH, default={})
     previous_key = previous_state.get("idempotency_key") if isinstance(previous_state, dict) else None
+    previous_workspace_lock_sha256 = (
+        str(previous_state.get("workspace_lock_content_sha256") or "")
+        if isinstance(previous_state, dict)
+        else ""
+    )
     execution_profile = {
         "dry_run": bool(args.dry_run),
         "skip_sync": bool(args.skip_sync),
@@ -1799,14 +2164,20 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
             "fingerprint": fingerprint_after["fingerprint"],
             "ledger_content_hash": ledger_result.get("content_hash"),
             "execution_profile": execution_profile,
+            "workspace_lock_content_sha256": workspace_lock_content_sha256,
         }
     )
     previous_passed = bool(previous_state.get("overall_passed")) if isinstance(previous_state, dict) else False
-    idempotent_replay = previous_key == idempotency_key and previous_passed and not args.force
+    idempotent_replay = bool(
+        previous_key == idempotency_key
+        and previous_workspace_lock_sha256 == workspace_lock_content_sha256
+        and previous_passed
+        and not args.force
+    )
     finished_at = utc_now()
     run_id = f"{cycle_id}-RUN-{finished_at.replace(':', '').replace('-', '').replace('.', '')}"
     operational_gate_passed = not blocking
-    workspace_lock = build_workspace_lock()
+    release_required_stages_passed = required_cycle_stages_passed(stages)
     research_promotion_passed = bool(
         replay_shadow.get("strategy_evidence_passed") is True
         and replay_shadow.get("shadow_promotion_gate", {}).get("evidence_passed") is True
@@ -1817,6 +2188,9 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         and full_tests_requested
         and not args.skip_site
         and not args.skip_trading_core
+        and sync_rc == 0
+        and ledger_result.get("write_performed") is True
+        and release_required_stages_passed
         and workspace_lock["release_reproducible"]
     )
 
@@ -1830,10 +2204,17 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         "execution_profile": execution_profile,
         "idempotency_key": idempotency_key,
         "idempotent_replay": idempotent_replay,
+        "workspace_lock_content_sha256": workspace_lock_content_sha256,
         "gate_scope": "daily_operational",
         "overall_passed": operational_gate_passed,
         "operational_gate_passed": operational_gate_passed,
         "release_candidate_passed": release_candidate_passed,
+        "release_candidate_evidence": {
+            "sync_passed": sync_rc == 0,
+            "canonical_ledger_write_performed": ledger_result.get("write_performed") is True,
+            "required_stages": list(RELEASE_REQUIRED_STAGES),
+            "required_stages_passed": release_required_stages_passed,
+        },
         "research_promotion_passed": research_promotion_passed,
         "blocking_reasons": blocking,
         "stages": stages,
@@ -1864,6 +2245,7 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
             ),
             "canonical_write_performed": ledger_result.get("write_performed", False),
             "canonical_write_blocked_by_upstream_gate": bool(not ledger_write_allowed and not args.dry_run),
+            "release_required_stages_passed": release_required_stages_passed,
             "replay_and_shadow_validation": replay_shadow["overall_passed"],
             "targeted_integration_test_gate": tests_rc == 0,
             "full_test_suite_executed": full_tests_requested and tests_rc == 0,
@@ -1903,12 +2285,16 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
                 "execution_profile": execution_profile,
                 "fingerprint": fingerprint_after["fingerprint"],
                 "ledger_content_hash": ledger_result.get("content_hash"),
+                "workspace_lock_content_sha256": workspace_lock_content_sha256,
                 "last_audit_json": str(audit_json_path),
                 "last_audit_markdown": str(audit_md_path),
                 "last_history_json": str(history_json_path),
                 "last_history_markdown": str(history_md_path),
                 "updated_at": audit_payload["finished_at"],
                 "overall_passed": audit_payload["overall_passed"],
+                "operational_gate_passed": audit_payload["operational_gate_passed"],
+                "release_candidate_passed": audit_payload["release_candidate_passed"],
+                "blocking_reasons": audit_payload["blocking_reasons"],
             },
         )
 
@@ -2038,6 +2424,11 @@ def build_parser() -> argparse.ArgumentParser:
     alerts.add_argument("--json", action="store_true")
     alerts.add_argument("--ack-by", help="Record who acknowledged the date-aligned alert payload.")
     alerts.add_argument("--retry", action="store_true", help="Prepare the next delivery attempt or escalate.")
+    alerts.add_argument(
+        "--receipt-destination",
+        help="Configured destination that returned a durable delivery receipt.",
+    )
+    alerts.add_argument("--receipt-id", help="Provider or connector receipt identifier.")
     alerts.set_defaults(handler=command_alerts)
 
     cycle = subparsers.add_parser("cycle", help="Run the gated ATLAS virtual trading/evolution cycle.")

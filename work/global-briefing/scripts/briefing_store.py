@@ -10,6 +10,8 @@ import os
 import re
 import subprocess
 import sys
+import time
+from contextlib import contextmanager
 from datetime import date as date_type
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -26,6 +28,8 @@ from research_quality import resolved_market_mapping_index
 from research_quality import review_scope
 from research_quality import review_is_valid_for_resolution
 from research_quality import validate_v2_prediction, validate_v2_review
+from report_clock import report_date as current_report_date
+from report_clock import report_now
 
 ROOT = SCRIPT_PATH.parents[3]
 REPORT_DIR = ROOT / "outputs"
@@ -41,6 +45,13 @@ TITLE_RE = re.compile(r"^##\s+(\d{4}-\d{2}-\d{2})\b.*$", re.MULTILINE)
 DAILY_FILE_RE = re.compile(rf"^{re.escape(DAILY_REPORT_STEM)}-(\d{{4}}-\d{{2}}-\d{{2}})\.md$")
 
 
+def strict_json_loads(text: str, *, source: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"{source} contains non-standard numeric constant {value}")
+
+    return json.loads(text, parse_constant=reject_constant)
+
+
 def ensure_files(report: Path = DEFAULT_REPORT, predictions: Path = DEFAULT_PREDICTIONS) -> None:
     REPORT_DIR.mkdir(parents=True, exist_ok=True)
     predictions.parent.mkdir(parents=True, exist_ok=True)
@@ -54,11 +65,55 @@ def parse_date(value: str) -> date_type:
 
 
 def today_string() -> str:
-    return datetime.now().strftime("%Y-%m-%d")
+    return current_report_date()
 
 
 def report_path_for_date(date: str) -> Path:
     return REPORT_DIR / f"{DAILY_REPORT_STEM}-{date}.md"
+
+
+@contextmanager
+def prediction_ledger_lock(predictions: Path, timeout_seconds: float = 10.0):
+    """Hold an OS-level exclusive lock for a prediction-ledger transaction."""
+    lock_path = predictions.with_suffix(predictions.suffix + ".lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    handle = lock_path.open("a+b")
+    acquired = False
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while not acquired:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0, os.SEEK_END)
+                    if handle.tell() == 0:
+                        handle.write(b"\0")
+                        handle.flush()
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except OSError as exc:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out acquiring prediction ledger lock: {lock_path}") from exc
+                time.sleep(0.05)
+        yield
+    finally:
+        if acquired:
+            if os.name == "nt":
+                import msvcrt
+
+                handle.seek(0)
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        handle.close()
 
 
 def summary_path_for_period(period: str, date: str) -> Path:
@@ -106,7 +161,11 @@ def migrate_legacy_report(report: Path = DEFAULT_REPORT) -> list[Path]:
         daily_path = report_path_for_date(section_date)
         if daily_path.exists():
             continue
-        daily_path.write_text(normalize_report(section_date, section), encoding="utf-8")
+        daily_path.write_text(
+            normalize_report(section_date, section),
+            encoding="utf-8",
+            newline="\n",
+        )
         written.append(daily_path)
     return written
 
@@ -117,7 +176,7 @@ def normalize_report(date: str, content: str) -> str:
         raise ValueError("Report content is empty.")
     first_line = content.splitlines()[0].strip()
     if not first_line.startswith("## "):
-        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        stamp = report_now().strftime("%Y-%m-%d %H:%M:%S %Z")
         content = f"## {date} 每日全球晨间简报\n\n资料检索时间：{stamp}\n\n{content}"
     return content.rstrip() + "\n"
 
@@ -127,7 +186,7 @@ def write_daily_report(date: str, content: str) -> tuple[Path, bool]:
     daily_path = report_path_for_date(date)
     new_section = normalize_report(date, content)
     existed = daily_path.exists()
-    daily_path.write_text(new_section, encoding="utf-8")
+    daily_path.write_text(new_section, encoding="utf-8", newline="\n")
     return daily_path, existed
 
 
@@ -142,7 +201,11 @@ def write_summary(period: str, date: str, content: str) -> tuple[Path, bool]:
         title = "每周全球简报总结" if period == "week" else "每月全球简报总结"
         normalized = f"# {title} {start:%Y-%m-%d} 至 {end:%Y-%m-%d}\n\n{normalized}"
     existed = summary_path.exists()
-    summary_path.write_text(normalized.rstrip() + "\n", encoding="utf-8")
+    summary_path.write_text(
+        normalized.rstrip() + "\n",
+        encoding="utf-8",
+        newline="\n",
+    )
     return summary_path, existed
 
 
@@ -155,11 +218,12 @@ def load_json_records(path: Path) -> list[dict[str, Any]]:
         if not line:
             continue
         try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
+            value = strict_json_loads(line, source=f"{path}:{line_no}")
+        except (json.JSONDecodeError, ValueError) as exc:
             raise ValueError(f"Invalid JSONL at {path}:{line_no}: {exc}") from exc
-        if isinstance(value, dict):
-            records.append(value)
+        if not isinstance(value, dict):
+            raise ValueError(f"Invalid JSONL at {path}:{line_no}: row must be an object")
+        records.append(value)
     return records
 
 
@@ -214,9 +278,8 @@ def reports_in_period(period: str, date: str) -> list[tuple[str, Path, str]]:
 
 
 def append_prediction_records(input_path: Path, date: str, predictions: Path = DEFAULT_PREDICTIONS) -> int:
-    ensure_files(predictions=predictions)
     raw = input_path.read_text(encoding="utf-8")
-    value = json.loads(raw)
+    value = strict_json_loads(raw, source=str(input_path))
     if isinstance(value, dict):
         records = value.get("predictions", [value])
     elif isinstance(value, list):
@@ -224,104 +287,135 @@ def append_prediction_records(input_path: Path, date: str, predictions: Path = D
     else:
         raise ValueError("Prediction input must be a JSON object, a list, or an object with a predictions list.")
 
-    existing = load_json_records(predictions)
-    settings = json.loads(DEFAULT_SETTINGS.read_text(encoding="utf-8"))
-    contract = settings.get("prediction_contract", {})
-    enforce_from = parse_contract_date(contract.get("enforce_from_date") or "9999-12-31")
-    originals = {
-        str(item.get("prediction_id")): item
-        for item in existing
-        if item.get("prediction_id") and not isinstance(item.get("review"), dict)
-    }
-    review_keys = {
-        (
-            str(item.get("prediction_id") or ""),
-            str(item.get("status") or ""),
-            str(item.get("review", {}).get("review_date") or item.get("date") or ""),
-        )
-        for item in existing
-        if isinstance(item.get("review"), dict)
-    }
-    prepared: list[dict[str, Any]] = []
-    errors: list[str] = []
-    for raw_record in records:
-        if not isinstance(raw_record, dict):
-            raise ValueError("Each prediction record must be a JSON object.")
-        record = dict(raw_record)
-        record.setdefault("date", date)
-        record.setdefault("status", "open")
-        prediction_id = str(record.get("prediction_id") or "")
-        is_review = isinstance(record.get("review"), dict)
-        try:
-            record_day = parse_contract_date(record.get("date"))
-        except (TypeError, ValueError):
-            errors.append(f"{prediction_id or '<missing-id>'}: invalid date")
-            prepared.append(record)
-            continue
-        if is_review:
-            review = record.get("review") if isinstance(record.get("review"), dict) else {}
-            review_key = (
-                prediction_id,
-                str(record.get("status") or ""),
-                str(review.get("review_date") or record.get("date") or ""),
-            )
-            if review_key in review_keys:
-                continue
-        elif prediction_id in originals:
-            if originals[prediction_id] == record:
-                continue
-            errors.append(f"{prediction_id}: original prediction already exists with different content")
-        if record_day >= enforce_from:
-            if is_review:
-                original = originals.get(prediction_id)
-                original_is_v2 = bool(
-                    original
-                    and original.get("schema_version") == 2
-                    and parse_contract_date(original.get("date")) >= enforce_from
-                )
-                if original is None or original_is_v2:
-                    errors.extend(
-                        validate_v2_review(
-                            record,
-                            original,
-                            price_recompute_enforce_from_date=str(
-                                settings.get("review_queue", {}).get(
-                                    "market_resolution_price_recompute_enforce_from_date"
-                                )
-                                or "2026-07-16"
-                            ),
-                        )
-                    )
-            else:
-                errors.extend(validate_v2_prediction(
-                    record,
-                    machine_evaluation_enforce_from_date=str(
-                        settings.get("review_queue", {}).get("machine_evaluation_enforce_from_date") or ""
-                    ) or None,
-                    event_asset_separation_enforce_from_date=str(
-                        settings.get("review_queue", {}).get("event_asset_separation_enforce_from_date") or ""
-                    ) or None,
-                    independence_enforce_from_date=str(
-                        settings.get("prediction_contract", {}).get("independence_enforce_from_date") or ""
-                    ) or None,
-                    evidence_reproducibility_enforce_from_date=str(
-                        settings.get("prediction_contract", {}).get("evidence_reproducibility_enforce_from_date") or ""
-                    ) or None,
-                ))
-        if not is_review and prediction_id:
-            originals[prediction_id] = record
-        elif is_review:
-            review_keys.add(review_key)
-        prepared.append(record)
-    if errors:
-        raise ValueError("Prediction contract rejected the batch: " + "; ".join(errors))
+    run_day = parse_contract_date(date)
+    if run_day.isoformat() != date:
+        raise ValueError(f"Run date must be canonical YYYY-MM-DD: {date!r}")
 
-    count = 0
-    with predictions.open("a", encoding="utf-8") as handle:
-        for record in prepared:
-            handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
-            count += 1
-    return count
+    with prediction_ledger_lock(predictions):
+        ensure_files(predictions=predictions)
+        existing = load_json_records(predictions)
+        settings = strict_json_loads(
+            DEFAULT_SETTINGS.read_text(encoding="utf-8"),
+            source=str(DEFAULT_SETTINGS),
+        )
+        contract = settings.get("prediction_contract", {})
+        enforce_from = parse_contract_date(contract.get("enforce_from_date") or "9999-12-31")
+        originals: dict[str, dict[str, Any]] = {}
+        for item in existing:
+            prediction_id = str(item.get("prediction_id") or "")
+            if prediction_id and not isinstance(item.get("review"), dict) and prediction_id not in originals:
+                originals[prediction_id] = item
+        reviews_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+        for item in existing:
+            if not isinstance(item.get("review"), dict):
+                continue
+            review_key = (
+                str(item.get("prediction_id") or ""),
+                str(item.get("status") or ""),
+                str(item.get("review", {}).get("review_date") or item.get("date") or ""),
+            )
+            previous = reviews_by_key.get(review_key)
+            if previous is not None and previous != item:
+                raise ValueError(
+                    "Prediction ledger contains conflicting review records for "
+                    f"identity {review_key!r}."
+                )
+            reviews_by_key[review_key] = item
+        prepared: list[dict[str, Any]] = []
+        errors: list[str] = []
+        for raw_record in records:
+            if not isinstance(raw_record, dict):
+                raise ValueError("Each prediction record must be a JSON object.")
+            record = dict(raw_record)
+            supplied_date = record.get("date")
+            if supplied_date not in (None, "") and str(supplied_date) != date:
+                errors.append(
+                    f"{record.get('prediction_id') or '<missing-id>'}: "
+                    f"record date {supplied_date!r} must equal run date {date}"
+                )
+            record["date"] = date
+            record.setdefault("status", "open")
+            prediction_id = str(record.get("prediction_id") or "")
+            is_review = isinstance(record.get("review"), dict)
+            try:
+                record_day = parse_contract_date(record.get("date"))
+            except (TypeError, ValueError):
+                errors.append(f"{prediction_id or '<missing-id>'}: invalid date")
+                prepared.append(record)
+                continue
+            if is_review:
+                review = record.get("review") if isinstance(record.get("review"), dict) else {}
+                review_key = (
+                    prediction_id,
+                    str(record.get("status") or ""),
+                    str(review.get("review_date") or record.get("date") or ""),
+                )
+                previous_review = reviews_by_key.get(review_key)
+                if previous_review is not None:
+                    if previous_review == record:
+                        continue
+                    errors.append(
+                        f"{prediction_id}: review identity {review_key!r} already exists "
+                        "with different content"
+                    )
+                    continue
+                reviews_by_key[review_key] = record
+            elif prediction_id in originals:
+                if originals[prediction_id] == record:
+                    continue
+                errors.append(f"{prediction_id}: original prediction already exists with different content")
+            if record_day >= enforce_from:
+                if is_review:
+                    original = originals.get(prediction_id)
+                    original_is_v2 = bool(
+                        original
+                        and original.get("schema_version") == 2
+                        and parse_contract_date(original.get("date")) >= enforce_from
+                    )
+                    if original is None or original_is_v2:
+                        errors.extend(
+                            validate_v2_review(
+                                record,
+                                original,
+                                price_recompute_enforce_from_date=str(
+                                    settings.get("review_queue", {}).get(
+                                        "market_resolution_price_recompute_enforce_from_date"
+                                    )
+                                    or "2026-07-16"
+                                ),
+                            )
+                        )
+                else:
+                    errors.extend(validate_v2_prediction(
+                        record,
+                        machine_evaluation_enforce_from_date=str(
+                            settings.get("review_queue", {}).get("machine_evaluation_enforce_from_date") or ""
+                        ) or None,
+                        event_asset_separation_enforce_from_date=str(
+                            settings.get("review_queue", {}).get("event_asset_separation_enforce_from_date") or ""
+                        ) or None,
+                        independence_enforce_from_date=str(
+                            settings.get("prediction_contract", {}).get("independence_enforce_from_date") or ""
+                        ) or None,
+                        evidence_reproducibility_enforce_from_date=str(
+                            settings.get("prediction_contract", {}).get("evidence_reproducibility_enforce_from_date") or ""
+                        ) or None,
+                    ))
+            if not is_review and prediction_id:
+                originals[prediction_id] = record
+            prepared.append(record)
+        if errors:
+            raise ValueError("Prediction contract rejected the batch: " + "; ".join(errors))
+        if not prepared:
+            return 0
+
+        rows = [*existing, *prepared]
+        text = "".join(
+            json.dumps(record, ensure_ascii=False, sort_keys=True, allow_nan=False) + "\n"
+            for record in rows
+        )
+        atomic_write_text(predictions, text)
+        return len(prepared)
 
 
 def print_previous(
@@ -388,8 +482,11 @@ def _review_closes_prediction(original: dict[str, Any], review_record: dict[str,
 
 def review_queue_settings() -> dict[str, Any]:
     try:
-        settings = json.loads(DEFAULT_SETTINGS.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        settings = strict_json_loads(
+            DEFAULT_SETTINGS.read_text(encoding="utf-8"),
+            source=str(DEFAULT_SETTINGS),
+        )
+    except (OSError, json.JSONDecodeError, ValueError):
         return {}
     queue = settings.get("review_queue", {}) if isinstance(settings, dict) else {}
     return queue if isinstance(queue, dict) else {}
@@ -400,7 +497,14 @@ def review_queue_path(run_date: str) -> Path:
 
 
 def review_queue_input_fingerprint(predictions: Path = DEFAULT_PREDICTIONS) -> str:
-    settings = json.loads(DEFAULT_SETTINGS.read_text(encoding="utf-8")) if DEFAULT_SETTINGS.exists() else {}
+    settings = (
+        strict_json_loads(
+            DEFAULT_SETTINGS.read_text(encoding="utf-8"),
+            source=str(DEFAULT_SETTINGS),
+        )
+        if DEFAULT_SETTINGS.exists()
+        else {}
+    )
     contract = settings.get("prediction_contract", {}) if isinstance(settings, dict) else {}
     queue = settings.get("review_queue", {}) if isinstance(settings, dict) else {}
     material = {
@@ -414,8 +518,7 @@ def review_queue_input_fingerprint(predictions: Path = DEFAULT_PREDICTIONS) -> s
     ).hexdigest()
 
 
-def atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
-    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+def atomic_write_text(path: Path, text: str) -> bool:
     if path.exists() and path.read_text(encoding="utf-8") == text:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -423,6 +526,11 @@ def atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
     temporary.write_text(text, encoding="utf-8", newline="\n")
     temporary.replace(path)
     return True
+
+
+def atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
+    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, allow_nan=False) + "\n"
+    return atomic_write_text(path, text)
 
 
 def due_review_queue(run_date: str, records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -443,10 +551,18 @@ def due_review_queue(run_date: str, records: list[dict[str, Any]]) -> dict[str, 
     event_resolved_count = 0
     resolved_mapping_count = 0
 
+    canonical_originals: dict[str, dict[str, Any]] = {}
+    duplicate_original_counts: dict[str, int] = {}
     for original in records:
         if isinstance(original.get("review"), dict) or not original.get("prediction_id"):
             continue
         prediction_id = str(original["prediction_id"])
+        if prediction_id in canonical_originals:
+            duplicate_original_counts[prediction_id] = duplicate_original_counts.get(prediction_id, 1) + 1
+            continue
+        canonical_originals[prediction_id] = original
+
+    for prediction_id, original in canonical_originals.items():
         latest_review = latest_reviews.get(prediction_id)
         event_resolved = _review_closes_prediction(original, latest_review)
         if event_resolved:
@@ -490,6 +606,7 @@ def due_review_queue(run_date: str, records: list[dict[str, Any]]) -> dict[str, 
             "market_mappings_maturing_today": market_matures_today,
             "market_mappings_not_due": market_not_due,
             "prediction": original,
+            "duplicate_original_count": duplicate_original_counts.get(prediction_id, 1),
         }
         has_unresolved_mapping = bool(market_due or market_matures_today or market_not_due)
         if event_resolved and not has_unresolved_mapping:
@@ -543,7 +660,12 @@ def due_review_queue(run_date: str, records: list[dict[str, Any]]) -> dict[str, 
             "fully_closed": fully_closed_count,
             "event_resolved": event_resolved_count,
             "market_mappings_resolved": resolved_mapping_count,
+            "duplicate_original_ids": len(duplicate_original_counts),
         },
+        "duplicate_originals": [
+            {"prediction_id": prediction_id, "count": count}
+            for prediction_id, count in sorted(duplicate_original_counts.items())
+        ],
         "review_now": review_now,
         "review_backlog": review_backlog,
         **categories,

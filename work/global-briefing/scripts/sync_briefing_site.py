@@ -1,20 +1,21 @@
 #!/usr/bin/env python3
-"""Incrementally sync the newest dated briefing into the ATLAS site.
+"""Stage, freeze, and publish the newest dated briefing into the ATLAS site.
 
-The command is intentionally two-phase:
-  1. Run without --mark-deployed to detect a content hash change and generate
-     src/app/briefing.generated.json.
-  2. After a successful Sites deployment, call --mark-deployed <sha256>.
-
-This keeps failed deployments retryable and makes unchanged checks a no-op.
+An unfrozen candidate is written only below the nondeployable ATLAS runtime
+directory. After all date-aligned gates pass, one immutable snapshot writes the
+site payload plus its publication manifest. A deployment can be marked only
+after the live page exposes and the verifier observes that exact identity.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import ipaddress
 import json
+import math
 import re
+import subprocess
 import sys
 from difflib import SequenceMatcher
 from datetime import date as Date
@@ -29,6 +30,9 @@ ROOT = Path(__file__).resolve().parents[3]
 OUTPUTS = ROOT / "outputs"
 DATA_DIR = ROOT / "work" / "global-briefing" / "data"
 SITE_DATA = ROOT / "src" / "app" / "briefing.generated.json"
+SITE_PUBLICATION_MANIFEST = ROOT / "src" / "app" / "publication.generated.json"
+SITE_LOCKFILE = ROOT / "src" / "package-lock.json"
+SITE_PACKAGE_JSON = ROOT / "src" / "package.json"
 STATE_FILE = ROOT / "work" / "global-briefing" / "data" / "site-sync-state.json"
 REPORT_RE = re.compile(r"每日全球晨间简报-(\d{4}-\d{2}-\d{2})\.md$")
 SITE_SCHEMA_VERSION = 4
@@ -46,7 +50,16 @@ ATLAS_IMPROVEMENTS_LATEST = ATLAS_RUNTIME_ROOT / "improvements" / "latest.json"
 ATLAS_ALERTS_LATEST = ATLAS_RUNTIME_ROOT / "alerts" / "latest.json"
 ATLAS_BACKUPS_LATEST = ATLAS_RUNTIME_ROOT / "backups" / "latest.json"
 PUBLICATION_SNAPSHOT_ROOT = ATLAS_RUNTIME_ROOT / "publication_snapshots"
-PUBLICATION_SNAPSHOT_SCHEMA_VERSION = 1
+PUBLICATION_CANDIDATE_ROOT = ATLAS_RUNTIME_ROOT / "publication_candidates"
+PUBLICATION_SNAPSHOT_SCHEMA_VERSION = 2
+PUBLICATION_MANIFEST_SCHEMA_VERSION = 1
+CANDIDATE_FINGERPRINT_SCHEMA_VERSION = 1
+MAX_GATE_ARTIFACT_AGE = timedelta(hours=72)
+REPOSITORY_PATHS = {
+    "root": ROOT,
+    "site": ROOT / "src",
+    "trading-core": ROOT / "work" / "trading-core",
+}
 
 
 def compact(value: str, limit: int = 280) -> str:
@@ -120,6 +133,50 @@ def load_json(path: Path, default: Any) -> Any:
         return json.loads(path.read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         return default
+
+
+def site_dependency_source_errors(
+    path: Path | None = None,
+    manifest_path: Path | None = None,
+) -> list[str]:
+    """Fail closed when the site lockfile cannot be built by the hosted runner."""
+    path = path or SITE_LOCKFILE
+    manifest_path = manifest_path or (SITE_PACKAGE_JSON if path == SITE_LOCKFILE else path.with_name("package.json"))
+    lockfile = load_json(path, {})
+    manifest = load_json(manifest_path, {})
+    packages = lockfile.get("packages") if isinstance(lockfile, dict) else None
+    if not isinstance(manifest, dict) or manifest.get("packageManager") != "npm@10.9.2":
+        return ["package.json must pin packageManager to npm@10.9.2"]
+    if not isinstance(lockfile.get("lockfileVersion"), int) or lockfile["lockfileVersion"] < 2:
+        return ["package-lock.json must use lockfileVersion 2+"]
+    if not isinstance(packages, dict):
+        return ["package-lock.json packages map is missing"]
+    errors: list[str] = []
+    for package_path, metadata in packages.items():
+        label = package_path or "<root>"
+        if not isinstance(metadata, dict):
+            errors.append(f"{label} has invalid package metadata")
+            continue
+        if "resolved" not in metadata:
+            if package_path == "" or metadata.get("link") is True or metadata.get("inBundle") is True:
+                continue
+            errors.append(f"{label} is missing a resolved dependency source")
+            continue
+        resolved = metadata.get("resolved")
+        if not isinstance(resolved, str) or not resolved:
+            errors.append(f"{label} has an invalid resolved dependency source")
+            continue
+        parsed = urlparse(resolved)
+        if parsed.scheme != "https":
+            errors.append(f"{label} must use an HTTPS dependency source")
+        if parsed.username or parsed.password:
+            errors.append(f"{label} embeds credentials in its dependency source")
+        if parsed.hostname != "registry.npmjs.org":
+            errors.append(f"{label} uses unsupported dependency host {parsed.hostname or 'missing'}")
+        integrity = metadata.get("integrity")
+        if not isinstance(integrity, str) or not integrity.startswith("sha512-"):
+            errors.append(f"{label} is missing SHA-512 dependency integrity")
+    return errors
 
 
 def valid_iso_date(value: str) -> str:
@@ -427,9 +484,9 @@ def parse_events(sections: dict[str, list[str]], predictions: list[dict[str, Any
     specs = [
         (("政治和外交", "政治与外交"), "地缘", "首要变量"),
         (("军事和安全", "军事与安全"), "安全", "一周窗口"),
-        (("科技和AI", "科技与AI"), "科技", "结构迁移"),
+        (("科技和AI", "科技与AI", "科技与人工智能"), "科技", "结构迁移"),
         (("环境和气候", "环境与气候"), "气候", "复合冲击"),
-        (("经济和能源", "经济与能源"), "宏观", "价格验证"),
+        (("经济和能源", "经济与能源", "经济、宏观与能源", "经济宏观与能源"), "宏观", "价格验证"),
         (("公共卫生和社会", "公共卫生与社会"), "社会", "中期影响"),
         (("中国市场映射",), "中国", "结构分化"),
     ]
@@ -659,7 +716,11 @@ def portfolio_review(lines: list[str], account: str) -> str:
     return compact(" ".join(collected), 520)
 
 
-def reconstruct_portfolio_for_date(account: str, report_date: str) -> dict[str, Any] | None:
+def reconstruct_portfolio_for_date(
+    account: str,
+    report_date: str,
+    valuations: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     base = load_json(PAPER_CONFIG_PATH, {})
     account_settings = base.get("accounts", {}).get(account, {}) if isinstance(base, dict) else {}
     if not isinstance(account_settings, dict) or not account_settings:
@@ -693,7 +754,15 @@ def reconstruct_portfolio_for_date(account: str, report_date: str) -> dict[str, 
             return None
         price = trade.get("price")
         if price not in (None, "") and float(price) > 0:
-            prices[key] = {"price": float(price), "date": trade_date, "source": trade.get("source"), "currency": currency, "fx_to_base": rate}
+            price_date = str(trade.get("price_date") or trade_date)[:10]
+            if price_date <= report_date:
+                prices[key] = {
+                    "price": float(price),
+                    "date": price_date,
+                    "source": trade.get("source"),
+                    "currency": currency,
+                    "fx_to_base": rate,
+                }
         if action not in {"BUY", "SELL"}:
             continue
         quantity = float(trade.get("quantity", 0.0))
@@ -724,6 +793,46 @@ def reconstruct_portfolio_for_date(account: str, report_date: str) -> dict[str, 
                 positions.pop(key, None)
     if not trades:
         return None
+    eligible_valuations = [
+        row
+        for row in (valuations or [])
+        if isinstance(row, dict)
+        and str(row.get("date") or "")[:10]
+        and str(row.get("date") or "")[:10] <= report_date
+    ]
+    eligible_valuations.sort(key=lambda row: str(row.get("date") or "")[:10])
+    for valuation in eligible_valuations:
+        valuation_date = str(valuation.get("date") or "")[:10]
+        price_snapshot = valuation.get("price_snapshot")
+        for item in price_snapshot if isinstance(price_snapshot, list) else []:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "").strip().upper()
+            exchange = str(item.get("exchange") or "").strip().upper()
+            key = str(item.get("key") or (f"{exchange}:{symbol}" if exchange else symbol))
+            price = item.get("price")
+            price_date = str(item.get("price_date") or valuation_date)[:10]
+            if not key or price in (None, "") or float(price) <= 0 or price_date > report_date:
+                continue
+            currency = str(
+                item.get("currency")
+                or positions.get(key, {}).get("currency")
+                or config.get("base_currency")
+                or ""
+            ).upper()
+            rate = fx_rate(currency, item.get("fx_to_base"))
+            if rate <= 0:
+                continue
+            prices[key] = {
+                "price": float(price),
+                "date": price_date,
+                "source": item.get("source"),
+                "currency": currency,
+                "fx_to_base": rate,
+            }
+    latest_valuation = eligible_valuations[-1] if eligible_valuations else None
+    if latest_valuation and isinstance(latest_valuation.get("cash"), (int, float)):
+        cash = float(latest_valuation["cash"])
     return {
         "account_id": config.get("account_id"),
         "mode": "paper_trading",
@@ -734,22 +843,30 @@ def reconstruct_portfolio_for_date(account: str, report_date: str) -> dict[str, 
         "last_prices": prices,
         "base_currency": config.get("base_currency"),
         "fx_rates_to_base": config.get("fx_rates_to_base", {}),
-        "as_of_date": report_date,
+        "as_of_date": str(latest_valuation.get("date") or report_date)[:10] if latest_valuation else report_date,
+        "_recorded_equity": (
+            float(latest_valuation["equity"])
+            if latest_valuation and isinstance(latest_valuation.get("equity"), (int, float))
+            else None
+        ),
+        "_valuation_snapshot_used": latest_valuation is not None,
     }
 
 
 def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any]:
     path = DATA_DIR / ("paper_portfolio_us.json" if account == "US" else "paper_portfolio_china.json")
+    valuation_path = DATA_DIR / ("paper_valuations_us.jsonl" if account == "US" else "paper_valuations_china.jsonl")
     data = load_json(path, {})
     cash = float(data.get("cash") or 0)
     positions = data.get("positions") or {}
     prices = data.get("last_prices") or {}
+    valuations = read_jsonl(valuation_path)
     price_dates = [str(item.get("date") or "")[:10] for item in prices.values() if isinstance(item, dict) and item.get("date")]
     state_date = str(data.get("as_of_date") or (max(price_dates) if price_dates else "") or data.get("last_updated") or "")[:10]
     historical_summary: dict[str, Any] | None = None
     historical_reconstructed = False
     if state_date and state_date > report_date:
-        reconstructed = reconstruct_portfolio_for_date(account, report_date)
+        reconstructed = reconstruct_portfolio_for_date(account, report_date, valuations)
         if reconstructed:
             data = reconstructed
             cash = float(data.get("cash") or 0)
@@ -758,8 +875,7 @@ def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any
             state_date = report_date
             historical_reconstructed = True
         else:
-            valuation_path = DATA_DIR / ("paper_valuations_us.jsonl" if account == "US" else "paper_valuations_china.jsonl")
-            candidates = [row for row in read_jsonl(valuation_path) if str(row.get("date") or "") <= report_date]
+            candidates = [row for row in valuations if str(row.get("date") or "") <= report_date]
             historical_summary = max(candidates, key=lambda row: str(row.get("date") or "")) if candidates else None
             positions = {}
             prices = {}
@@ -802,12 +918,25 @@ def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any
     values.sort(key=lambda pair: pair[1], reverse=True)
     position_rows.sort(key=lambda row: float(row["marketValue"]), reverse=True)
     equity = cash + sum(value for _, value in values)
+    recorded_equity = data.get("_recorded_equity")
+    if historical_reconstructed and isinstance(recorded_equity, (int, float)):
+        equity = float(recorded_equity)
     if historical_summary:
         equity = float(historical_summary.get("equity") or equity)
         historical_positions_value = float(historical_summary.get("positions_value") or 0)
         values = [("历史持仓汇总", historical_positions_value)] if historical_positions_value else []
     initial = float(data.get("initial_cash") or 100000)
     total_return = ((equity / initial) - 1) * 100 if initial else 0
+    as_of = str(historical_summary.get("date") if historical_summary else data.get("as_of_date") or state_date or report_date)
+    prior_valuations = [
+        row
+        for row in valuations
+        if str(row.get("date") or "") < as_of and str(row.get("date") or "") <= report_date
+    ]
+    previous_valuation = max(prior_valuations, key=lambda row: str(row.get("date") or "")) if prior_valuations else None
+    previous_equity = float(previous_valuation.get("equity") or 0) if previous_valuation else None
+    period_pnl = equity - previous_equity if previous_equity is not None else None
+    period_return_pct = (period_pnl / previous_equity) * 100 if previous_equity else None
     allocations = [{"label": "现金", "pct": round(cash / equity * 100, 1) if equity else 0}]
     for symbol, value in values[:2]:
         allocations.append({"label": symbol, "pct": round(value / equity * 100, 1) if equity else 0})
@@ -821,18 +950,29 @@ def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any
         "returnPct": round(total_return, 2),
         "allocations": allocations,
         "accountId": str(data.get("account_id") or ""),
-        "asOf": str(historical_summary.get("date") if historical_summary else data.get("as_of_date") or state_date or report_date),
+        "asOf": as_of,
         "baseCurrency": portfolio_base_currency,
         "initialCash": round(initial, 2),
         "cash": round(cash, 2),
         "cashPct": round(cash / equity * 100, 2) if equity else 0,
         "equity": round(equity, 2),
+        "previousEquity": round(previous_equity, 2) if previous_equity is not None else None,
+        "periodPnl": round(period_pnl, 2) if period_pnl is not None else None,
+        "periodReturnPct": round(period_return_pct, 2) if period_return_pct is not None else None,
         "realizedPnl": round(float(data.get("realized_pnl") or 0), 2),
         "positions": position_rows,
         "review": review or "本期维持虚拟研究账户，仅按最近可得价格完成标记。",
         "paperTradingOnly": data.get("mode") == "paper_trading",
         "detailAvailable": historical_summary is None,
-        "limitations": ["历史持仓由截止报告日的虚拟成交逐笔重建，未使用未来持仓快照。"] if historical_reconstructed else ["历史日期仅有账户估值汇总，未使用未来持仓快照。"] if historical_summary else [],
+        "limitations": (
+            ["历史持仓由截止报告日的虚拟成交逐笔重建，并优先采用日期对齐的估值价格快照，未使用未来持仓快照。"]
+            if historical_reconstructed and data.get("_valuation_snapshot_used")
+            else ["历史持仓由截止报告日的虚拟成交逐笔重建，未使用未来持仓快照。"]
+            if historical_reconstructed
+            else ["历史日期仅有账户估值汇总，未使用未来持仓快照。"]
+            if historical_summary
+            else []
+        ),
     }
 
 
@@ -850,14 +990,22 @@ def public_portfolio(value: dict[str, Any]) -> dict[str, Any]:
         allocations.append({"label": label, "pct": float(item.get("pct") or 0)})
     return {
         "name": str(value.get("name") or "虚拟组合"),
+        "value": str(value.get("value") or "0.00"),
         "return": str(value.get("return") or "N/A"),
         "returnPct": float(value.get("returnPct") or 0),
+        "asOf": str(value.get("asOf") or ""),
+        "baseCurrency": str(value.get("baseCurrency") or ""),
+        "cash": round(float(value.get("cash") or 0), 2),
+        "cashPct": round(float(value.get("cashPct") or 0), 2),
+        "equity": round(float(value.get("equity") or 0), 2),
+        "periodPnl": round(float(value["periodPnl"]), 2) if value.get("periodPnl") is not None else None,
+        "periodReturnPct": round(float(value["periodReturnPct"]), 2) if value.get("periodReturnPct") is not None else None,
         "allocations": allocations,
         "review": str(value.get("review") or "仅展示公开聚合指标。"),
         "paperTradingOnly": value.get("paperTradingOnly") is True,
         "publicDataOnly": True,
         "limitations": [
-            "公开站点仅展示聚合收益率和匿名资产配置；账户、持仓、成本、现金与盈亏明细不进入发布载荷。"
+            "公开站点展示总权益、现金、最近一期盈亏和累计收益；账户编号、逐笔持仓、成本基础与已实现盈亏明细不进入发布载荷。"
         ],
     }
 
@@ -1288,10 +1436,10 @@ def report_quality_audit(text: str) -> dict[str, Any]:
 
     topic_specs = [
         ("政治与外交",),
-        ("科技与AI",),
+        ("科技与AI", "科技和AI", "科技与人工智能"),
         ("环境与气候",),
         ("军事与安全",),
-        ("经济与能源",),
+        ("经济与能源", "经济和能源", "经济、宏观与能源", "经济宏观与能源"),
         ("公共卫生与社会",),
     ]
     required_layers = ("结论", "硬证据", "机制", "反证", "证伪")
@@ -1684,7 +1832,22 @@ def validate_payload(payload: dict[str, Any]) -> list[str]:
                 errors.append(f"portfolios.{account} must remain paper-trading only")
             if portfolio_payload.get("publicDataOnly") is not True:
                 errors.append(f"portfolios.{account} must use the public-data projection")
-            forbidden_portfolio_fields = {"accountId", "positions", "cash", "equity", "realizedPnl", "initialCash"}
+            for numeric_field in ("cash", "cashPct", "equity", "returnPct"):
+                numeric_value = portfolio_payload.get(numeric_field)
+                if not isinstance(numeric_value, (int, float)) or not math.isfinite(float(numeric_value)):
+                    errors.append(f"portfolios.{account}.{numeric_field} must be a finite number")
+            for optional_numeric_field in ("periodPnl", "periodReturnPct"):
+                optional_value = portfolio_payload.get(optional_numeric_field)
+                if optional_value is not None and (
+                    not isinstance(optional_value, (int, float))
+                    or not math.isfinite(float(optional_value))
+                ):
+                    errors.append(f"portfolios.{account}.{optional_numeric_field} must be a finite number or null")
+            if not isinstance(portfolio_payload.get("baseCurrency"), str) or not portfolio_payload.get("baseCurrency"):
+                errors.append(f"portfolios.{account}.baseCurrency must be present")
+            if not isinstance(portfolio_payload.get("asOf"), str) or not portfolio_payload.get("asOf"):
+                errors.append(f"portfolios.{account}.asOf must be present")
+            forbidden_portfolio_fields = {"accountId", "positions", "realizedPnl", "initialCash", "previousEquity"}
             if forbidden_portfolio_fields.intersection(portfolio_payload):
                 errors.append(f"portfolios.{account} contains restricted account fields")
     system = payload.get("system")
@@ -1715,18 +1878,141 @@ def validate_payload(payload: dict[str, Any]) -> list[str]:
 
 
 def serialized_payload(payload: Any) -> str:
-    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    return json.dumps(payload, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
 
 
 def payload_sha256(payload: Any) -> str:
     return hashlib.sha256(serialized_payload(payload).encode("utf-8")).hexdigest()
 
 
+def canonical_json_sha256(payload: Any) -> str:
+    serialized = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+    return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
+
+
+def current_repository_commits() -> dict[str, str]:
+    commits: dict[str, str] = {}
+    for name, path in REPOSITORY_PATHS.items():
+        completed = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--verify", "HEAD"],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+            timeout=10,
+        )
+        commit = completed.stdout.strip().lower()
+        if completed.returncode != 0 or not re.fullmatch(r"[0-9a-f]{40}", commit):
+            detail = completed.stderr.strip() or "HEAD is unavailable"
+            raise ValueError(f"cannot identify {name} repository commit: {detail}")
+        commits[name] = commit
+    return commits
+
+
+def build_candidate_fingerprint(
+    *,
+    report_date: str,
+    raw_report: bytes,
+    content_hash: str,
+    payload: dict[str, Any],
+    repository_commits: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    material = {
+        "schema_version": CANDIDATE_FINGERPRINT_SCHEMA_VERSION,
+        "algorithm": "sha256",
+        "canonicalization": "json-sort-keys-utf8-v1",
+        "formula": "sha256(utf8(json(candidate_inputs,sort_keys=true,separators=(',',':'))))",
+        "date": report_date,
+        "report_sha256": hashlib.sha256(raw_report).hexdigest(),
+        "site_input_hash": content_hash,
+        "payload_sha256": payload_sha256(payload),
+        "repository_commits": repository_commits or current_repository_commits(),
+    }
+    return {**material, "fingerprint_sha256": canonical_json_sha256(material)}
+
+
+def candidate_fingerprint_errors(candidate: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if candidate.get("schema_version") != CANDIDATE_FINGERPRINT_SCHEMA_VERSION:
+        errors.append("candidate fingerprint schema version is invalid")
+    for field in ("report_sha256", "site_input_hash", "payload_sha256", "fingerprint_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(candidate.get(field) or "")):
+            errors.append(f"candidate fingerprint {field} is invalid")
+    commits = candidate.get("repository_commits")
+    if not isinstance(commits, dict) or set(commits) != set(REPOSITORY_PATHS):
+        errors.append("candidate fingerprint must contain exactly the three repository commits")
+    elif any(not re.fullmatch(r"[0-9a-f]{40}", str(value or "")) for value in commits.values()):
+        errors.append("candidate fingerprint contains an invalid repository commit")
+    material = {key: value for key, value in candidate.items() if key != "fingerprint_sha256"}
+    if candidate.get("fingerprint_sha256") != canonical_json_sha256(material):
+        errors.append("candidate fingerprint digest is inconsistent")
+    return errors
+
+
+def publication_snapshot_sha256(snapshot: dict[str, Any]) -> str:
+    return hashlib.sha256(serialized_payload(snapshot).encode("utf-8")).hexdigest()
+
+
+def build_publication_manifest(snapshot: dict[str, Any]) -> dict[str, Any]:
+    candidate = snapshot.get("candidate_fingerprint", {})
+    snapshot_digest = publication_snapshot_sha256(snapshot)
+    candidate_digest = str(candidate.get("fingerprint_sha256") or "") if isinstance(candidate, dict) else ""
+    build_digest = canonical_json_sha256({
+        "candidate_fingerprint": candidate_digest,
+        "payload_sha256": snapshot.get("payload_sha256"),
+        "snapshot_sha256": snapshot_digest,
+    })
+    deployment_digest = canonical_json_sha256({
+        "build_id": f"atlas-build-{build_digest}",
+        "snapshot_revision": snapshot.get("revision"),
+        "snapshot_sha256": snapshot_digest,
+    })
+    return {
+        "schemaVersion": PUBLICATION_MANIFEST_SCHEMA_VERSION,
+        "frozen": True,
+        "reportDate": snapshot.get("date"),
+        "contentHash": snapshot.get("content_hash"),
+        "payloadSha256": snapshot.get("payload_sha256"),
+        "snapshotRevision": snapshot.get("revision"),
+        "snapshotSha256": snapshot_digest,
+        "candidateFingerprint": candidate_digest,
+        "repositoryCommits": candidate.get("repository_commits", {}) if isinstance(candidate, dict) else {},
+        "buildId": f"atlas-build-{build_digest}",
+        "deploymentId": f"atlas-deployment-{deployment_digest}",
+    }
+
+
+def publication_manifest_errors(
+    manifest: dict[str, Any],
+    *,
+    payload: dict[str, Any],
+    snapshot: dict[str, Any],
+) -> list[str]:
+    errors: list[str] = []
+    expected = build_publication_manifest(snapshot)
+    if manifest.get("schemaVersion") != PUBLICATION_MANIFEST_SCHEMA_VERSION:
+        errors.append("publication manifest schema version is invalid")
+    if manifest.get("frozen") is not True:
+        errors.append("publication manifest is not frozen")
+    for field, value in expected.items():
+        if manifest.get(field) != value:
+            errors.append(f"publication manifest {field} does not match the frozen snapshot")
+    if manifest.get("payloadSha256") != payload_sha256(payload):
+        errors.append("publication manifest payload hash does not match deployable site data")
+    return errors
+
+
 def deployment_verification_errors(
     artifact_path: Path,
     *,
-    expected_content_hash: str,
-    expected_payload_sha256: str,
+    expected_manifest: dict[str, Any],
     deployment_url: str,
     now: datetime | None = None,
 ) -> tuple[list[str], dict[str, Any]]:
@@ -1734,24 +2020,97 @@ def deployment_verification_errors(
     errors: list[str] = []
     if not artifact_path.exists() or not artifact:
         return [f"production verification artifact is missing or invalid: {artifact_path}"], {}
-    if artifact.get("schema_version") != 1:
-        errors.append("production verification artifact schema_version must be 1")
+    if artifact.get("schema_version") != 2:
+        errors.append("production verification artifact schema_version must be 2")
     if artifact.get("passed") is not True:
         errors.append("production verification artifact did not pass")
-    if str(artifact.get("expected_content_hash") or "") != expected_content_hash:
-        errors.append("production verification content hash does not match --mark-deployed")
-    if str(artifact.get("site_payload_sha256") or "") != expected_payload_sha256:
-        errors.append("production verification payload hash does not match current site data")
+    expected = artifact.get("expected", {})
+    if not isinstance(expected, dict):
+        expected = {}
+        errors.append("production verification expected identity is missing")
+    identity_fields = {
+        "content_hash": "contentHash",
+        "report_date": "reportDate",
+        "payload_sha256": "payloadSha256",
+        "snapshot_revision": "snapshotRevision",
+        "snapshot_sha256": "snapshotSha256",
+        "candidate_fingerprint": "candidateFingerprint",
+        "build_id": "buildId",
+        "deployment_id": "deploymentId",
+    }
+    for artifact_field, manifest_field in identity_fields.items():
+        if expected.get(artifact_field) != expected_manifest.get(manifest_field):
+            errors.append(f"production verification expected {artifact_field} does not match the frozen publication")
     expected_url = deployment_url.rstrip("/")
     artifact_url = str(artifact.get("deployment_url") or "").rstrip("/")
-    if not expected_url or urlparse(expected_url).scheme.lower() != "https":
-        errors.append("--deployment-url must be an HTTPS URL")
+    try:
+        parsed_deployment = urlparse(expected_url)
+        deployment_port = parsed_deployment.port or 443
+    except ValueError:
+        parsed_deployment = urlparse("")
+        deployment_port = 0
+    if (
+        not expected_url
+        or parsed_deployment.scheme.lower() != "https"
+        or not parsed_deployment.hostname
+        or parsed_deployment.username
+        or parsed_deployment.password
+        or parsed_deployment.fragment
+        or deployment_port != 443
+    ):
+        errors.append("--deployment-url must be a credential-free HTTPS URL on port 443 without a fragment")
     if artifact_url != expected_url:
         errors.append("production verification URL does not match --deployment-url")
     if artifact.get("source_isolation", {}).get("passed") is not True:
         errors.append("production source-isolation verification did not pass")
-    if artifact.get("live", {}).get("passed") is not True:
+    live = artifact.get("live", {})
+    if not isinstance(live, dict) or live.get("passed") is not True:
         errors.append("production live-response verification did not pass")
+        live = live if isinstance(live, dict) else {}
+    observed_fields = {
+        "observed_content_hash": "contentHash",
+        "observed_report_date": "reportDate",
+        "observed_payload_sha256": "payloadSha256",
+        "observed_snapshot_revision": "snapshotRevision",
+        "observed_snapshot_sha256": "snapshotSha256",
+        "observed_candidate_fingerprint": "candidateFingerprint",
+        "observed_build_id": "buildId",
+        "observed_deployment_id": "deploymentId",
+    }
+    for observed_field, manifest_field in observed_fields.items():
+        if live.get(observed_field) != expected_manifest.get(manifest_field):
+            errors.append(f"production live response {observed_field} does not match the frozen publication")
+    network = artifact.get("network", {})
+    connected_ip = str(network.get("connected_ip") or "") if isinstance(network, dict) else ""
+    validated_addresses = network.get("validated_addresses", []) if isinstance(network, dict) else []
+    deployment_hostname = parsed_deployment.hostname or ""
+    try:
+        deployment_hostname = deployment_hostname.rstrip(".").encode("idna").decode("ascii").casefold()
+    except UnicodeError:
+        deployment_hostname = ""
+    if not isinstance(network, dict) or network.get("dns_pinned") is not True:
+        errors.append("production verification did not pin the connection to prevalidated DNS")
+    if network.get("tls_server_name") != deployment_hostname:
+        errors.append("production verification TLS server name does not match --deployment-url")
+    if network.get("host_header") != deployment_hostname:
+        errors.append("production verification Host header does not match --deployment-url")
+    try:
+        if not ipaddress.ip_address(connected_ip).is_global:
+            raise ValueError
+    except ValueError:
+        errors.append("production verification did not record a global connected IP")
+    if not isinstance(validated_addresses, list) or connected_ip not in validated_addresses:
+        errors.append("production connected IP was not one of the prevalidated DNS addresses")
+    else:
+        try:
+            if any(
+                not isinstance(address, str)
+                or not ipaddress.ip_address(address).is_global
+                for address in validated_addresses
+            ):
+                errors.append("production verification DNS evidence contains a non-global address")
+        except ValueError:
+            errors.append("production verification DNS evidence contains an invalid address")
     checked_at = str(artifact.get("checked_at") or "")
     try:
         checked = datetime.fromisoformat(checked_at.replace("Z", "+00:00"))
@@ -1773,42 +2132,150 @@ def write_json_atomic(path: Path, payload: Any) -> None:
     temporary.replace(path)
 
 
-def site_data_matches(expected_hash: str, expected_payload_hash: str | None = None) -> bool:
+def site_data_matches(
+    expected_hash: str,
+    expected_payload_hash: str | None = None,
+    expected_manifest: dict[str, Any] | None = None,
+) -> bool:
     payload = load_json(SITE_DATA, {})
+    manifest = load_json(SITE_PUBLICATION_MANIFEST, {})
     return bool(
         isinstance(payload, dict)
         and payload.get("schemaVersion") == SITE_SCHEMA_VERSION
         and payload.get("contentHash") == expected_hash
         and (expected_payload_hash is None or payload_sha256(payload) == expected_payload_hash)
+        and (expected_manifest is None or manifest == expected_manifest)
         and not validate_payload(payload)
     )
+
+
+def publication_candidate_path(report_date: str) -> Path:
+    return PUBLICATION_CANDIDATE_ROOT / f"atlas-publication-candidate-{report_date}.json"
+
+
+def stage_publication_candidate(
+    *,
+    report_date: str,
+    report_path: Path,
+    payload: dict[str, Any],
+    candidate_fingerprint: dict[str, Any],
+    readiness: dict[str, Any],
+) -> Path:
+    path = publication_candidate_path(report_date)
+    write_json_atomic(path, {
+        "schema_version": 1,
+        "staged_at": datetime.now(timezone.utc).isoformat(),
+        "date": report_date,
+        "report": _evidence_path(report_path),
+        "candidate_fingerprint": candidate_fingerprint,
+        "readiness": readiness,
+        "payload": payload,
+    })
+    return path
+
+
+def write_frozen_site_artifacts(snapshot: dict[str, Any]) -> dict[str, Any]:
+    payload = snapshot.get("payload")
+    if not isinstance(payload, dict):
+        raise ValueError("frozen publication snapshot payload is missing")
+    manifest = build_publication_manifest(snapshot)
+    errors = publication_manifest_errors(manifest, payload=payload, snapshot=snapshot)
+    if errors:
+        raise ValueError("cannot write invalid frozen site artifacts: " + "; ".join(errors))
+    # The deployable payload and its self-describing identity are only written
+    # after a valid frozen snapshot exists. A partial write remains fail-closed
+    # because both sync and production verification require an exact pair.
+    write_json_atomic(SITE_PUBLICATION_MANIFEST, manifest)
+    write_json_atomic(SITE_DATA, payload)
+    return manifest
 
 
 def publication_snapshot_path(report_date: str) -> Path:
     return PUBLICATION_SNAPSHOT_ROOT / f"atlas-publication-{report_date}.json"
 
 
-def publication_snapshot_readiness(report_date: str) -> dict[str, Any]:
+def _publication_snapshot_status_checks(
+    report_date: str,
+    *,
+    artifacts: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any]:
     cycle_path = cycle_audit_path(report_date)
-    cycle = load_json(cycle_path, {}) if cycle_path else {}
-    healing = load_json(ATLAS_SELF_HEALING_LATEST, {})
-    improvements = load_json(ATLAS_IMPROVEMENTS_LATEST, {})
-    alerts = load_json(ATLAS_ALERTS_LATEST, {})
-    backup = load_json(ATLAS_BACKUPS_LATEST, {})
+    cycle = artifacts.get("cycle", {}) if artifacts is not None else load_json(cycle_path, {}) if cycle_path else {}
+    healing = artifacts.get("selfHealing", {}) if artifacts is not None else load_json(ATLAS_SELF_HEALING_LATEST, {})
+    improvements = artifacts.get("improvements", {}) if artifacts is not None else load_json(ATLAS_IMPROVEMENTS_LATEST, {})
+    alerts = artifacts.get("alerts", {}) if artifacts is not None else load_json(ATLAS_ALERTS_LATEST, {})
+    backup = artifacts.get("backup", {}) if artifacts is not None else load_json(ATLAS_BACKUPS_LATEST, {})
     reasons: list[str] = []
 
+    cycle_stage_rows = cycle.get("stages", []) if isinstance(cycle, dict) else []
+    cycle_stages = {
+        str(item.get("name") or ""): item
+        for item in cycle_stage_rows
+        if isinstance(item, dict)
+    }
+    cycle_boundary = cycle.get("boundary", {}) if isinstance(cycle, dict) else {}
+    workspace_lock = cycle.get("workspace_lock", {}) if isinstance(cycle, dict) else {}
+    ledger = cycle.get("ledger", {}) if isinstance(cycle, dict) else {}
     if (
         not isinstance(cycle, dict)
         or cycle.get("date") != report_date
         or cycle.get("operational_gate_passed", cycle.get("overall_passed")) is not True
     ):
         reasons.append("date-aligned ATLAS cycle has not passed")
+    if not isinstance(cycle, dict) or cycle.get("release_candidate_passed") is not True:
+        reasons.append("date-aligned ATLAS cycle is not a release candidate")
+    if cycle_stages.get("sync", {}).get("status") != "passed":
+        reasons.append("date-aligned ATLAS sync stage did not pass")
+    if (
+        cycle_stages.get("canonical_virtual_ledger_commit", {}).get("status") != "passed"
+        or not isinstance(ledger, dict)
+        or ledger.get("write_performed") is not True
+        or not isinstance(cycle_boundary, dict)
+        or cycle_boundary.get("canonical_write_performed") is not True
+    ):
+        reasons.append("date-aligned canonical virtual ledger commit was not performed")
+    if (
+        cycle.get("idempotent_replay") is not True
+        or not isinstance(cycle_boundary, dict)
+        or cycle_boundary.get("idempotency_verified_by_repeated_fingerprint") is not True
+    ):
+        reasons.append("date-aligned cycle idempotency replay was not verified")
+    execution_profile = cycle.get("execution_profile", {}) if isinstance(cycle, dict) else {}
+    if (
+        not isinstance(cycle_boundary, dict)
+        or cycle_boundary.get("full_test_suite_executed") is not True
+        or not isinstance(execution_profile, dict)
+        or execution_profile.get("full_tests") is not True
+    ):
+        reasons.append("date-aligned full regression suite was not executed")
+    if not isinstance(workspace_lock, dict) or workspace_lock.get("release_reproducible") is not True:
+        reasons.append("date-aligned workspace provenance is not reproducible")
+
     healing_counts = healing.get("counts", {}) if isinstance(healing, dict) else {}
+    healing_checks = healing.get("checks", []) if isinstance(healing, dict) else []
+    healing_check_index = {
+        str(item.get("check_id") or ""): item
+        for item in healing_checks
+        if isinstance(item, dict)
+    }
+    required_healing_checks = {"briefing_tests", "site_quality"}
+    missing_healing_checks = sorted(required_healing_checks - set(healing_check_index))
+    failed_healing_checks = sorted(
+        check_id
+        for check_id, item in healing_check_index.items()
+        if item.get("executed") is not True or item.get("passed") is not True
+    )
     if (
         not isinstance(healing, dict)
         or healing.get("date") != report_date
+        or healing.get("deep") is not True
+        or healing.get("strict") is not True
         or int(healing_counts.get("blocking") or 0) != 0
-        or str(healing.get("overall_status") or "") == "blocked"
+        or int(healing_counts.get("failed") or 0) != 0
+        or int(healing_counts.get("unresolved") or 0) != 0
+        or str(healing.get("overall_status") or "") != "healthy"
+        or missing_healing_checks
+        or failed_healing_checks
     ):
         reasons.append("date-aligned deep self-healing is missing or blocking")
     improvement_counts = improvements.get("counts", {}) if isinstance(improvements, dict) else {}
@@ -1823,11 +2290,15 @@ def publication_snapshot_readiness(report_date: str) -> dict[str, Any]:
     if (
         not isinstance(backup, dict)
         or backup.get("date") != report_date
-        or backup.get("verified") is not True
+        or backup.get("encrypted") is not True
+        or backup.get("encryption_algorithm") != "AES-256-GCM"
+        or backup.get("encrypted_container_authenticated") is not True
+        or backup.get("archive_integrity_verified") is not True
         or backup.get("restore_verified") is not True
+        or backup.get("restore_scope") != "configured_workspace_files_and_git_bundles"
         or backup.get("target_outside_workspace") is not True
     ):
-        reasons.append("date-aligned external backup and restore verification has not passed")
+        reasons.append("date-aligned encrypted external backup and restore verification has not passed")
 
     return {
         "ready": not reasons,
@@ -1836,11 +2307,34 @@ def publication_snapshot_readiness(report_date: str) -> dict[str, Any]:
             "cycle": {
                 "date": cycle.get("date") if isinstance(cycle, dict) else None,
                 "overallPassed": cycle.get("overall_passed") is True if isinstance(cycle, dict) else False,
+                "releaseCandidatePassed": cycle.get("release_candidate_passed") is True if isinstance(cycle, dict) else False,
+                "syncPassed": cycle_stages.get("sync", {}).get("status") == "passed",
+                "canonicalWritePerformed": ledger.get("write_performed") is True if isinstance(ledger, dict) else False,
+                "idempotentReplay": cycle.get("idempotent_replay") is True if isinstance(cycle, dict) else False,
+                "fullTestsExecuted": (
+                    cycle_boundary.get("full_test_suite_executed") is True
+                    if isinstance(cycle_boundary, dict)
+                    else False
+                ),
+                "workspaceReproducible": (
+                    workspace_lock.get("release_reproducible") is True
+                    if isinstance(workspace_lock, dict)
+                    else False
+                ),
             },
             "selfHealing": {
                 "date": healing.get("date") if isinstance(healing, dict) else None,
                 "status": healing.get("overall_status") if isinstance(healing, dict) else None,
                 "blocking": int(healing_counts.get("blocking") or 0) if isinstance(healing_counts, dict) else 0,
+                "deep": healing.get("deep") is True if isinstance(healing, dict) else False,
+                "strict": healing.get("strict") is True if isinstance(healing, dict) else False,
+                "requiredChecks": {
+                    check_id: (
+                        healing_check_index.get(check_id, {}).get("executed") is True
+                        and healing_check_index.get(check_id, {}).get("passed") is True
+                    )
+                    for check_id in sorted(required_healing_checks)
+                },
             },
             "improvements": {
                 "date": improvements.get("date") if isinstance(improvements, dict) else None,
@@ -1854,12 +2348,192 @@ def publication_snapshot_readiness(report_date: str) -> dict[str, Any]:
             },
             "backup": {
                 "date": backup.get("date") if isinstance(backup, dict) else None,
-                "verified": backup.get("verified") is True if isinstance(backup, dict) else False,
+                "encrypted": backup.get("encrypted") is True if isinstance(backup, dict) else False,
+                "encryptionAlgorithm": (
+                    backup.get("encryption_algorithm") if isinstance(backup, dict) else None
+                ),
+                "containerAuthenticated": (
+                    backup.get("encrypted_container_authenticated") is True
+                    if isinstance(backup, dict)
+                    else False
+                ),
+                "archiveIntegrityVerified": (
+                    backup.get("archive_integrity_verified") is True
+                    if isinstance(backup, dict)
+                    else False
+                ),
                 "restoreVerified": backup.get("restore_verified") is True if isinstance(backup, dict) else False,
+                "restoreScope": backup.get("restore_scope") if isinstance(backup, dict) else None,
+                "fullRuntimeRestoreVerified": (
+                    backup.get("full_runtime_restore_verified") is True
+                    if isinstance(backup, dict)
+                    else False
+                ),
                 "outsideWorkspace": backup.get("target_outside_workspace") is True if isinstance(backup, dict) else False,
             },
         },
     }
+
+
+def _evidence_path(path: Path) -> str:
+    try:
+        return path.resolve().relative_to(ROOT.resolve()).as_posix()
+    except ValueError:
+        return str(path.resolve())
+
+
+def _artifact_timestamp(payload: dict[str, Any], path: Path) -> datetime:
+    for field in (
+        "finished_at",
+        "generated_at",
+        "completed_at",
+        "checked_at",
+        "created_at",
+        "timestamp",
+    ):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            continue
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            raise ValueError(f"{field} must include a timezone")
+        return parsed.astimezone(timezone.utc)
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
+
+
+def _gate_artifact_attestation(
+    *,
+    name: str,
+    path: Path | None,
+    report_date: str,
+    candidate_fingerprint: dict[str, Any],
+    now: datetime,
+) -> tuple[dict[str, Any], list[str], dict[str, Any]]:
+    candidate_digest = str(candidate_fingerprint.get("fingerprint_sha256") or "")
+    if path is None or not path.is_file():
+        return {
+            "path": _evidence_path(path) if path is not None else "",
+            "sha256": "",
+            "date": None,
+            "candidateFingerprint": candidate_digest,
+            "fresh": False,
+        }, [f"{name} gate artifact is missing"], {}
+    try:
+        raw_artifact = path.read_bytes()
+        payload = json.loads(raw_artifact.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        raw_artifact = b""
+        payload = {}
+    if not isinstance(payload, dict) or not payload:
+        return {
+            "path": _evidence_path(path),
+            "sha256": hashlib.sha256(raw_artifact).hexdigest() if raw_artifact else "",
+            "date": None,
+            "candidateFingerprint": candidate_digest,
+            "fresh": False,
+        }, [f"{name} gate artifact is invalid"], {}
+    reasons: list[str] = []
+    artifact_date = str(payload.get("date") or "")
+    if artifact_date != report_date:
+        reasons.append(f"{name} gate artifact is not date-aligned")
+    explicit_candidate = str(payload.get("candidate_fingerprint") or "")
+    if explicit_candidate and explicit_candidate != candidate_digest:
+        reasons.append(f"{name} gate artifact candidate fingerprint does not match")
+    artifact_time: datetime | None = None
+    age_seconds: float | None = None
+    try:
+        artifact_time = _artifact_timestamp(payload, path)
+        age = now.astimezone(timezone.utc) - artifact_time
+        age_seconds = age.total_seconds()
+        if age < -timedelta(minutes=5):
+            reasons.append(f"{name} gate artifact is future-dated")
+        elif age > MAX_GATE_ARTIFACT_AGE:
+            reasons.append(f"{name} gate artifact is stale")
+    except (OSError, ValueError):
+        reasons.append(f"{name} gate artifact timestamp is invalid")
+    return {
+        "path": _evidence_path(path),
+        "sha256": hashlib.sha256(raw_artifact).hexdigest(),
+        "sizeBytes": len(raw_artifact),
+        "date": artifact_date or None,
+        "artifactTimestamp": artifact_time.isoformat() if artifact_time else None,
+        "ageSeconds": round(age_seconds, 3) if age_seconds is not None else None,
+        "candidateFingerprint": candidate_digest,
+        "producerCandidateFingerprint": explicit_candidate or None,
+        "fresh": not any("stale" in reason or "future-dated" in reason or "timestamp" in reason for reason in reasons),
+    }, reasons, payload
+
+
+def publication_snapshot_readiness(
+    report_date: str,
+    *,
+    candidate_fingerprint: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    candidate = candidate_fingerprint if isinstance(candidate_fingerprint, dict) else {}
+    candidate_errors = candidate_fingerprint_errors(candidate)
+    if candidate.get("date") != report_date:
+        candidate_errors.append("candidate fingerprint date does not match publication date")
+    reasons = list(candidate_errors)
+
+    cycle_path = cycle_audit_path(report_date)
+    quality_path = DATA_DIR / f"research-quality-{report_date}.json"
+    artifact_paths = {
+        "cycle": cycle_path,
+        "researchQuality": quality_path,
+        "selfHealing": ATLAS_SELF_HEALING_LATEST,
+        "improvements": ATLAS_IMPROVEMENTS_LATEST,
+        "alerts": ATLAS_ALERTS_LATEST,
+        "backup": ATLAS_BACKUPS_LATEST,
+    }
+    checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    gate_artifacts: dict[str, Any] = {}
+    artifact_payloads: dict[str, dict[str, Any]] = {}
+    for name, path in artifact_paths.items():
+        attestation, artifact_reasons, artifact_payload = _gate_artifact_attestation(
+            name=name,
+            path=path,
+            report_date=report_date,
+            candidate_fingerprint=candidate,
+            now=checked_at,
+        )
+        gate_artifacts[name] = attestation
+        artifact_payloads[name] = artifact_payload
+        reasons.extend(artifact_reasons)
+
+    status = _publication_snapshot_status_checks(report_date, artifacts=artifact_payloads)
+    reasons = [*(status.get("reasons") or []), *reasons]
+    evidence = dict(status.get("evidence") or {})
+    quality = artifact_payloads.get("researchQuality", {})
+    if (
+        not isinstance(quality, dict)
+        or quality.get("operational_passed") is not True
+        or quality.get("report_sha256") != candidate.get("report_sha256")
+        or not isinstance(quality.get("report_audit"), dict)
+        or quality.get("report_audit", {}).get("passed") is not True
+    ):
+        reasons.append("research quality artifact is not bound to the current report SHA")
+
+    cycle = artifact_payloads.get("cycle", {})
+    workspace_lock = cycle.get("workspace_lock", {}) if isinstance(cycle, dict) else {}
+    repositories = workspace_lock.get("repositories", []) if isinstance(workspace_lock, dict) else []
+    workspace_commits = {
+        str(item.get("name") or ""): str(item.get("commit") or "").lower()
+        for item in repositories
+        if isinstance(item, dict)
+    }
+    if workspace_commits != candidate.get("repository_commits"):
+        reasons.append("cycle workspace lock is not bound to the current three-repository commits")
+
+    evidence.update({
+        "candidateFingerprint": candidate,
+        "candidateFingerprintSha256": candidate.get("fingerprint_sha256"),
+        "candidateFormula": candidate.get("formula"),
+        "attestedAt": checked_at.isoformat(),
+        "gateArtifacts": gate_artifacts,
+    })
+    reasons = list(dict.fromkeys(reasons))
+    return {"ready": not reasons, "reasons": reasons, "evidence": evidence}
 
 
 def publication_snapshot_errors(
@@ -1871,6 +2545,7 @@ def publication_snapshot_errors(
 ) -> list[str]:
     errors: list[str] = []
     payload = snapshot.get("payload")
+    candidate = snapshot.get("candidate_fingerprint")
     if snapshot.get("schema_version") != PUBLICATION_SNAPSHOT_SCHEMA_VERSION:
         errors.append("publication snapshot schema version is invalid")
     if snapshot.get("date") != report_date:
@@ -1880,6 +2555,17 @@ def publication_snapshot_errors(
         errors.append("report changed after publication snapshot freeze; explicit refresh is required")
     if snapshot.get("content_hash") != content_hash:
         errors.append("publication snapshot content hash is inconsistent")
+    if not isinstance(candidate, dict):
+        errors.append("publication snapshot candidate fingerprint is missing")
+        candidate = {}
+    else:
+        errors.extend(candidate_fingerprint_errors(candidate))
+    if candidate.get("date") != report_date:
+        errors.append("publication snapshot candidate date is inconsistent")
+    if candidate.get("report_sha256") != report_hash:
+        errors.append("publication snapshot candidate report hash is inconsistent")
+    if candidate.get("site_input_hash") != content_hash:
+        errors.append("publication snapshot candidate site input hash is inconsistent")
     if not isinstance(payload, dict):
         errors.append("publication snapshot payload is missing")
     else:
@@ -1887,7 +2573,27 @@ def publication_snapshot_errors(
             errors.append("frozen payload content hash is inconsistent")
         if snapshot.get("payload_sha256") != payload_sha256(payload):
             errors.append("publication snapshot payload hash is inconsistent")
+        if candidate.get("payload_sha256") != snapshot.get("payload_sha256"):
+            errors.append("publication snapshot candidate payload hash is inconsistent")
         errors.extend(validate_payload(payload))
+    prerequisites = snapshot.get("prerequisites")
+    if not isinstance(prerequisites, dict):
+        errors.append("publication snapshot prerequisites are missing")
+    else:
+        if prerequisites.get("candidateFingerprintSha256") != candidate.get("fingerprint_sha256"):
+            errors.append("publication snapshot prerequisites are not bound to the candidate fingerprint")
+        if prerequisites.get("candidateFingerprint") != candidate:
+            errors.append("publication snapshot prerequisite candidate inputs are inconsistent")
+        gate_artifacts = prerequisites.get("gateArtifacts")
+        if not isinstance(gate_artifacts, dict) or not gate_artifacts:
+            errors.append("publication snapshot gate artifact attestations are missing")
+        elif any(
+            not isinstance(item, dict)
+            or item.get("candidateFingerprint") != candidate.get("fingerprint_sha256")
+            or not re.fullmatch(r"[0-9a-f]{64}", str(item.get("sha256") or ""))
+            for item in gate_artifacts.values()
+        ):
+            errors.append("publication snapshot gate artifacts are not bound to the candidate fingerprint")
     return errors
 
 
@@ -1919,9 +2625,22 @@ def freeze_publication_snapshot(
     raw_report: bytes,
     content_hash: str,
     payload: dict[str, Any],
+    candidate_fingerprint: dict[str, Any],
     refresh: bool = False,
 ) -> dict[str, Any]:
-    readiness = publication_snapshot_readiness(report_date)
+    expected_candidate = build_candidate_fingerprint(
+        report_date=report_date,
+        raw_report=raw_report,
+        content_hash=content_hash,
+        payload=payload,
+        repository_commits=candidate_fingerprint.get("repository_commits"),
+    )
+    if candidate_fingerprint != expected_candidate:
+        raise ValueError("candidate fingerprint does not match the current report, site input, payload, and repositories")
+    readiness = publication_snapshot_readiness(
+        report_date,
+        candidate_fingerprint=candidate_fingerprint,
+    )
     if readiness.get("ready") is not True:
         raise ValueError("publication snapshot prerequisites failed: " + "; ".join(readiness.get("reasons") or []))
     path = publication_snapshot_path(report_date)
@@ -1929,9 +2648,6 @@ def freeze_publication_snapshot(
     if existing and not refresh:
         raise ValueError("publication snapshot already exists; use --refresh-publication-snapshot after rerunning all gates")
     revision = int(existing.get("revision") or 0) + 1 if isinstance(existing, dict) else 1
-    if existing:
-        history_path = PUBLICATION_SNAPSHOT_ROOT / "history" / report_date / f"revision-{revision - 1}.json"
-        write_json_atomic(history_path, existing)
     snapshot = {
         "schema_version": PUBLICATION_SNAPSHOT_SCHEMA_VERSION,
         "date": report_date,
@@ -1940,6 +2656,7 @@ def freeze_publication_snapshot(
         "report_sha256": hashlib.sha256(raw_report).hexdigest(),
         "content_hash": content_hash,
         "payload_sha256": payload_sha256(payload),
+        "candidate_fingerprint": candidate_fingerprint,
         "prerequisites": readiness["evidence"],
         "payload": payload,
     }
@@ -1951,6 +2668,9 @@ def freeze_publication_snapshot(
     )
     if errors:
         raise ValueError("cannot freeze invalid publication snapshot: " + "; ".join(errors))
+    if existing:
+        history_path = PUBLICATION_SNAPSHOT_ROOT / "history" / report_date / f"revision-{revision - 1}.json"
+        write_json_atomic(history_path, existing)
     write_json_atomic(path, snapshot)
     return snapshot
 
@@ -1980,15 +2700,78 @@ def main() -> int:
     args = parser.parse_args()
 
     state = load_json(STATE_FILE, {})
+    if not isinstance(state, dict):
+        state = {}
     if args.mark_deployed:
         current_payload = load_json(SITE_DATA, {})
-        current_payload_sha = payload_sha256(current_payload) if isinstance(current_payload, dict) else ""
-        report_date = str(current_payload.get("reportDate") or "") if isinstance(current_payload, dict) else ""
+        current_manifest = load_json(SITE_PUBLICATION_MANIFEST, {})
+        deployment_reasons: list[str] = []
+        if not isinstance(current_payload, dict):
+            current_payload = {}
+            deployment_reasons.append("current site payload is missing or invalid")
+        current_payload_sha = payload_sha256(current_payload)
+        if not isinstance(current_manifest, dict):
+            current_manifest = {}
+            deployment_reasons.append("current publication manifest is missing or invalid")
+        current_manifest_sha = payload_sha256(current_manifest)
+        report_date = str(current_payload.get("reportDate") or "")
+        content_hash = str(current_payload.get("contentHash") or "")
+        if content_hash != args.mark_deployed:
+            deployment_reasons.append("--mark-deployed does not match the current site payload content hash")
+        if validate_payload(current_payload):
+            deployment_reasons.append("current site payload does not pass publication validation")
+        pending_snapshot_revision = state.get("pending_snapshot_revision")
+        pending_snapshot_sha = str(state.get("pending_snapshot_sha256") or "")
+        if (
+            state.get("pending_sha") != args.mark_deployed
+            or state.get("pending_payload_sha") != current_payload_sha
+            or state.get("pending_manifest_sha") != current_manifest_sha
+            or state.get("pending_date") != report_date
+        ):
+            deployment_reasons.append("deployment does not match the pending site payload")
+        if not isinstance(pending_snapshot_revision, int) or pending_snapshot_revision <= 0 or not pending_snapshot_sha:
+            deployment_reasons.append("pending deployment is not bound to a frozen publication snapshot")
+
+        snapshot: dict[str, Any] | None = None
+        snapshot_sha = ""
+        try:
+            report_path, selected_date = report_for_date(report_date)
+            raw_report = report_path.read_bytes()
+            current_input_hash = site_input_hash(raw_report, selected_date)
+            if current_input_hash != content_hash:
+                deployment_reasons.append("current report inputs drifted after publication snapshot freeze")
+            snapshot = load_publication_snapshot(report_date, raw_report, content_hash)
+        except (FileNotFoundError, OSError, ValueError) as error:
+            deployment_reasons.append(f"cannot reload frozen publication snapshot: {error}")
+        if isinstance(snapshot, dict):
+            snapshot_sha = publication_snapshot_sha256(snapshot)
+            if snapshot.get("revision") != pending_snapshot_revision:
+                deployment_reasons.append("pending publication snapshot revision does not match the frozen snapshot")
+            if snapshot_sha != pending_snapshot_sha:
+                deployment_reasons.append("pending publication snapshot hash does not match the frozen snapshot")
+            if snapshot.get("payload_sha256") != current_payload_sha or snapshot.get("payload") != current_payload:
+                deployment_reasons.append("current site payload is not the exact frozen publication payload")
+            manifest_errors = publication_manifest_errors(
+                current_manifest,
+                payload=current_payload,
+                snapshot=snapshot,
+            )
+            deployment_reasons.extend(manifest_errors)
+        else:
+            deployment_reasons.append("frozen publication snapshot is missing")
+
+        if deployment_reasons:
+            print(json.dumps({
+                "status": "error",
+                "error": "cannot mark an unfrozen or mismatched deployment",
+                "reasons": deployment_reasons,
+            }, ensure_ascii=False))
+            return 2
+
         verification_path = args.verification_artifact or DATA_DIR / f"production-verification-{report_date}.json"
         verification_errors, verification = deployment_verification_errors(
             verification_path,
-            expected_content_hash=args.mark_deployed,
-            expected_payload_sha256=current_payload_sha,
+            expected_manifest=current_manifest,
             deployment_url=args.deployment_url,
         )
         if verification_errors:
@@ -2002,34 +2785,51 @@ def main() -> int:
         state.update({
             "last_deployed_sha": args.mark_deployed,
             "last_deployed_payload_sha": current_payload_sha,
-            "last_deployed_snapshot_revision": state.get("pending_snapshot_revision"),
-            "last_deployed_snapshot_sha256": state.get("pending_snapshot_sha256"),
+            "last_deployed_manifest_sha": current_manifest_sha,
+            "last_deployed_snapshot_revision": snapshot.get("revision") if isinstance(snapshot, dict) else None,
+            "last_deployed_snapshot_sha256": snapshot_sha,
+            "last_deployed_build_id": current_manifest.get("buildId"),
+            "last_deployed_deployment_id": current_manifest.get("deploymentId"),
             "last_deployed_at": datetime.now(timezone.utc).isoformat(),
             "deployment_url": args.deployment_url,
             "last_deployment_verified_at": verification.get("checked_at"),
             "last_deployment_verification_artifact": str(verification_path),
             "last_deployment_verification_sha256": hashlib.sha256(verification_path.read_bytes()).hexdigest(),
+            "last_deployment_connected_ip": verification.get("network", {}).get("connected_ip"),
         })
-        pending_payload_sha = str(state.get("pending_payload_sha") or "")
-        if state.get("pending_sha") == args.mark_deployed and (not pending_payload_sha or pending_payload_sha == current_payload_sha):
-            for key in (
-                "pending_sha",
-                "pending_payload_sha",
-                "pending_report",
-                "pending_date",
-                "pending_snapshot_revision",
-                "pending_snapshot_sha256",
-            ):
-                state.pop(key, None)
+        for key in (
+            "pending_sha",
+            "pending_payload_sha",
+            "pending_manifest_sha",
+            "pending_report",
+            "pending_date",
+            "pending_snapshot_revision",
+            "pending_snapshot_sha256",
+            "pending_build_id",
+            "pending_deployment_id",
+        ):
+            state.pop(key, None)
         write_json_atomic(STATE_FILE, state)
         print(json.dumps({
             "status": "marked",
             "sha256": args.mark_deployed,
             "payload_sha256": current_payload_sha,
+            "build_id": current_manifest.get("buildId"),
+            "deployment_id": current_manifest.get("deploymentId"),
             "deployment_url": args.deployment_url,
             "verification_artifact": str(verification_path),
         }, ensure_ascii=False))
         return 0
+
+    dependency_errors = site_dependency_source_errors()
+    if dependency_errors:
+        print(json.dumps({
+            "status": "error",
+            "error": "site dependency source preflight failed",
+            "reasons": dependency_errors[:50],
+            "reason_count": len(dependency_errors),
+        }, ensure_ascii=False))
+        return 2
 
     try:
         report_path, report_date = report_for_date(args.date)
@@ -2057,6 +2857,20 @@ def main() -> int:
     if candidate_errors:
         print(json.dumps({"status": "error", "date": report_date, "errors": candidate_errors}, ensure_ascii=False, indent=2))
         return 2
+    try:
+        candidate_fingerprint = build_candidate_fingerprint(
+            report_date=report_date,
+            raw_report=raw,
+            content_hash=sha256,
+            payload=candidate_payload,
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        print(json.dumps({
+            "status": "error",
+            "date": report_date,
+            "error": f"cannot build canonical publication candidate fingerprint: {error}",
+        }, ensure_ascii=False))
+        return 2
     if args.candidate_only:
         print(json.dumps({
             "status": "candidate_valid",
@@ -2066,32 +2880,50 @@ def main() -> int:
             "date": report_date,
             "events": len(candidate_payload["events"]),
             "scenarios": len(candidate_payload["scenarios"]),
+            "candidate_fingerprint": candidate_fingerprint,
         }, ensure_ascii=False))
         return 0
     snapshot: dict[str, Any] | None = None
     snapshot_status = "not_ready"
+    snapshot_conflict = ""
     if not args.refresh_publication_snapshot:
         try:
             snapshot = load_publication_snapshot(report_date, raw, sha256)
         except ValueError as error:
-            print(json.dumps({
-                "status": "error",
-                "date": report_date,
-                "error": str(error),
-                "snapshot": "conflict",
-            }, ensure_ascii=False))
-            return 2
+            # A legacy or drifted snapshot must never be silently replaced.
+            # Keep the cycle operable by staging the current candidate; only an
+            # explicit refresh can supersede the conflicting frozen record.
+            snapshot_conflict = str(error)
+            snapshot_status = "conflict"
     if snapshot is not None:
         payload = snapshot["payload"]
         snapshot_status = "frozen"
+        readiness = {
+            "ready": True,
+            "reasons": [],
+            "evidence": snapshot.get("prerequisites", {}),
+            "source": "frozen_snapshot",
+        }
     else:
         payload = candidate_payload
+        readiness = publication_snapshot_readiness(
+            report_date,
+            candidate_fingerprint=candidate_fingerprint,
+        )
+        if snapshot_conflict:
+            readiness = {
+                **readiness,
+                "ready": False,
+                "reasons": list(dict.fromkeys([
+                    *(readiness.get("reasons") or []),
+                    f"existing publication snapshot conflicts with the candidate: {snapshot_conflict}",
+                ])),
+            }
     payload_hash = payload_sha256(payload)
     validation_errors = validate_payload(payload)
     if validation_errors:
         print(json.dumps({"status": "error", "date": report_date, "errors": validation_errors}, ensure_ascii=False, indent=2))
         return 2
-    readiness = publication_snapshot_readiness(report_date)
     if snapshot is None and readiness.get("ready") is True:
         if args.dry_run:
             snapshot_status = "ready_to_freeze"
@@ -2102,6 +2934,7 @@ def main() -> int:
                     raw_report=raw,
                     content_hash=sha256,
                     payload=payload,
+                    candidate_fingerprint=candidate_fingerprint,
                     refresh=args.refresh_publication_snapshot,
                 )
             except ValueError as error:
@@ -2113,6 +2946,39 @@ def main() -> int:
                 }, ensure_ascii=False))
                 return 2
             snapshot_status = "refreshed" if args.refresh_publication_snapshot else "created"
+    elif snapshot is None and not args.dry_run:
+        staged_path = stage_publication_candidate(
+            report_date=report_date,
+            report_path=report_path,
+            payload=candidate_payload,
+            candidate_fingerprint=candidate_fingerprint,
+            readiness=readiness,
+        )
+        state.update({
+            "staged_sha": sha256,
+            "staged_payload_sha": candidate_payload_hash,
+            "staged_candidate_fingerprint": candidate_fingerprint["fingerprint_sha256"],
+            "staged_report": str(report_path),
+            "staged_date": report_date,
+            "staged_path": str(staged_path),
+            "last_checked_at": datetime.now(timezone.utc).isoformat(),
+        })
+        write_json_atomic(STATE_FILE, state)
+        result = {
+            "status": "error" if args.refresh_publication_snapshot else "staged",
+            "sha256": sha256,
+            "payload_sha256": candidate_payload_hash,
+            "candidate_fingerprint": candidate_fingerprint["fingerprint_sha256"],
+            "report": str(report_path),
+            "date": report_date,
+            "staged": str(staged_path),
+            "publication_snapshot": snapshot_status,
+            "reasons": readiness.get("reasons") or [],
+        }
+        if args.refresh_publication_snapshot:
+            result["error"] = "publication snapshot refresh requires all closed-loop prerequisites"
+        print(json.dumps(result, ensure_ascii=False))
+        return 2 if args.refresh_publication_snapshot else 0
     elif args.refresh_publication_snapshot:
         print(json.dumps({
             "status": "error",
@@ -2122,7 +2988,7 @@ def main() -> int:
         }, ensure_ascii=False))
         return 2
 
-    snapshot_hash = hashlib.sha256(serialized_payload(snapshot).encode("utf-8")).hexdigest() if snapshot else ""
+    snapshot_hash = publication_snapshot_sha256(snapshot) if snapshot else ""
     snapshot_revision = int(snapshot.get("revision") or 0) if snapshot else 0
     if args.dry_run:
         print(json.dumps({
@@ -2136,24 +3002,71 @@ def main() -> int:
             "publication_snapshot": snapshot_status,
             "snapshot_revision": snapshot_revision,
             "snapshot_prerequisites": readiness,
+            "candidate_fingerprint": candidate_fingerprint["fingerprint_sha256"],
         }, ensure_ascii=False))
         return 0
-    if not args.force and state.get("last_deployed_sha") == sha256 and state.get("last_deployed_payload_sha") == payload_hash and site_data_matches(sha256, payload_hash):
-        print(json.dumps({"status": "unchanged", "sha256": sha256, "payload_sha256": payload_hash, "report": str(report_path), "date": report_date}, ensure_ascii=False))
+    if snapshot is None:
+        print(json.dumps({"status": "error", "error": "deployable site data requires a frozen snapshot"}, ensure_ascii=False))
+        return 2
+    manifest = build_publication_manifest(snapshot)
+    manifest_sha = payload_sha256(manifest)
+    if (
+        not args.force
+        and state.get("last_deployed_sha") == sha256
+        and state.get("last_deployed_payload_sha") == payload_hash
+        and state.get("last_deployed_manifest_sha") == manifest_sha
+        and site_data_matches(sha256, payload_hash, manifest)
+    ):
+        print(json.dumps({
+            "status": "unchanged",
+            "sha256": sha256,
+            "payload_sha256": payload_hash,
+            "build_id": manifest["buildId"],
+            "deployment_id": manifest["deploymentId"],
+            "report": str(report_path),
+            "date": report_date,
+        }, ensure_ascii=False))
         return 0
-    if not args.force and state.get("pending_sha") == sha256 and state.get("pending_payload_sha") == payload_hash and site_data_matches(sha256, payload_hash):
-        print(json.dumps({"status": "pending", "sha256": sha256, "payload_sha256": payload_hash, "report": str(report_path), "date": report_date, "generated": str(SITE_DATA)}, ensure_ascii=False))
+    if (
+        not args.force
+        and state.get("pending_sha") == sha256
+        and state.get("pending_payload_sha") == payload_hash
+        and state.get("pending_manifest_sha") == manifest_sha
+        and site_data_matches(sha256, payload_hash, manifest)
+    ):
+        print(json.dumps({
+            "status": "pending",
+            "sha256": sha256,
+            "payload_sha256": payload_hash,
+            "build_id": manifest["buildId"],
+            "deployment_id": manifest["deploymentId"],
+            "report": str(report_path),
+            "date": report_date,
+            "generated": str(SITE_DATA),
+        }, ensure_ascii=False))
         return 0
-    write_json_atomic(SITE_DATA, payload)
+    manifest = write_frozen_site_artifacts(snapshot)
     state.update({
         "pending_sha": sha256,
         "pending_payload_sha": payload_hash,
+        "pending_manifest_sha": manifest_sha,
         "pending_report": str(report_path),
         "pending_date": report_date,
         "pending_snapshot_revision": snapshot_revision or None,
         "pending_snapshot_sha256": snapshot_hash or None,
+        "pending_build_id": manifest["buildId"],
+        "pending_deployment_id": manifest["deploymentId"],
         "last_checked_at": datetime.now(timezone.utc).isoformat(),
     })
+    for key in (
+        "staged_sha",
+        "staged_payload_sha",
+        "staged_candidate_fingerprint",
+        "staged_report",
+        "staged_date",
+        "staged_path",
+    ):
+        state.pop(key, None)
     write_json_atomic(STATE_FILE, state)
     print(json.dumps({
         "status": "changed",
@@ -2162,8 +3075,13 @@ def main() -> int:
         "report": str(report_path),
         "date": report_date,
         "generated": str(SITE_DATA),
+        "publication_manifest": str(SITE_PUBLICATION_MANIFEST),
         "publication_snapshot": snapshot_status,
         "snapshot_revision": snapshot_revision,
+        "snapshot_sha256": snapshot_hash,
+        "candidate_fingerprint": snapshot["candidate_fingerprint"]["fingerprint_sha256"],
+        "build_id": manifest["buildId"],
+        "deployment_id": manifest["deploymentId"],
     }, ensure_ascii=False))
     return 0
 

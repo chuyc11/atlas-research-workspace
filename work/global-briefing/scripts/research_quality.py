@@ -13,6 +13,7 @@ Legacy categorical forecasts remain readable, but never enter proper scoring.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -61,8 +62,15 @@ def date_on_or_after(value: Any, threshold: date_type) -> bool:
         return False
 
 
+def strict_json_loads(text: str, *, source: str) -> Any:
+    def reject_constant(value: str) -> None:
+        raise ValueError(f"{source} contains non-standard numeric constant {value}")
+
+    return json.loads(text, parse_constant=reject_constant)
+
+
 def read_json(path: Path) -> dict[str, Any]:
-    value = json.loads(path.read_text(encoding="utf-8-sig"))
+    value = strict_json_loads(path.read_text(encoding="utf-8-sig"), source=str(path))
     if not isinstance(value, dict):
         raise ValueError(f"Expected a JSON object: {path}")
     return value
@@ -83,9 +91,42 @@ def prediction_family_indexes(registry: dict[str, Any] | None) -> tuple[dict[str
     return event_index, market_index
 
 
-def direct_auditable_url(value: Any) -> bool:
+def normalize_hostname(value: str) -> str:
+    clean = value.rstrip(".").casefold()
+    try:
+        return clean.encode("idna").decode("ascii").removeprefix("www.")
+    except UnicodeError:
+        return ""
+
+
+def auditable_url_hostname(value: Any) -> str:
     parsed = urlparse(str(value or ""))
-    return parsed.scheme in {"http", "https"} and bool(parsed.netloc) and parsed.path not in {"", "/"}
+    if parsed.scheme not in {"http", "https"} or parsed.path in {"", "/"}:
+        return ""
+    if parsed.username is not None or parsed.password is not None:
+        return ""
+    try:
+        port = parsed.port
+    except ValueError:
+        return ""
+    default_port = 443 if parsed.scheme == "https" else 80
+    if port not in {None, default_port}:
+        return ""
+    return normalize_hostname(parsed.hostname or "")
+
+
+def direct_auditable_url(value: Any) -> bool:
+    return bool(auditable_url_hostname(value))
+
+
+def canonical_original_index(records: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Use the first immutable original consistently across every consumer."""
+    originals: dict[str, dict[str, Any]] = {}
+    for row in records:
+        prediction_id = str(row.get("prediction_id") or "")
+        if prediction_id and not isinstance(row.get("review"), dict) and prediction_id not in originals:
+            originals[prediction_id] = row
+    return originals
 
 
 def read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -94,9 +135,9 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
         if not line.strip():
             continue
         try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"Invalid JSONL at {path}:{line_number}: {exc.msg}") from exc
+            value = strict_json_loads(line, source=f"{path}:{line_number}")
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ValueError(f"Invalid JSONL at {path}:{line_number}: {exc}") from exc
         if not isinstance(value, dict):
             raise ValueError(f"Invalid JSONL at {path}:{line_number}: row is not an object")
         rows.append(value)
@@ -104,7 +145,13 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
 
 
 def atomic_write_json(path: Path, payload: dict[str, Any]) -> bool:
-    text = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+    text = json.dumps(
+        payload,
+        allow_nan=False,
+        ensure_ascii=False,
+        indent=2,
+        sort_keys=True,
+    ) + "\n"
     if path.exists() and path.read_text(encoding="utf-8") == text:
         return False
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -440,11 +487,7 @@ def resolved_market_mapping_index(
 ) -> dict[str, dict[str, Any]]:
     """Index independently resolved asset mappings across every appended review."""
     resolved: dict[str, dict[str, Any]] = {}
-    originals = {
-        str(row.get("prediction_id") or ""): row
-        for row in records
-        if not isinstance(row.get("review"), dict) and row.get("prediction_id")
-    }
+    originals = canonical_original_index(records)
     for row in records:
         prediction_id = str(row.get("prediction_id") or "")
         review = row.get("review")
@@ -1403,10 +1446,69 @@ def core_story_blocks(text: str) -> list[dict[str, str]]:
     return blocks
 
 
+def normalized_domain(link: str) -> str:
+    return auditable_url_hostname(link)
+
+
+MULTI_LABEL_PUBLIC_SUFFIXES = {
+    "ac.uk",
+    "co.jp",
+    "co.uk",
+    "com.au",
+    "com.br",
+    "com.cn",
+    "com.hk",
+    "com.sg",
+    "edu.au",
+    "gov.au",
+    "gov.cn",
+    "gov.uk",
+    "net.au",
+    "org.au",
+    "org.cn",
+    "org.uk",
+}
+
+
+def registrable_domain(domain: str) -> str:
+    clean = normalize_hostname(domain)
+    labels = [label for label in clean.split(".") if label]
+    if len(labels) <= 2:
+        return clean
+    suffix = ".".join(labels[-2:])
+    return ".".join(labels[-3:]) if suffix in MULTI_LABEL_PUBLIC_SUFFIXES else suffix
+
+
+def source_family(domain: str, aliases: dict[str, Any]) -> str:
+    clean = normalize_hostname(domain)
+    for alias, family in aliases.items():
+        normalized_alias = normalize_hostname(str(alias))
+        if clean == normalized_alias or clean.endswith("." + normalized_alias):
+            return str(family)
+    return registrable_domain(clean)
+
+
+def evidence_role_links(role_text: str, label: str, story_links: set[str]) -> set[str]:
+    match = re.search(
+        rf"{re.escape(label)}\s*=\s*(.*?)(?=\s*[；;]\s*(?:一手来源|事件地区来源|外部核验)\s*=|$)",
+        role_text,
+    )
+    if not match:
+        return set()
+    return {
+        link
+        for link in LINK_RE.findall(match.group(1))
+        if link in story_links and direct_auditable_url(link)
+    }
+
+
 def audit_core_story(block: dict[str, str], policy: dict[str, Any], *, enforce_roles: bool) -> dict[str, Any]:
     body = block["body"]
     links = {link for link in LINK_RE.findall(body) if direct_auditable_url(link)}
-    domains = sorted({urlparse(link).netloc.lower().removeprefix("www.") for link in links})
+    domains = sorted({domain for link in links if (domain := normalized_domain(link))})
+    aliases = policy.get("source_family_aliases", {})
+    aliases = aliases if isinstance(aliases, dict) else {}
+    source_families = sorted({source_family(domain, aliases) for domain in domains})
     required_layers = {
         "conclusion": "结论",
         "hard_evidence": "硬证据",
@@ -1415,31 +1517,76 @@ def audit_core_story(block: dict[str, str], policy: dict[str, Any], *, enforce_r
         "falsification_signal": "证伪",
     }
     missing_layers = [name for name, label in required_layers.items() if not re.search(rf"(?:\*\*)?{label}[：:]", body)]
-    primary_suffixes = tuple(policy.get("quality_gate", {}).get("primary_domain_suffixes", []))
+    primary_suffixes = {
+        normalize_hostname(str(domain).lstrip("."))
+        for domain in policy.get("quality_gate", {}).get("primary_domain_suffixes", [])
+    }
+    primary_suffixes.discard("")
     primary_allowlist = {
-        str(domain).lower().removeprefix("www.")
+        normalize_hostname(str(domain))
         for domain in policy.get("quality_gate", {}).get("primary_domain_allowlist", [])
     }
+    primary_allowlist.discard("")
     primary_links = [
         link for link in links
-        if any(urlparse(link).netloc.lower().endswith(suffix) for suffix in primary_suffixes)
-        or urlparse(link).netloc.lower().removeprefix("www.") in primary_allowlist
+        if (
+            normalized_domain(link) in primary_allowlist
+            or any(
+                normalized_domain(link) == suffix
+                or normalized_domain(link).endswith("." + suffix)
+                for suffix in primary_suffixes
+            )
+        )
     ]
     role_match = re.search(r"(?:\*\*)?证据角色[：:]([^\n]+)", body)
     role_text = role_match.group(1) if role_match else ""
-    role_links = set(LINK_RE.findall(role_text))
+    assigned_role_links = {
+        "primary": evidence_role_links(role_text, "一手来源", links),
+        "event_region": evidence_role_links(role_text, "事件地区来源", links),
+        "external_verification": evidence_role_links(role_text, "外部核验", links),
+    }
+    unique_role_links = {
+        name: assigned - set().union(*(other for key, other in assigned_role_links.items() if key != name))
+        for name, assigned in assigned_role_links.items()
+    }
+    role_source_families = {
+        name: {
+            source_family(normalized_domain(link), aliases)
+            for link in assigned
+            if normalized_domain(link)
+        }
+        for name, assigned in assigned_role_links.items()
+    }
+    unique_role_families = {
+        name: assigned
+        - set().union(*(other for key, other in role_source_families.items() if key != name))
+        for name, assigned in role_source_families.items()
+    }
+    primary_families = {
+        source_family(normalized_domain(link), aliases) for link in primary_links
+    }
     role_coverage = {
-        "primary": bool(re.search(r"一手来源\s*=", role_text)) and bool(role_links & links),
-        "event_region": bool(re.search(r"事件地区来源\s*=", role_text)) and bool(role_links & links),
-        "external_verification": bool(re.search(r"外部核验\s*=", role_text)) and bool(role_links & links),
+        "primary": bool(
+            unique_role_links["primary"] & set(primary_links)
+            and unique_role_families["primary"] & primary_families
+        ),
+        "event_region": bool(
+            unique_role_links["event_region"] and unique_role_families["event_region"]
+        ),
+        "external_verification": bool(
+            unique_role_links["external_verification"]
+            and unique_role_families["external_verification"]
+        ),
     }
     errors: list[str] = []
     minimum_sources = int(policy.get("minimum_sources_per_core_story", 0))
     minimum_domains = int(policy.get("minimum_independent_domains_per_core_story", 0))
     if len(links) < minimum_sources:
         errors.append(f"needs {minimum_sources} direct sources; found {len(links)}")
-    if len(domains) < minimum_domains:
-        errors.append(f"needs {minimum_domains} independent domains; found {len(domains)}")
+    if len(source_families) < minimum_domains:
+        errors.append(
+            f"needs {minimum_domains} independent source families; found {len(source_families)}"
+        )
     if policy.get("require_primary_source_for_high_impact_story") is True and not primary_links:
         errors.append("needs a primary/institutional source")
     if missing_layers:
@@ -1452,9 +1599,15 @@ def audit_core_story(block: dict[str, str], policy: dict[str, Any], *, enforce_r
         "title": block["title"],
         "direct_source_count": len(links),
         "independent_domain_count": len(domains),
+        "independent_source_family_count": len(source_families),
+        "source_families": source_families,
         "primary_source_count": len(primary_links),
         "missing_layers": missing_layers,
         "role_coverage": role_coverage,
+        "role_links": {name: sorted(values) for name, values in assigned_role_links.items()},
+        "role_source_families": {
+            name: sorted(values) for name, values in role_source_families.items()
+        },
         "roles_enforced": enforce_roles,
         "errors": errors,
         "passed": not errors,
@@ -1478,13 +1631,11 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
     research_policy = policy if isinstance(policy.get("quality_gate"), dict) else {}
     quality_policy = research_policy.get("quality_gate", policy)
     links = LINK_RE.findall(text)
-    auditable_links = {
-        link for link in links
-        if urlparse(link).scheme in {"http", "https"}
-        and bool(urlparse(link).netloc)
-        and urlparse(link).path not in {"", "/"}
-    }
-    domains = sorted({urlparse(link).netloc.lower().removeprefix("www.") for link in auditable_links})
+    auditable_links = {link for link in links if direct_auditable_url(link)}
+    domains = sorted({domain for link in auditable_links if (domain := normalized_domain(link))})
+    aliases = research_policy.get("source_family_aliases", {})
+    aliases = aliases if isinstance(aliases, dict) else {}
+    source_families = sorted({source_family(domain, aliases) for domain in domains})
     requirements = {
         "minimum_report_characters": int(quality_policy.get("minimum_report_characters", 0)),
         "maximum_report_characters": int(quality_policy.get("maximum_report_characters", 10**9)),
@@ -1497,8 +1648,8 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
         errors.append("report exceeds the configured maximum")
     if len(auditable_links) < requirements["minimum_distinct_links"]:
         errors.append("report has too few distinct source links")
-    if len(domains) < requirements["minimum_distinct_domains"]:
-        errors.append("report has too few independent source domains")
+    if len(source_families) < requirements["minimum_distinct_domains"]:
+        errors.append("report has too few independent source families")
 
     required_sections = {
         "核心摘要": ["核心摘要"],
@@ -1551,6 +1702,8 @@ def audit_report(report_path: Path, policy: dict[str, Any], *, enforce: bool) ->
         "all_http_link_count": len(set(links)),
         "distinct_domain_count": len(domains),
         "domains": domains,
+        "distinct_source_family_count": len(source_families),
+        "source_families": source_families,
         "required_sections_missing": missing_sections,
         "thesis_layer_counts": layer_counts,
         "primary_thesis_count": len(story_blocks),
@@ -1576,6 +1729,7 @@ def build_quality_report(
     settings: dict[str, Any],
     evaluation_cutoff: str | None = None,
 ) -> dict[str, Any]:
+    report_sha256 = hashlib.sha256(report_path.read_bytes()).hexdigest() if report_path.is_file() else None
     cutoff = evaluation_cutoff or date
     if parse_date(cutoff) < parse_date(date):
         raise ValueError("evaluation_cutoff cannot precede the report date")
@@ -1597,7 +1751,10 @@ def build_quality_report(
         prediction_contract=contract,
         family_registry=family_registry,
     )
-    news_policy = settings.get("news_research_policy", {})
+    news_policy = dict(settings.get("news_research_policy", {}))
+    source_aliases = settings.get("drift_diagnostics", {}).get("source_family_aliases", {})
+    if isinstance(source_aliases, dict):
+        news_policy["source_family_aliases"] = source_aliases
     content_enforce_from = str(news_policy.get("enforce_from_date") or "9999-12-31")
     report_audit = audit_report(report_path, news_policy, enforce=parse_date(date) >= parse_date(content_enforce_from))
     operational_passed = prediction_audit["operational_passed"] and report_audit["passed"]
@@ -1609,6 +1766,7 @@ def build_quality_report(
     return {
         "schema_version": 1,
         "date": date,
+        "report_sha256": report_sha256,
         "evaluation_cutoff": cutoff,
         "revised": cutoff != date,
         "generated_at": datetime.now().astimezone().isoformat(),
@@ -1659,6 +1817,7 @@ def main(argv: list[str] | None = None) -> int:
         "status": status,
         "output": str(output),
         "date": args.date,
+        "report_sha256": payload["report_sha256"],
         "operational_passed": payload["operational_passed"],
         "research_ready": payload["research_ready"],
         "blocking_reasons": payload["blocking_reasons"],

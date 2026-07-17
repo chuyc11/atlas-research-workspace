@@ -134,6 +134,166 @@ class ImprovementTrackerTests(unittest.TestCase):
         self.assertNotEqual(source["status"], "verified")
         self.assertFalse(source["last_evaluation"]["evidence"]["all_core_stories_passed"])
 
+    def test_external_alerting_requires_actual_delivery_receipts(self) -> None:
+        date = "2026-07-12"
+        self.tracker.config["external_alerting"] = {
+            "enabled": True,
+            "destinations": ["codex_task_inbox"],
+            "channel_health_max_age_hours": 168,
+        }
+        spec = next(
+            item
+            for item in self.tracker.capability_specs(date)
+            if item.source_key == "capability-external-alerting"
+        )
+        action = {"eligible_from": date}
+        alert = self.root / "work" / "shared" / "atlas" / "alerts" / "latest.json"
+        write_json(
+            alert,
+            {
+                "date": date,
+                "destinations": ["codex_task_inbox"],
+                "status": "attention_required",
+                "findings": [{"severity": "medium"}],
+                "delivery_state": "pending",
+                "delivery_receipts": {},
+            },
+        )
+
+        pending = self.tracker.evaluate(spec, action, date)
+        self.assertEqual(pending.outcome, "fail")
+        self.assertEqual(
+            pending.evidence["missing_or_stale_destinations"],
+            ["codex_task_inbox"],
+        )
+
+        write_json(
+            alert,
+            {
+                "date": date,
+                "destinations": ["codex_task_inbox"],
+                "status": "attention_required",
+                "findings": [{"severity": "medium"}],
+                "delivery_state": "delivered",
+                "delivery_receipts": {
+                    "codex_task_inbox": {
+                        "receipt_id": "receipt-123",
+                        "recorded_at": "2026-07-12T01:00:00Z",
+                    }
+                },
+            },
+        )
+        delivered = self.tracker.evaluate(spec, action, date)
+
+        self.assertEqual(delivered.outcome, "fail")
+
+        channel_health = self.root / "work" / "shared" / "atlas" / "alerts" / "channel_health.json"
+        write_json(
+            channel_health,
+            {
+                "schema_version": 1,
+                "updated_at": "2026-07-12T01:00:00Z",
+                "destinations": {
+                    "codex_task_inbox": {
+                        "status": "healthy",
+                        "destination": "codex_task_inbox",
+                        "provider_message_id": "receipt-123",
+                        "receipt_id": "receipt-123",
+                        "verified_at": "2026-07-12T01:00:00Z",
+                        "source_alert_id": "ATLAS-ALERT-1",
+                        "source_alert_date": date,
+                    }
+                },
+            },
+        )
+        delivered = self.tracker.evaluate(spec, action, date)
+
+        self.assertEqual(delivered.outcome, "pass")
+        self.assertEqual(delivered.evidence["healthy_destinations"], ["codex_task_inbox"])
+
+        alert_payload = json.loads(alert.read_text(encoding="utf-8"))
+        alert_payload.update(
+            {
+                "status": "attention_required",
+                "findings": [{"severity": "high"}],
+                "requires_acknowledgement": True,
+                "delivery_state": "delivered",
+            }
+        )
+        write_json(alert, alert_payload)
+        unacknowledged = self.tracker.evaluate(spec, action, date)
+        self.assertEqual(unacknowledged.outcome, "fail")
+        self.assertFalse(unacknowledged.evidence["acknowledgement_satisfied"])
+
+        alert_payload.update(
+            {
+                "delivery_state": "acknowledged",
+                "acknowledged_at": "2026-07-12T02:00:00Z",
+                "acknowledged_by": "operator",
+            }
+        )
+        write_json(alert, alert_payload)
+        acknowledged = self.tracker.evaluate(spec, action, date)
+        self.assertEqual(acknowledged.outcome, "pass")
+
+        write_json(
+            alert,
+            {
+                "date": date,
+                "status": "healthy",
+                "delivery_state": "not_required",
+                "findings": [],
+            },
+        )
+        healthy_day = self.tracker.evaluate(spec, action, date)
+        self.assertEqual(healthy_day.outcome, "pass")
+
+    def test_disaster_recovery_requires_authenticated_encryption_when_configured(self) -> None:
+        date = "2026-07-12"
+        self.tracker.config["disaster_recovery"] = {
+            "enabled": True,
+            "maximum_backup_age_hours": 24,
+            "encryption": {"required": True, "algorithm": "AES-256-GCM"},
+        }
+        spec = next(
+            item
+            for item in self.tracker.capability_specs(date)
+            if item.source_key == "capability-disaster-recovery"
+        )
+        action = {"eligible_from": date}
+        latest = self.root / "work" / "shared" / "atlas" / "backups" / "latest.json"
+        with tempfile.TemporaryDirectory() as external:
+            archive = Path(external) / "backup.atlasdr"
+            archive.write_bytes(b"encrypted backup")
+            payload = {
+                "archive": str(archive),
+                "created_at": MODULE.utc_now(),
+                "archive_integrity_verified": True,
+                "restore_verified": True,
+                "restore_scope": "configured_workspace_files_and_git_bundles",
+                "encrypted": False,
+                "encryption_algorithm": None,
+                "encrypted_container_authenticated": False,
+                "full_runtime_restore_verified": False,
+            }
+            write_json(latest, payload)
+
+            unencrypted = self.tracker.evaluate(spec, action, date)
+            self.assertEqual(unencrypted.outcome, "fail")
+
+            payload.update(
+                {
+                    "encrypted": True,
+                    "encryption_algorithm": "AES-256-GCM",
+                    "encrypted_container_authenticated": True,
+                }
+            )
+            write_json(latest, payload)
+            encrypted = self.tracker.evaluate(spec, action, date)
+
+        self.assertEqual(encrypted.outcome, "pass")
+        self.assertFalse(encrypted.evidence["full_runtime_restore_verified"])
+
     def test_paper_attribution_uses_only_allowlisted_safe_fixer(self) -> None:
         target = self.root / "work" / "global-briefing" / "data" / "paper-attribution-day-2026-07-12.json"
 

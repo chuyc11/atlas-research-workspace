@@ -1,0 +1,6 @@
+[submodule "src"]
+	path = src
+	url = https://github.com/chuyc11/atlas-global-briefing-site.git
+[submodule "work/trading-core"]
+	path = work/trading-core
+	url = https://github.com/chuyc11/atlas-trading-core.git

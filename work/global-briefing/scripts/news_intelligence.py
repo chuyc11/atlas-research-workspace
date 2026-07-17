@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import re
+import sys
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +17,11 @@ from urllib.parse import urlparse
 
 
 SCRIPT_PATH = Path(__file__).resolve()
+if str(SCRIPT_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_PATH.parent))
+
+from report_clock import report_date as current_report_date  # noqa: E402
+
 ROOT = SCRIPT_PATH.parents[3]
 SETTINGS_PATH = ROOT / "work" / "global-briefing" / "config" / "settings.json"
 SOURCES_PATH = ROOT / "work" / "global-briefing" / "config" / "sources.json"
@@ -397,7 +403,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--output", type=Path, default=None)
     args = parser.parse_args(argv)
-    output = args.output or DATA_DIR / f"news-intelligence-{datetime.now().strftime('%Y-%m-%d')}.json"
+    output = args.output or DATA_DIR / f"news-intelligence-{current_report_date()}.json"
     result = build_intelligence_file(args.input, output)
     print(f"clusters={result['event_cluster_count']} core={len(result['core_research_queue'])}")
     print(output)

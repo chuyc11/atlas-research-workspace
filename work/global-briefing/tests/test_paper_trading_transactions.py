@@ -7,7 +7,10 @@ import socket
 import sys
 import tempfile
 import unittest
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
+from unittest import mock
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "paper_trading.py"
@@ -85,6 +88,28 @@ class PaperTradingTransactionTests(unittest.TestCase):
             "reason": "transaction test",
             "risk": "test risk",
         }
+
+    def enable_china_account(self) -> None:
+        self.config["accounts"]["CHINA"] = {
+            "account_id": "test-china-paper",
+            "market_scope": "CHINA",
+            "base_currency": "CNY",
+            "fx_rates_to_base": {"CNY": 1.0, "HKD": 0.8},
+            "initial_cash": 100000.0,
+            "base_unit": "points",
+            "allowed_market_types": ["A_SHARE", "HK"],
+            "portfolio_file": "data/china-portfolio.json",
+            "trades_file": "data/china-trades.jsonl",
+            "valuations_file": "data/china-valuations.jsonl",
+        }
+        self.config["market_rules"]["HK"] = {
+            "exchanges": ["HK", "HKEX"],
+            "currency": "HKD",
+            "integer_quantity": True,
+            "allow_same_day_sell": True,
+        }
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+        MODULE.ensure_files(reset=True, account="CHINA")
 
     def test_repeating_same_order_is_a_no_write_idempotent_replay(self) -> None:
         path = self.write_orders([self.order("ORDER-001")])
@@ -394,6 +419,678 @@ class PaperTradingTransactionTests(unittest.TestCase):
         buy = self.order("ORDER-HISTORY-BUY")
         with self.assertRaisesRegex(ValueError, "registry history gate"):
             MODULE.apply_orders(self.write_orders([buy]), "2026-07-14", account="US")
+
+    def test_non_finite_numbers_negative_fees_and_non_standard_json_are_rejected_without_writes(self) -> None:
+        portfolio_path = self.root / "data" / "portfolio.json"
+        initial_portfolio = portfolio_path.read_bytes()
+        invalid_orders = []
+
+        invalid_price = self.order("BAD-PRICE")
+        invalid_price["price"] = "NaN"
+        invalid_orders.append((invalid_price, "price.*finite"))
+
+        invalid_quantity = self.order("BAD-QUANTITY")
+        invalid_quantity["quantity"] = "Infinity"
+        invalid_quantity["notional"] = None
+        invalid_orders.append((invalid_quantity, "quantity.*finite"))
+
+        invalid_notional = self.order("BAD-NOTIONAL")
+        invalid_notional["notional"] = "-Infinity"
+        invalid_orders.append((invalid_notional, "notional.*finite"))
+
+        invalid_fx = self.order("BAD-FX")
+        invalid_fx["fx_to_base"] = "NaN"
+        invalid_orders.append((invalid_fx, "fx_to_base.*finite"))
+
+        invalid_fee = self.order("BAD-FEE")
+        invalid_fee["fee"] = -1
+        invalid_orders.append((invalid_fee, "fee.*non-negative"))
+
+        invalid_tax = self.order("BAD-TAX")
+        invalid_tax["tax"] = -0.01
+        invalid_orders.append((invalid_tax, "tax.*non-negative"))
+
+        for order, pattern in invalid_orders:
+            with self.subTest(order_id=order["order_id"]):
+                with self.assertRaisesRegex(ValueError, pattern):
+                    MODULE.apply_orders(self.write_orders([order]), "2026-07-10", account="US")
+                self.assertEqual(portfolio_path.read_bytes(), initial_portfolio)
+                self.assertEqual(MODULE.read_jsonl(self.root / "data" / "trades.jsonl"), [])
+
+        raw_path = self.root / "raw-nan-orders.json"
+        raw_path.write_text(
+            '{"orders":[{"account":"US","action":"BUY","symbol":"AAA","exchange":"NASDAQ",'
+            '"notional":1000,"price":NaN,"reason":"bad json","risk":"bad"}]}',
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "non-standard numeric constant NaN"):
+            MODULE.apply_orders(raw_path, "2026-07-10", account="US")
+
+        output_path = self.root / "nan-output.json"
+        with self.assertRaises(ValueError):
+            MODULE.atomic_write_json(output_path, {"value": float("nan")})
+        self.assertFalse(output_path.exists())
+
+    def test_order_date_must_be_strict_iso_and_equal_the_run_date(self) -> None:
+        backdated = self.order("BACKDATED")
+        backdated["date"] = "2026-07-09"
+        with self.assertRaisesRegex(ValueError, "must equal run date"):
+            MODULE.apply_orders(self.write_orders([backdated]), "2026-07-10", account="US")
+
+        malformed = self.order("MALFORMED-DATE")
+        malformed["date"] = "2026-7-10"
+        with self.assertRaisesRegex(ValueError, "strict ISO"):
+            MODULE.apply_orders(self.write_orders([malformed]), "2026-07-10", account="US")
+
+        with self.assertRaisesRegex(ValueError, "strict ISO"):
+            MODULE.apply_orders(self.write_orders([self.order("BAD-RUN-DATE")]), "2026-7-10", account="US")
+
+        self.assertEqual(MODULE.read_jsonl(self.root / "data" / "trades.jsonl"), [])
+
+    def test_report_timezone_controls_business_date_and_local_record_timestamp_at_utc_boundary(self) -> None:
+        settings_path = self.root / "work" / "global-briefing" / "config" / "settings.json"
+        settings_path.parent.mkdir(parents=True)
+        settings_path.write_text(
+            json.dumps({"timezone": "Asia/Shanghai"}),
+            encoding="utf-8",
+        )
+        instant = datetime(2026, 7, 10, 16, 30, tzinfo=UTC)
+
+        self.assertEqual(MODULE.current_business_date(instant), "2026-07-11")
+        self.assertEqual(MODULE.now_iso(instant), "2026-07-11T00:30:00+08:00")
+        self.assertEqual(MODULE.utc_now_iso(instant), "2026-07-10T16:30:00+00:00")
+
+        orders_path = self.write_orders([self.order("DEFAULT-DATE")])
+        with (
+            mock.patch.object(MODULE, "current_business_date", return_value="2026-07-11"),
+            mock.patch.object(MODULE, "apply_orders", return_value=[]) as apply_orders,
+        ):
+            result = MODULE.main(
+                [
+                    "apply-orders",
+                    "--input",
+                    str(orders_path),
+                    "--account",
+                    "US",
+                ]
+            )
+
+        self.assertEqual(result, 0)
+        apply_orders.assert_called_once_with(orders_path, "2026-07-11", account="US")
+
+    def test_mark_uses_price_date_and_fails_closed_on_conflict_missing_date_or_empty_price(self) -> None:
+        MODULE.apply_orders(self.write_orders([self.order("ORDER-MARK-DATE")]), "2026-07-10", account="US")
+        prices = self.root / "prices.json"
+        prices.write_text(
+            json.dumps(
+                {
+                    "prices": [
+                        {
+                            "account": "US",
+                            "symbol": "AAA",
+                            "exchange": "NASDAQ",
+                            "price": 110,
+                            "price_date": "2026-07-10",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        valuation = MODULE.mark_to_market(prices, "2026-07-10", account="US")[0]
+
+        self.assertEqual(valuation["price_snapshot"][0]["price_date"], "2026-07-10")
+        self.assertEqual(
+            MODULE.load_state("US")["last_prices"]["NASDAQ:AAA"]["date"],
+            "2026-07-10",
+        )
+        state_before = (self.root / "data" / "portfolio.json").read_bytes()
+        ledger_before = (self.root / "data" / "valuations.jsonl").read_bytes()
+
+        conflicting = self.root / "conflicting-prices.json"
+        conflicting.write_text(
+            json.dumps(
+                {
+                    "prices": [
+                        {
+                            "account": "US",
+                            "symbol": "AAA",
+                            "exchange": "NASDAQ",
+                            "price": 111,
+                            "price_date": "2026-07-11",
+                            "date": "2026-07-10",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts with date"):
+            MODULE.mark_to_market(conflicting, "2026-07-11", account="US")
+
+        missing_date = self.root / "missing-date-prices.json"
+        missing_date.write_text(
+            json.dumps(
+                {
+                    "prices": [
+                        {
+                            "account": "US",
+                            "symbol": "AAA",
+                            "exchange": "NASDAQ",
+                            "price": 111,
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "requires an explicit price_date"):
+            MODULE.mark_to_market(missing_date, "2026-07-11", account="US")
+
+        empty_price = self.root / "empty-prices.json"
+        empty_price.write_text(
+            json.dumps(
+                {
+                    "prices": [
+                        {
+                            "account": "US",
+                            "symbol": "AAA",
+                            "exchange": "NASDAQ",
+                            "price": None,
+                            "price_date": "2026-07-11",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            MODULE.mark_to_market(empty_price, "2026-07-11", account="US")
+
+        self.assertEqual((self.root / "data" / "portfolio.json").read_bytes(), state_before)
+        self.assertEqual((self.root / "data" / "valuations.jsonl").read_bytes(), ledger_before)
+
+    def test_stale_open_position_blocks_valuation_by_default(self) -> None:
+        MODULE.apply_orders(self.write_orders([self.order("ORDER-STALE")]), "2026-07-10", account="US")
+        prices = self.root / "stale-prices.json"
+        prices.write_text(
+            json.dumps(
+                {
+                    "prices": [
+                        {
+                            "account": "US",
+                            "symbol": "AAA",
+                            "exchange": "NASDAQ",
+                            "price": 110,
+                            "price_date": "2026-07-10",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "Valuation blocked.*stale_price"):
+            MODULE.mark_to_market(prices, "2026-07-14", account="US")
+
+        self.assertEqual(MODULE.read_jsonl(self.root / "data" / "valuations.jsonl"), [])
+        self.assertEqual(MODULE.load_state("US")["as_of_date"], "2026-07-10")
+
+    def test_partial_stale_policy_never_labels_stale_valuation_healthy(self) -> None:
+        self.config["valuation_policy"] = {
+            "stale_price_policy": "partial",
+            "max_price_age_business_days": 1,
+        }
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+        MODULE.apply_orders(self.write_orders([self.order("ORDER-PARTIAL")]), "2026-07-10", account="US")
+        prices = self.root / "partial-prices.json"
+        prices.write_text(
+            json.dumps(
+                {
+                    "prices": [
+                        {
+                            "account": "US",
+                            "symbol": "AAA",
+                            "exchange": "NASDAQ",
+                            "price": 110,
+                            "price_date": "2026-07-10",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        valuation = MODULE.mark_to_market(prices, "2026-07-14", account="US")[0]
+
+        self.assertEqual(valuation["valuation_status"], "partial")
+        self.assertFalse(valuation["valuation_healthy"])
+        self.assertEqual(valuation["valuation_issues"][0]["issue"], "stale_price")
+
+    def test_fx_change_is_reconciled_between_realized_and_unrealized_base_pnl(self) -> None:
+        self.enable_china_account()
+        buy = {
+            "order_id": "HK-BUY",
+            "account": "CHINA",
+            "action": "BUY",
+            "symbol": "0700.HK",
+            "exchange": "HK",
+            "quantity": 100,
+            "price": 10,
+            "fx_to_base": 0.8,
+            "reason": "fx basis test",
+            "risk": "test risk",
+        }
+        sell = {
+            **buy,
+            "order_id": "HK-SELL",
+            "action": "SELL",
+            "quantity": 50,
+            "fx_to_base": 0.9,
+        }
+
+        MODULE.apply_orders(self.write_orders([buy]), "2026-07-10", account="CHINA")
+        sold = MODULE.apply_orders(self.write_orders([sell]), "2026-07-13", account="CHINA")[0]
+        state = MODULE.load_state("CHINA")
+        summary = MODULE.summarize(state)
+        position = summary["positions"][0]
+
+        self.assertAlmostEqual(sold["cost_basis_base_released"], 400.0)
+        self.assertAlmostEqual(sold["realized_pnl_base"], 50.0)
+        self.assertAlmostEqual(sold["realized_price_pnl_base"], 0.0)
+        self.assertAlmostEqual(sold["realized_fx_pnl_base"], 50.0)
+        self.assertAlmostEqual(state["cash"], 99650.0)
+        self.assertAlmostEqual(state["positions"]["HK:0700.HK"]["cost_basis_base"], 400.0)
+        self.assertAlmostEqual(position["unrealized_pnl_base"], 50.0)
+        self.assertAlmostEqual(position["unrealized_price_pnl_base"], 0.0)
+        self.assertAlmostEqual(position["unrealized_fx_pnl_base"], 50.0)
+        self.assertAlmostEqual(summary["equity"], 100100.0)
+
+    def test_multi_account_batch_prewrites_every_journal_before_first_commit(self) -> None:
+        self.enable_china_account()
+        us_order = self.order("US-BATCH", notional=1000)
+        china_order = {
+            "order_id": "CHINA-BATCH",
+            "account": "CHINA",
+            "action": "BUY",
+            "symbol": "0700.HK",
+            "exchange": "HK",
+            "quantity": 100,
+            "price": 10,
+            "fx_to_base": 0.8,
+            "reason": "batch transaction test",
+            "risk": "test risk",
+        }
+        us_config = MODULE.account_config(self.config, "US")
+        china_config = MODULE.account_config(self.config, "CHINA")
+        trade_paths = {
+            MODULE.resolve_path(us_config, "trades_file"),
+            MODULE.resolve_path(china_config, "trades_file"),
+        }
+        journal_paths = {
+            MODULE.transaction_path(us_config),
+            MODULE.transaction_path(china_config),
+        }
+        original_atomic_write_text = MODULE.atomic_write_text
+        observations: list[bool] = []
+
+        def observe_commit(path: Path, text: str) -> None:
+            if path in trade_paths:
+                observations.append(all(journal.exists() for journal in journal_paths))
+            original_atomic_write_text(path, text)
+
+        with mock.patch.object(MODULE, "atomic_write_text", side_effect=observe_commit):
+            MODULE.apply_orders(self.write_orders([us_order, china_order]), "2026-07-10")
+
+        self.assertTrue(observations)
+        self.assertTrue(observations[0])
+        self.assertTrue(all(not journal.exists() for journal in journal_paths))
+
+    def test_failed_second_account_commit_is_recoverable_on_next_run(self) -> None:
+        self.enable_china_account()
+        us_order = self.order("US-RECOVER", notional=1000)
+        china_order = {
+            "order_id": "CHINA-RECOVER",
+            "account": "CHINA",
+            "action": "BUY",
+            "symbol": "0700.HK",
+            "exchange": "HK",
+            "quantity": 100,
+            "price": 10,
+            "fx_to_base": 0.8,
+            "reason": "batch recovery test",
+            "risk": "test risk",
+        }
+        us_config = MODULE.account_config(self.config, "US")
+        china_config = MODULE.account_config(self.config, "CHINA")
+        us_trades = MODULE.resolve_path(us_config, "trades_file")
+        original_atomic_write_text = MODULE.atomic_write_text
+        failed = False
+
+        def fail_us_commit_once(path: Path, text: str) -> None:
+            nonlocal failed
+            if path == us_trades and not failed:
+                failed = True
+                raise OSError("simulated account commit interruption")
+            original_atomic_write_text(path, text)
+
+        orders_path = self.write_orders([us_order, china_order])
+        with mock.patch.object(MODULE, "atomic_write_text", side_effect=fail_us_commit_once):
+            with self.assertRaisesRegex(OSError, "simulated account commit interruption"):
+                MODULE.apply_orders(orders_path, "2026-07-10")
+
+        self.assertTrue(MODULE.transaction_path(us_config).exists())
+        self.assertTrue(MODULE.transaction_path(china_config).exists())
+        self.assertEqual(len(MODULE.read_jsonl(MODULE.resolve_path(china_config, "trades_file"))), 1)
+        self.assertEqual(len(MODULE.read_jsonl(us_trades)), 0)
+
+        replay = MODULE.apply_orders(orders_path, "2026-07-10")
+
+        self.assertEqual(len(MODULE.read_jsonl(us_trades)), 1)
+        self.assertEqual(len(MODULE.read_jsonl(MODULE.resolve_path(china_config, "trades_file"))), 1)
+        self.assertTrue(all(record["idempotent_replay"] for record in replay))
+        self.assertFalse(MODULE.transaction_path(us_config).exists())
+        self.assertFalse(MODULE.transaction_path(china_config).exists())
+
+    def test_partial_journal_staging_aborts_without_publishing_any_account(self) -> None:
+        self.enable_china_account()
+        us_order = self.order("US-STAGE", notional=1000)
+        china_order = {
+            "order_id": "CHINA-STAGE",
+            "account": "CHINA",
+            "action": "BUY",
+            "symbol": "0700.HK",
+            "exchange": "HK",
+            "quantity": 100,
+            "price": 10,
+            "fx_to_base": 0.8,
+            "reason": "staging interruption test",
+            "risk": "test risk",
+        }
+        configs = [
+            MODULE.account_config(self.config, name)
+            for name in ("CHINA", "US")
+        ]
+        journal_paths = [MODULE.transaction_path(config) for config in configs]
+        initial_states = {
+            config["account"]: MODULE.resolve_path(config, "portfolio_file").read_bytes()
+            for config in configs
+        }
+        original_atomic_write_json = MODULE.atomic_write_json
+
+        def interrupt_second_journal(path: Path, payload: object) -> None:
+            if path == journal_paths[1]:
+                raise OSError("simulated staging interruption")
+            original_atomic_write_json(path, payload)
+
+        with mock.patch.object(MODULE, "atomic_write_json", side_effect=interrupt_second_journal):
+            with self.assertRaisesRegex(OSError, "simulated staging interruption"):
+                MODULE.apply_orders(self.write_orders([us_order, china_order]), "2026-07-10")
+
+        self.assertFalse(MODULE.batch_coordinator_path(valuation=False).exists())
+        self.assertTrue(all(not path.exists() for path in journal_paths))
+        for config in configs:
+            self.assertEqual(
+                MODULE.resolve_path(config, "portfolio_file").read_bytes(),
+                initial_states[config["account"]],
+            )
+            self.assertEqual(MODULE.read_jsonl(MODULE.resolve_path(config, "trades_file")), [])
+
+    def test_hard_crash_during_partial_journal_staging_is_aborted_on_recovery(self) -> None:
+        self.enable_china_account()
+        orders = [
+            self.order("US-HARD-STAGE", notional=1000),
+            {
+                "order_id": "CHINA-HARD-STAGE",
+                "account": "CHINA",
+                "action": "BUY",
+                "symbol": "0700.HK",
+                "exchange": "HK",
+                "quantity": 100,
+                "price": 10,
+                "fx_to_base": 0.8,
+                "reason": "hard staging crash test",
+                "risk": "test risk",
+            },
+        ]
+        us_config = MODULE.account_config(self.config, "US")
+        us_journal = MODULE.transaction_path(us_config)
+        original_atomic_write_json = MODULE.atomic_write_json
+
+        def hard_crash_on_us_journal(path: Path, payload: object) -> None:
+            if path == us_journal:
+                raise SystemExit("simulated process death")
+            original_atomic_write_json(path, payload)
+
+        with mock.patch.object(MODULE, "atomic_write_json", side_effect=hard_crash_on_us_journal):
+            with self.assertRaisesRegex(SystemExit, "simulated process death"):
+                MODULE.apply_orders(self.write_orders(orders), "2026-07-10")
+
+        coordinator_path = MODULE.batch_coordinator_path(valuation=False)
+        self.assertEqual(json.loads(coordinator_path.read_text(encoding="utf-8"))["phase"], "preparing")
+        _state, rows, _valuations = MODULE.load_account_snapshot("US")
+
+        self.assertEqual(rows, [])
+        self.assertFalse(coordinator_path.exists())
+        self.assertFalse(us_journal.exists())
+
+    def test_reader_recovers_half_published_batch_before_returning_snapshot(self) -> None:
+        self.enable_china_account()
+        orders = [
+            self.order("US-READER", notional=1000),
+            {
+                "order_id": "CHINA-READER",
+                "account": "CHINA",
+                "action": "BUY",
+                "symbol": "0700.HK",
+                "exchange": "HK",
+                "quantity": 100,
+                "price": 10,
+                "fx_to_base": 0.8,
+                "reason": "reader recovery test",
+                "risk": "test risk",
+            },
+        ]
+        us_config = MODULE.account_config(self.config, "US")
+        china_config = MODULE.account_config(self.config, "CHINA")
+        us_trades = MODULE.resolve_path(us_config, "trades_file")
+        original_atomic_write_text = MODULE.atomic_write_text
+        interrupted = False
+
+        def interrupt_us_publish(path: Path, text: str) -> None:
+            nonlocal interrupted
+            if path == us_trades and not interrupted:
+                interrupted = True
+                raise OSError("simulated half publication")
+            original_atomic_write_text(path, text)
+
+        with mock.patch.object(MODULE, "atomic_write_text", side_effect=interrupt_us_publish):
+            with self.assertRaisesRegex(OSError, "simulated half publication"):
+                MODULE.apply_orders(self.write_orders(orders), "2026-07-10")
+
+        _state, us_rows, _valuations = MODULE.load_account_snapshot("US")
+        _china_state, china_rows, _china_valuations = MODULE.load_account_snapshot("CHINA")
+
+        self.assertEqual([row["order_id"] for row in us_rows], ["US-READER"])
+        self.assertEqual([row["order_id"] for row in china_rows], ["CHINA-READER"])
+        self.assertFalse(MODULE.batch_coordinator_path(valuation=False).exists())
+        self.assertFalse(MODULE.transaction_path(us_config).exists())
+        self.assertFalse(MODULE.transaction_path(china_config).exists())
+
+    def test_committed_batch_with_partial_cleanup_is_recoverable_without_journals_for_every_account(self) -> None:
+        self.enable_china_account()
+        orders = [
+            self.order("US-CLEANUP", notional=1000),
+            {
+                "order_id": "CHINA-CLEANUP",
+                "account": "CHINA",
+                "action": "BUY",
+                "symbol": "0700.HK",
+                "exchange": "HK",
+                "quantity": 100,
+                "price": 10,
+                "fx_to_base": 0.8,
+                "reason": "cleanup recovery test",
+                "risk": "test risk",
+            },
+        ]
+        us_config = MODULE.account_config(self.config, "US")
+        china_config = MODULE.account_config(self.config, "CHINA")
+        us_journal = MODULE.transaction_path(us_config)
+        china_journal = MODULE.transaction_path(china_config)
+        original_unlink = Path.unlink
+        interrupted = False
+
+        def interrupt_one_cleanup(path: Path, *args: object, **kwargs: object) -> None:
+            nonlocal interrupted
+            if path == us_journal and not interrupted:
+                interrupted = True
+                raise OSError("simulated cleanup interruption")
+            original_unlink(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", new=interrupt_one_cleanup):
+            with self.assertRaisesRegex(OSError, "simulated cleanup interruption"):
+                MODULE.apply_orders(self.write_orders(orders), "2026-07-10")
+
+        coordinator_path = MODULE.batch_coordinator_path(valuation=False)
+        marker_path = MODULE.batch_commit_marker_path(valuation=False)
+        self.assertEqual(json.loads(coordinator_path.read_text(encoding="utf-8"))["phase"], "committed")
+        self.assertTrue(marker_path.exists())
+        self.assertFalse(china_journal.exists())
+        self.assertTrue(us_journal.exists())
+
+        _state, rows, _valuations = MODULE.load_account_snapshot("US")
+
+        self.assertEqual([row["order_id"] for row in rows], ["US-CLEANUP"])
+        self.assertFalse(coordinator_path.exists())
+        self.assertFalse(us_journal.exists())
+
+    def test_all_account_lock_acquisition_uses_one_canonical_order(self) -> None:
+        self.enable_china_account()
+        observed: list[str] = []
+
+        @contextmanager
+        def observe_lock(config: dict):
+            observed.append(str(config["account_id"]))
+            yield
+
+        expected = [str(config["account_id"]) for config in MODULE.all_account_configs(self.config)]
+        with mock.patch.object(MODULE, "account_lock", side_effect=observe_lock):
+            MODULE.ensure_files(reset=True, account="ALL")
+
+        self.assertEqual(observed, expected)
+
+    def test_currency_must_match_instrument_position_and_mark(self) -> None:
+        wrong_order = self.order("WRONG-CURRENCY")
+        wrong_order["currency"] = "EUR"
+        with self.assertRaisesRegex(ValueError, "conflicts with US instrument currency USD"):
+            MODULE.apply_orders(self.write_orders([wrong_order]), "2026-07-10", account="US")
+
+        MODULE.apply_orders(self.write_orders([self.order("RIGHT-CURRENCY")]), "2026-07-10", account="US")
+        wrong_mark = self.root / "wrong-currency-mark.json"
+        wrong_mark.write_text(
+            json.dumps({
+                "prices": [{
+                    "account": "US",
+                    "symbol": "AAA",
+                    "exchange": "NASDAQ",
+                    "currency": "EUR",
+                    "price": 101,
+                    "price_date": "2026-07-10",
+                }]
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "conflicts with US instrument currency USD"):
+            MODULE.mark_to_market(wrong_mark, "2026-07-10", account="US")
+
+        state = MODULE.load_state("US")
+        state["positions"]["NASDAQ:AAA"]["currency"] = "EUR"
+        MODULE.atomic_write_json(self.root / "data" / "portfolio.json", state)
+        sell = self.order("POSITION-CURRENCY-CONFLICT")
+        sell.update({"action": "SELL", "quantity": "ALL", "notional": None})
+        with self.assertRaisesRegex(ValueError, "position.*currency|Position.*currency"):
+            MODULE.apply_orders(self.write_orders([sell]), "2026-07-10", account="US")
+
+    def test_as_of_date_cannot_move_backward_for_orders_or_valuations(self) -> None:
+        MODULE.apply_orders(self.write_orders([self.order("MONOTONIC-BASE")]), "2026-07-10", account="US")
+        portfolio_path = self.root / "data" / "portfolio.json"
+        portfolio_before = portfolio_path.read_bytes()
+        backdated = self.order("BACKWARD-ORDER", symbol="BBB", notional=1000)
+        with self.assertRaisesRegex(ValueError, "cannot move portfolio as_of_date backward"):
+            MODULE.apply_orders(self.write_orders([backdated]), "2026-07-09", account="US")
+        self.assertEqual(portfolio_path.read_bytes(), portfolio_before)
+
+        prices = self.root / "backward-mark.json"
+        prices.write_text(
+            json.dumps({
+                "prices": [{
+                    "account": "US",
+                    "symbol": "AAA",
+                    "exchange": "NASDAQ",
+                    "price": 101,
+                    "price_date": "2026-07-09",
+                }]
+            }),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ValueError, "cannot move portfolio as_of_date backward"):
+            MODULE.mark_to_market(prices, "2026-07-09", account="US")
+        self.assertEqual(MODULE.read_jsonl(self.root / "data" / "valuations.jsonl"), [])
+
+    def test_historical_turnover_requires_strict_finite_numeric_values(self) -> None:
+        trades_path = self.root / "data" / "trades.jsonl"
+        MODULE.atomic_write_text(
+            trades_path,
+            json.dumps({
+                "date": "2026-07-10",
+                "action": "BUY",
+                "order_id": "LEGACY-NAN",
+                "gross_value_base": "NaN",
+            }) + "\n",
+        )
+        with self.assertRaisesRegex(ValueError, "historical turnover.*finite"):
+            MODULE.turnover_for_date("2026-07-10", trades_path)
+
+        MODULE.atomic_write_text(
+            trades_path,
+            '{"date":"2026-07-10","action":"BUY","gross_value_base":NaN}\n',
+        )
+        with self.assertRaisesRegex(ValueError, "non-standard numeric constant NaN"):
+            MODULE.turnover_for_date("2026-07-10", trades_path)
+
+    def test_duplicate_and_legacy_order_identity_fail_closed(self) -> None:
+        duplicate = self.order("DUPLICATE-INPUT")
+        with self.assertRaisesRegex(ValueError, "Duplicate order_id"):
+            MODULE.apply_orders(self.write_orders([duplicate, dict(duplicate)]), "2026-07-10", account="US")
+
+        trades_path = self.root / "data" / "trades.jsonl"
+        legacy = {"order_id": "LEGACY-ID", "date": "2026-07-10", "action": "HOLD"}
+        MODULE.atomic_write_text(trades_path, json.dumps(legacy) + "\n")
+        legacy_replay = self.order("LEGACY-ID")
+        with self.assertRaisesRegex(ValueError, "lacks order_fingerprint"):
+            MODULE.apply_orders(self.write_orders([legacy_replay]), "2026-07-10", account="US")
+
+        duplicate_rows = [
+            {"order_id": "LEDGER-DUP", "date": "2026-07-10", "action": "HOLD"},
+            {"order_id": "LEDGER-DUP", "date": "2026-07-10", "action": "HOLD"},
+        ]
+        MODULE.atomic_write_text(
+            trades_path,
+            "".join(json.dumps(row) + "\n" for row in duplicate_rows),
+        )
+        with self.assertRaisesRegex(ValueError, "Duplicate order_id"):
+            MODULE.apply_orders(self.write_orders([self.order("NEW-ID")]), "2026-07-10", account="US")
+
+    def test_order_quote_staleness_uses_configured_business_day_limit(self) -> None:
+        self.config["order_contract"] = {"max_price_age_business_days": 0}
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+        stale = self.order("STALE-ORDER")
+        stale["price_date"] = "2026-07-10"
+
+        with self.assertRaisesRegex(ValueError, "Order price.*stale.*business_day_age=1"):
+            MODULE.apply_orders(self.write_orders([stale]), "2026-07-13", account="US")
 
 
 if __name__ == "__main__":

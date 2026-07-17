@@ -30,7 +30,7 @@ jobs:
           python-version: ${{ matrix.python-version }}
           cache: pip
       - name: Install root quality tooling
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install --require-hashes -r requirements-dev.lock
       - name: Compile the complete control plane
         run: python -m compileall -q atlas.py work/global-briefing/scripts
       - name: Run static analysis
@@ -42,7 +42,7 @@ jobs:
         run: git ls-files -z | grep -zv '^skills-lock.json$' | xargs -0 detect-secrets-hook
       - name: Audit Python dependency manifests
         run: |
-          pip-audit --strict -r requirements-dev.txt --progress-spinner off
+          pip-audit --strict -r requirements-dev.lock --progress-spinner off
           pip-audit --strict -r work/global-briefing/requirements.txt --progress-spinner off
       - name: Run all root-owned tests
         run: python -m pytest --cov=atlas --cov=work/global-briefing/scripts --cov-report=term-missing --cov-fail-under=60 -q
@@ -50,3 +50,47 @@ jobs:
         run: |
           python -m pip install -e . --no-deps
           atlas --help
+
+  composed-workspace:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Require private submodule credential
+        shell: bash
+        env:
+          ATLAS_SUBMODULE_TOKEN: ${{ secrets.ATLAS_SUBMODULE_TOKEN }}
+        run: |
+          if [[ -z "${ATLAS_SUBMODULE_TOKEN:-}" ]]; then
+            echo "ATLAS_SUBMODULE_TOKEN is required for the private composed workspace." >&2
+            exit 1
+          fi
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+          submodules: recursive
+          token: ${{ secrets.ATLAS_SUBMODULE_TOKEN }}
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.lock
+            work/global-briefing/requirements.txt
+            work/trading-core/pyproject.toml
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22.15.0
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+      - name: Install composed workspace
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install --require-hashes -r requirements-dev.lock
+          npm ci --prefix src
+      - name: Run clean-clone structural doctor
+        run: |
+          git submodule status --recursive
+          python -m unittest -v tests.test_repository_layout
+      - name: Run cross-repository integration gate
+        run: python atlas.py test

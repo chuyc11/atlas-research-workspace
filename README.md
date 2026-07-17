@@ -14,15 +14,26 @@ trading-core isolated replay ledger 现在作为只读来源保留；ATLAS 规�
 ## 环境
 
 - Python 3.11+
-- Node.js 22.13+
+- Node.js 22.15+
+
+首次克隆时同时拉取两个独立子仓的固定版本：
+
+```powershell
+git clone --recurse-submodules https://github.com/chuyc11/atlas-research-workspace.git
+```
+
+已有工作区升级后执行：
+
+```powershell
+git submodule sync --recursive
+git submodule update --init --recursive
+```
 
 首次安装：
 
 ```powershell
 python -m pip install -r requirements.txt
-Set-Location src
-npm ci
-Set-Location ..
+npm ci --prefix src
 ```
 
 ## 常用命令
@@ -65,7 +76,7 @@ python atlas.py test --full
 根仓开发者的快速质量门禁：
 
 ```powershell
-python -m pip install -r requirements-dev.txt
+python -m pip install --require-hashes -r requirements-dev.lock
 python -m ruff check atlas.py tests work/global-briefing/scripts work/global-briefing/tests
 python -m pytest -q
 ```
@@ -102,7 +113,8 @@ cycle 的稳定产物：
 - 哈希链运行历史：`work/shared/atlas/run_audits/history/YYYY-MM-DD/ATLAS-CYCLE-*-RUN-*.json`
 - 三仓来源锁：`work/shared/atlas/workspace-lock.json`
 
-cycle 使用内容指纹和稳定事件 ID 保持幂等；账本、状态和账本审计在输入不变时保持字节稳定，
+cycle 使用内容指纹、三仓 `workspace-lock` 内容哈希和稳定事件 ID 保持幂等；代码或任一仓 commit 改变后必须重新完成两次运行，
+账本、状态和账本审计在输入不变时保持字节稳定，
 每次调用则单独保留一份运行历史。相同源事件不会被静默去重，而会触发阻断并保留上一份已通过审计的 canonical ledger。
 cycle 通过 `work/shared/atlas/cycle.lock` 阻止并发运行；doctor 或 sync 上游门禁失败时只继续生成诊断和运行审计，不写 canonical ledger。
 每日自动生成的 `temp-orders-YYYY-MM-DD.json` 会作为 `virtual_order_intent` 进入 canonical ledger；旧版下划线文件只作兼容输入，
@@ -110,7 +122,9 @@ cycle 通过 `work/shared/atlas/cycle.lock` 阻止并发运行；doctor 或 sync
 实际旧账本仍不会被 cycle 直接追加。
 
 cycle 的 `overall_passed` 仅为向后兼容字段，语义等同 `operational_gate_passed`。`release_candidate_passed`
-还要求 `--full-tests`、输入不变的幂等复跑、三仓干净且均有远端；`research_promotion_passed` 单独表示研究证据门禁，三者不能互相替代。
+还要求 `--full-tests`、同一 workspace-lock 上输入不变的幂等复跑、三仓干净且每个当前 commit 都被至少一个远端 ref 明确发布；
+`research_promotion_passed` 单独表示研究证据门禁，三者不能互相替代。普通站点同步在门禁或冻结证据不足时只写 staging，
+不会覆盖可部署 JSON；只有与当前报告、输入、载荷、门禁 artifact 和三仓 commit 统一绑定的冻结快照才能进入站点。
 
 启动网页：
 
@@ -149,12 +163,13 @@ atlas doctor
 
 ## 版本控制恢复
 
-根目录如果出现空 `.git/`，不要直接覆盖或假定历史不存在。先备份工作区并确认原远端、备份或
-工作树元数据；无法恢复时，再明确选择建立新的集成仓库。`src/` 与
-`work/trading-core/` 仍保留各自独立的 Git 历史。
+`src/` 与 `work/trading-core/` 作为 Git 子模块保留各自独立历史；根仓只固定两个不可变 commit。
+不要在根仓用重置命令覆盖子仓工作树。若子模块目录缺失，运行
+`git submodule update --init --recursive` 恢复，不要手工复制本机目录冒充可复现工作区。
 
-`atlas doctor` 会报告两个子仓的 commit、分支、工作树状态和是否配置远端。缺少远端或存在未提交改动
-会显示警告：这不影响本地研究，但会阻断可重复发布。三个仓库必须分别通过自己的质量门禁。
+`atlas doctor` 会报告根仓与两个子仓的 commit、分支、工作树状态，并用只读远端探测验证当前完整 commit SHA
+确实出现在至少一个远端 ref 中，而不只验证远端地址可连通。
+缺少远端或存在未提交改动会显示警告：这不影响本地研究，但会阻断可重复发布。三个仓库必须分别通过自己的质量门禁。
 
 ## 虚拟执行与自我进化边界
 
@@ -163,7 +178,7 @@ atlas doctor
   `work/trading-core/data/replays/global_briefing/trades/*.jsonl` 是只读历史来源。
 - `work/global-briefing/data/temp-orders-*.json` 是自动虚拟订单意图来源，只写入 canonical ledger。
 - 账本审计要求所有事件 `paper_trading_only=true`、`no_real_broker_order=true`，并拒绝 broker/live order 字段。
-- paper-trading 写入器按账户加锁并使用恢复日志提交组合与成交账本；相同 `order_id` 或相同订单内容会幂等复用，复用 ID 但修改内容会 fail-closed，同批后续订单失败不会留下半事务。
+- paper-trading 写入器以固定顺序持有全部账户锁，使用 `preparing → prepared → committed` durable coordinator、全账户 journal、commit marker 与 generation 校验提交组合和账本；部分写日志、半发布或部分清理后崩溃均可恢复，读者不会看到半批。重复 ID、重复指纹、缺少可验证指纹的 legacy replay、币种冲突、日期倒退和过期成交价全部 fail-closed。
 - replay gate 只接受 isolated historical replay evaluation，要求主账本未写入、`run-daily` 未调用、no-trade fallback 未启用。
 - replay evaluation 按文件名中的回放结束日期选择 cycle 日期之前的最新周期，不依赖文件修改时间。
 - shadow promotion gate 由 verified out-of-sample evidence 驱动；无证据时保持 shadow，且不会自动晋升到 active-normal。
@@ -175,9 +190,9 @@ atlas doctor
 ## 安全与恢复
 
 - Node 审计固定使用 npm 官方安全端点；当前策略不保留漏洞例外，未来例外必须有责任人、理由和到期日，high/critical 永不豁免。
-- 根 CI 固定 GitHub Action 提交，执行 Ruff、Bandit、秘密扫描、Python 依赖审计、60% 覆盖率及 Python 3.11/3.12 矩阵。
-- 灾备写入 `D:/ATLAS-Backups`，要求与工作区不同卷；每个快照包含三仓 Git bundle、文件级哈希、嵌入清单、外置清单和前序清单哈希，并执行真实恢复校验。
-- 高/严重改进项需要确认；告警具备稳定 ID、重试上限、确认超时和升级状态。Slack 连接器只作为已配置目的地，未绑定频道时不得宣称已送达。
+- 根 CI 固定 GitHub Action 提交，执行 Ruff、Bandit、秘密扫描、Python 依赖审计、60% 覆盖率及 Python 3.11/3.12 矩阵。组合工作区 checkout 对私有子仓要求仓库 secret `ATLAS_SUBMODULE_TOKEN`；缺失时明确失败，不会降级成缺子仓的假绿。
+- 灾备写入 `D:/ATLAS-Backups`，要求与工作区不同卷；生产配置强制使用 AES-256-GCM。32 字节密钥以 Base64 放入密钥管理器提供的 `ATLAS_BACKUP_ENCRYPTION_KEY` 环境变量，不得写入仓库。schema 4 快照使用分用途 HMAC 认证 manifest sidecar 与 latest 索引，前序介质必须先通过 AEAD、逐文件哈希以及 Git `bundle verify → mirror clone → fsck` 才能接链；明文 staging 仅位于受保护的备份目标并可靠清理。旧 schema 2 `latest.json` 必须由运维显式归档后建立新的加密 genesis，系统不会静默信任迁移。该证据不宣称操作系统凭据等完整运行时已恢复。
+- 高/严重改进项需要确认；告警具备稳定 ID、重试上限、确认超时和升级状态。仅生成路由文件不算送达，每个目的地必须记录不可变回执后才能确认：`python atlas.py alerts --date YYYY-MM-DD --receipt-destination DESTINATION --receipt-id RECEIPT_ID`。真实 connector 回执还会更新独立、带新鲜度约束的 `channel_health.json`，使健康日能力验收保持幂等；需确认告警只有到 `acknowledged` 才通过。Slack 连接器未返回回执时不得宣称已送达。
 
 预测系统的分层设计、契约示例和晋升标准见 [RESEARCH_ARCHITECTURE.md](RESEARCH_ARCHITECTURE.md)。
 

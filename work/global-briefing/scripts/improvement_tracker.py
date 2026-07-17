@@ -36,7 +36,13 @@ def utc_now() -> str:
 
 
 def stable_hash(value: Any) -> str:
-    text = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    text = json.dumps(
+        value,
+        allow_nan=False,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
@@ -75,13 +81,25 @@ def atomic_write_text(path: Path, text: str) -> None:
 
 
 def atomic_write_json(path: Path, payload: Any) -> None:
-    atomic_write_text(path, json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+    atomic_write_text(
+        path,
+        json.dumps(payload, allow_nan=False, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+    )
 
 
 def append_jsonl(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("a", encoding="utf-8", newline="\n") as handle:
-        handle.write(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n")
+        handle.write(
+            json.dumps(
+                payload,
+                allow_nan=False,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+            + "\n"
+        )
         handle.flush()
         os.fsync(handle.fileno())
 
@@ -504,17 +522,117 @@ class ImprovementTracker:
             config = self.config.get("external_alerting", {})
             destinations = config.get("destinations", []) if isinstance(config, dict) else []
             dispatch = read_json(self.root / "work" / "shared" / "atlas" / "alerts" / "latest.json", {})
-            routed = bool(set(destinations) & set(dispatch.get("destinations", []))) if isinstance(dispatch, dict) else False
-            passed = config.get("enabled") is True and bool(destinations) and dispatch.get("date") == date and routed if isinstance(config, dict) else False
+            channel_health = read_json(
+                self.root / "work" / "shared" / "atlas" / "alerts" / "channel_health.json",
+                {},
+            )
+            configured = {
+                str(value) for value in destinations if isinstance(value, str) and value.strip()
+            }
+            raw_health = channel_health.get("destinations", {}) if isinstance(channel_health, dict) else {}
+            raw_health = raw_health if isinstance(raw_health, dict) else {}
+            maximum_age_hours = int(config.get("channel_health_max_age_hours") or 168)
+            reference_time = datetime.fromisoformat(f"{date}T23:59:59+00:00")
+            healthy_destinations: set[str] = set()
+            health_evidence: dict[str, Any] = {}
+            for destination in sorted(configured):
+                entry = raw_health.get(destination, {})
+                entry = entry if isinstance(entry, dict) else {}
+                verified_at = str(entry.get("verified_at") or "")
+                provider_message_id = str(entry.get("provider_message_id") or "").strip()
+                source_alert_id = str(entry.get("source_alert_id") or "").strip()
+                source_alert_date = str(entry.get("source_alert_date") or "")
+                age_hours: float | None = None
+                timestamp_valid = False
+                try:
+                    observed = datetime.fromisoformat(verified_at.replace("Z", "+00:00"))
+                    if observed.tzinfo is None:
+                        observed = observed.replace(tzinfo=UTC)
+                    age_hours = (reference_time - observed.astimezone(UTC)).total_seconds() / 3600
+                    timestamp_valid = 0 <= age_hours <= maximum_age_hours
+                except (TypeError, ValueError):
+                    pass
+                valid = bool(
+                    entry.get("status") == "healthy"
+                    and provider_message_id
+                    and source_alert_id
+                    and source_alert_date
+                    and source_alert_date <= date
+                    and timestamp_valid
+                )
+                if valid:
+                    healthy_destinations.add(destination)
+                health_evidence[destination] = {
+                    "valid": valid,
+                    "verified_at": verified_at or None,
+                    "age_hours": age_hours,
+                    "provider_message_id": provider_message_id or None,
+                    "source_alert_id": source_alert_id or None,
+                    "source_alert_date": source_alert_date or None,
+                }
+            health_coverage = bool(configured) and configured.issubset(healthy_destinations)
+            delivery_state = str(dispatch.get("delivery_state") or "")
+            current_attention_alert = bool(
+                dispatch.get("date") == date
+                and dispatch.get("status") == "attention_required"
+            )
+            current_findings = dispatch.get("findings")
+            dispatch_contract_valid = bool(
+                not current_attention_alert
+                or (isinstance(current_findings, list) and current_findings)
+            )
+            requires_acknowledgement = bool(
+                current_attention_alert and dispatch.get("requires_acknowledgement") is True
+            )
+            acknowledgement_satisfied = bool(
+                not requires_acknowledgement
+                or (
+                    delivery_state == "acknowledged"
+                    and str(dispatch.get("acknowledged_at") or "").strip()
+                    and str(dispatch.get("acknowledged_by") or "").strip()
+                )
+            )
+            passed = (
+                isinstance(config, dict)
+                and config.get("enabled") is True
+                and health_coverage
+                and dispatch_contract_valid
+                and acknowledgement_satisfied
+            )
             return Evaluation(
                 "pass" if passed else "fail",
-                "外部告警路由已验证" if passed else "外部告警未配置或当日路由未验证",
-                {"destinations": destinations, "dispatch_date": dispatch.get("date"), "dispatch_status": dispatch.get("status"), "routed": routed},
+                "外部告警通道具备近期真实送达证明，且需确认告警已确认"
+                if passed
+                else "外部告警未配置、通道送达证明缺失/过期，或需确认告警尚未确认",
+                {
+                    "destinations": destinations,
+                    "dispatch_date": dispatch.get("date"),
+                    "dispatch_status": dispatch.get("status"),
+                    "delivery_state": delivery_state,
+                    "requires_acknowledgement": requires_acknowledgement,
+                    "acknowledgement_satisfied": acknowledgement_satisfied,
+                    "dispatch_contract_valid": dispatch_contract_valid,
+                    "channel_health_max_age_hours": maximum_age_hours,
+                    "healthy_destinations": sorted(healthy_destinations),
+                    "missing_or_stale_destinations": sorted(configured - healthy_destinations),
+                    "channel_health": health_evidence,
+                },
             )
         if spec.acceptance_key == "disaster_recovery":
             config = self.config.get("disaster_recovery", {})
             manifest = read_json(self.root / "work" / "shared" / "atlas" / "backups" / "latest.json", {})
             archive = Path(str(manifest.get("archive") or "")) if isinstance(manifest, dict) else Path()
+            encryption = config.get("encryption", {}) if isinstance(config, dict) else {}
+            encryption = encryption if isinstance(encryption, dict) else {}
+            encryption_required = encryption.get("required") is True
+            encryption_verified = bool(
+                not encryption_required
+                or (
+                    manifest.get("encrypted") is True
+                    and manifest.get("encryption_algorithm") == "AES-256-GCM"
+                    and manifest.get("encrypted_container_authenticated") is True
+                )
+            )
             outside_workspace = False
             if archive.is_absolute():
                 try:
@@ -532,8 +650,10 @@ class ImprovementTracker:
                 isinstance(config, dict)
                 and isinstance(manifest, dict)
                 and config.get("enabled") is True
-                and manifest.get("verified") is True
+                and encryption_verified
+                and manifest.get("archive_integrity_verified") is True
                 and manifest.get("restore_verified") is True
+                and manifest.get("restore_scope") == "configured_workspace_files_and_git_bundles"
                 and archive.is_file()
                 and outside_workspace
                 and age_hours is not None
@@ -541,8 +661,23 @@ class ImprovementTracker:
             )
             return Evaluation(
                 "pass" if passed else "fail",
-                "外部灾备快照与恢复演练已验证" if passed else "灾备快照、时效或恢复演练未达标",
-                {"archive": str(archive), "outside_workspace": outside_workspace, "age_hours": age_hours, "maximum_age_hours": maximum_age, "restore_verified": manifest.get("restore_verified")},
+                "加密外部灾备快照与配置范围恢复演练已验证"
+                if passed
+                else "灾备加密、快照时效、归档完整性或配置范围恢复演练未达标",
+                {
+                    "archive": str(archive),
+                    "outside_workspace": outside_workspace,
+                    "age_hours": age_hours,
+                    "maximum_age_hours": maximum_age,
+                    "encryption_required": encryption_required,
+                    "encrypted": manifest.get("encrypted"),
+                    "encryption_algorithm": manifest.get("encryption_algorithm"),
+                    "encrypted_container_authenticated": manifest.get("encrypted_container_authenticated"),
+                    "archive_integrity_verified": manifest.get("archive_integrity_verified"),
+                    "restore_verified": manifest.get("restore_verified"),
+                    "restore_scope": manifest.get("restore_scope"),
+                    "full_runtime_restore_verified": manifest.get("full_runtime_restore_verified"),
+                },
             )
         return Evaluation("manual", "需要人工提供执行证据")
 

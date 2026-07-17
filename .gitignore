@@ -14,7 +14,6 @@ dist/
 venv/
 
 # Node / ATLAS site
-src/
 src/node_modules/
 src/dist/
 src/.next/
@@ -27,7 +26,6 @@ outputs/
 work/shared/
 work/global-briefing/data/
 work/skill-repos/
-work/trading-core/
 work/audits/
 work/site-design-options/
 work/site-package-stage/

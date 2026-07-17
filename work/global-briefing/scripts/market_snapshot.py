@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import multiprocessing as mp
+import sys
 import time
 import urllib.parse
 import urllib.request
@@ -15,6 +16,11 @@ from typing import Any
 
 
 SCRIPT_PATH = Path(__file__).resolve()
+if str(SCRIPT_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_PATH.parent))
+
+from report_clock import report_date as current_report_date  # noqa: E402
+
 ROOT = SCRIPT_PATH.parents[3]
 DATA_DIR = ROOT / "work" / "global-briefing" / "data"
 USER_AGENT = (
@@ -181,7 +187,7 @@ def main(argv: list[str] | None = None) -> int:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     result = snapshot(args.tickers, args.per_ticker_timeout)
-    output_path = args.output or DATA_DIR / f"market-snapshot-{datetime.now().strftime('%Y-%m-%d')}.json"
+    output_path = args.output or DATA_DIR / f"market-snapshot-{current_report_date()}.json"
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(output_path)
     error_count = sum(1 for item in result["items"] if item.get("last_close") is None)

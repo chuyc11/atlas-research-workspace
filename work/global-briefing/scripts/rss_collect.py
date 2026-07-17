@@ -23,6 +23,11 @@ from typing import Any
 
 
 SCRIPT_PATH = Path(__file__).resolve()
+if str(SCRIPT_PATH.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_PATH.parent))
+
+from report_clock import report_date as current_report_date  # noqa: E402
+
 ROOT = SCRIPT_PATH.parents[3]
 SOURCES_PATH = ROOT / "work" / "global-briefing" / "config" / "sources.json"
 DATA_DIR = ROOT / "work" / "global-briefing" / "data"
@@ -488,14 +493,15 @@ def main(argv: list[str] | None = None) -> int:
         lookback_hours=args.lookback_hours or None,
     )
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    output_path = args.output or DATA_DIR / f"rss-items-{datetime.now().strftime('%Y-%m-%d')}.json"
+    run_date = current_report_date()
+    output_path = args.output or DATA_DIR / f"rss-items-{run_date}.json"
     output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"items={len(result['items'])} errors={len(result['errors'])}")
     print(output_path)
     if not args.no_intelligence:
         from news_intelligence import build_intelligence_file
 
-        intelligence_path = DATA_DIR / f"news-intelligence-{datetime.now().strftime('%Y-%m-%d')}.json"
+        intelligence_path = DATA_DIR / f"news-intelligence-{run_date}.json"
         build_intelligence_file(output_path, intelligence_path)
         print(intelligence_path)
     return 0

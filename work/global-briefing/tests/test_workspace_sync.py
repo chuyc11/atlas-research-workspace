@@ -32,6 +32,27 @@ SITE_SYNC = load_module(
     ROOT / "work" / "global-briefing" / "scripts" / "sync_briefing_site.py",
 )
 
+TEST_REPOSITORY_COMMITS = {
+    "root": "1" * 40,
+    "site": "2" * 40,
+    "trading-core": "3" * 40,
+}
+
+
+def candidate_fingerprint(
+    report_date: str,
+    raw_report: bytes,
+    content_hash: str,
+    payload: dict,
+) -> dict:
+    return SITE_SYNC.build_candidate_fingerprint(
+        report_date=report_date,
+        raw_report=raw_report,
+        content_hash=content_hash,
+        payload=payload,
+        repository_commits=TEST_REPOSITORY_COMMITS,
+    )
+
 
 def requires_runtime_report(report_date: str):
     report = ROOT / "outputs" / f"每日全球晨间简报-{report_date}.md"
@@ -57,6 +78,112 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(
             SITE_SYNC.prediction_drivers({"trigger": "official release"}),
             ["official release"],
+        )
+
+    def test_site_dependency_preflight_rejects_nonofficial_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lockfile = Path(temporary) / "package-lock.json"
+            manifest = Path(temporary) / "package.json"
+            lockfile.write_text(
+                json.dumps({
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {},
+                        "node_modules/example": {
+                            "resolved": "https://registry.npmmirror.com/example/-/example-1.0.0.tgz",
+                            "integrity": "sha512-test",
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            manifest.write_text(json.dumps({"packageManager": "npm@10.9.2"}), encoding="utf-8")
+
+            errors = SITE_SYNC.site_dependency_source_errors(lockfile)
+
+        self.assertTrue(any("unsupported dependency host" in error for error in errors))
+
+    def test_site_dependency_preflight_accepts_official_integrity_pinned_registry(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lockfile = Path(temporary) / "package-lock.json"
+            manifest = Path(temporary) / "package.json"
+            lockfile.write_text(
+                json.dumps({
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {},
+                        "node_modules/example": {
+                            "resolved": "https://registry.npmjs.org/example/-/example-1.0.0.tgz",
+                            "integrity": "sha512-test",
+                        },
+                    },
+                }),
+                encoding="utf-8",
+            )
+            manifest.write_text(json.dumps({"packageManager": "npm@10.9.2"}), encoding="utf-8")
+
+            errors = SITE_SYNC.site_dependency_source_errors(lockfile)
+
+        self.assertEqual(errors, [])
+
+    def test_site_dependency_preflight_only_allows_documented_resolved_exceptions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lockfile = Path(temporary) / "package-lock.json"
+            manifest = Path(temporary) / "package.json"
+            manifest.write_text(json.dumps({"packageManager": "npm@10.9.2"}), encoding="utf-8")
+            lockfile.write_text(
+                json.dumps({
+                    "lockfileVersion": 3,
+                    "packages": {
+                        "": {},
+                        "node_modules/missing": {"version": "1.0.0"},
+                        "node_modules/link": {"link": True},
+                        "node_modules/bundled": {"inBundle": True},
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            errors = SITE_SYNC.site_dependency_source_errors(lockfile, manifest)
+
+        self.assertEqual(errors, ["node_modules/missing is missing a resolved dependency source"])
+
+    def test_site_dependency_preflight_rejects_unpinned_npm_major(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            lockfile = Path(temporary) / "package-lock.json"
+            manifest = Path(temporary) / "package.json"
+            lockfile.write_text(
+                json.dumps({"lockfileVersion": 3, "packages": {"": {}}}),
+                encoding="utf-8",
+            )
+            manifest.write_text(
+                json.dumps({"packageManager": "npm@11.6.2"}),
+                encoding="utf-8",
+            )
+
+            errors = SITE_SYNC.site_dependency_source_errors(lockfile, manifest)
+
+        self.assertTrue(any("npm@10.9.2" in error for error in errors))
+
+    def test_report_parser_accepts_canonical_long_form_topic_headings(self) -> None:
+        sections = SITE_SYNC.split_sections(
+            "## 科技与人工智能\n内容\n"
+            "## 经济、宏观与能源\n内容\n"
+        )
+
+        self.assertEqual(
+            SITE_SYNC.find_section(sections, "科技与AI", "科技和AI", "科技与人工智能"),
+            ["内容"],
+        )
+        self.assertEqual(
+            SITE_SYNC.find_section(
+                sections,
+                "经济与能源",
+                "经济和能源",
+                "经济、宏观与能源",
+                "经济宏观与能源",
+            ),
+            ["内容"],
         )
 
     def test_editorial_scaffolding_is_removed_from_public_copy(self) -> None:
@@ -421,31 +548,88 @@ class WorkspaceSyncTests(unittest.TestCase):
 
     def test_mark_deployed_clears_matching_pending_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            state_path = Path(temporary) / "site-sync-state.json"
-            verification_path = Path(temporary) / "production-verification.json"
+            root = Path(temporary)
+            state_path = root / "site-sync-state.json"
+            site_data = root / "briefing.generated.json"
+            site_manifest = root / "publication.generated.json"
+            report_path = root / "report.md"
+            verification_path = root / "production-verification.json"
+            content_hash = "a" * 64
+            report_date = "2026-07-12"
+            raw_report = b"report"
+            current_payload = {"reportDate": "2026-07-12", "contentHash": content_hash}
+            current_payload_sha = SITE_SYNC.payload_sha256(current_payload)
+            candidate = candidate_fingerprint(report_date, raw_report, content_hash, current_payload)
+            snapshot = {
+                "schema_version": 2,
+                "date": report_date,
+                "revision": 1,
+                "report_sha256": SITE_SYNC.hashlib.sha256(raw_report).hexdigest(),
+                "content_hash": content_hash,
+                "payload_sha256": current_payload_sha,
+                "candidate_fingerprint": candidate,
+                "prerequisites": {},
+                "payload": current_payload,
+            }
+            snapshot_sha = SITE_SYNC.publication_snapshot_sha256(snapshot)
+            manifest = SITE_SYNC.build_publication_manifest(snapshot)
+            manifest_sha = SITE_SYNC.payload_sha256(manifest)
+            site_data.write_text(SITE_SYNC.serialized_payload(current_payload), encoding="utf-8")
+            site_manifest.write_text(SITE_SYNC.serialized_payload(manifest), encoding="utf-8")
+            report_path.write_bytes(raw_report)
             state_path.write_text(
                 json.dumps(
                     {
-                        "pending_sha": "abc",
+                        "pending_sha": content_hash,
+                        "pending_payload_sha": current_payload_sha,
+                        "pending_manifest_sha": manifest_sha,
                         "pending_report": "report.md",
                         "pending_date": "2026-07-12",
+                        "pending_snapshot_revision": 1,
+                        "pending_snapshot_sha256": snapshot_sha,
+                        "pending_build_id": manifest["buildId"],
+                        "pending_deployment_id": manifest["deploymentId"],
                         "last_deployed_sha": "older",
                     }
                 ),
                 encoding="utf-8",
             )
-            current_payload = SITE_SYNC.load_json(SITE_SYNC.SITE_DATA, {})
             verified_at = datetime.now(timezone.utc).isoformat()
             verification_path.write_text(
                 json.dumps(
                     {
-                        "schema_version": 1,
+                        "schema_version": 2,
                         "checked_at": verified_at,
                         "deployment_url": "https://example.com",
-                        "expected_content_hash": "abc",
-                        "site_payload_sha256": SITE_SYNC.payload_sha256(current_payload),
+                        "expected": {
+                            "content_hash": manifest["contentHash"],
+                            "report_date": manifest["reportDate"],
+                            "payload_sha256": manifest["payloadSha256"],
+                            "snapshot_revision": manifest["snapshotRevision"],
+                            "snapshot_sha256": manifest["snapshotSha256"],
+                            "candidate_fingerprint": manifest["candidateFingerprint"],
+                            "build_id": manifest["buildId"],
+                            "deployment_id": manifest["deploymentId"],
+                        },
                         "source_isolation": {"passed": True},
-                        "live": {"passed": True},
+                        "live": {
+                            "passed": True,
+                            "observed_content_hash": manifest["contentHash"],
+                            "observed_report_date": manifest["reportDate"],
+                            "observed_payload_sha256": manifest["payloadSha256"],
+                            "observed_snapshot_revision": manifest["snapshotRevision"],
+                            "observed_snapshot_sha256": manifest["snapshotSha256"],
+                            "observed_candidate_fingerprint": manifest["candidateFingerprint"],
+                            "observed_build_id": manifest["buildId"],
+                            "observed_deployment_id": manifest["deploymentId"],
+                        },
+                        "network": {
+                            "connected_ip": "93.184.216.34",
+                            "validated_addresses": ["93.184.216.34"],
+                            "dns_pinned": True,
+                            "tls_server_name": "example.com",
+                            "host_header": "example.com",
+                        },
                         "passed": True,
                     }
                 ),
@@ -453,13 +637,19 @@ class WorkspaceSyncTests(unittest.TestCase):
             )
             with (
                 patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "report_for_date", return_value=(report_path, "2026-07-12")),
+                patch.object(SITE_SYNC, "site_input_hash", return_value=content_hash),
+                patch.object(SITE_SYNC, "load_publication_snapshot", return_value=snapshot),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
                 patch.object(
                     sys,
                     "argv",
                     [
                         "sync_briefing_site.py",
                         "--mark-deployed",
-                        "abc",
+                        content_hash,
                         "--deployment-url",
                         "https://example.com",
                         "--verification-artifact",
@@ -472,8 +662,11 @@ class WorkspaceSyncTests(unittest.TestCase):
 
             state = json.loads(state_path.read_text(encoding="utf-8"))
 
-        self.assertEqual(state["last_deployed_sha"], "abc")
-        self.assertTrue(state["last_deployed_payload_sha"])
+        self.assertEqual(state["last_deployed_sha"], content_hash)
+        self.assertEqual(state["last_deployed_payload_sha"], current_payload_sha)
+        self.assertEqual(state["last_deployed_manifest_sha"], manifest_sha)
+        self.assertEqual(state["last_deployed_snapshot_revision"], 1)
+        self.assertEqual(state["last_deployed_snapshot_sha256"], snapshot_sha)
         self.assertNotIn("pending_sha", state)
         self.assertNotIn("pending_report", state)
         self.assertNotIn("pending_date", state)
@@ -481,17 +674,45 @@ class WorkspaceSyncTests(unittest.TestCase):
 
     def test_mark_deployed_rejects_missing_production_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            state_path = Path(temporary) / "site-sync-state.json"
-            state_path.write_text(json.dumps({"pending_sha": "abc"}), encoding="utf-8")
+            root = Path(temporary)
+            state_path = root / "site-sync-state.json"
+            site_data = root / "briefing.generated.json"
+            report_path = root / "report.md"
+            content_hash = "b" * 64
+            current_payload = {"reportDate": "2026-07-12", "contentHash": content_hash}
+            current_payload_sha = SITE_SYNC.payload_sha256(current_payload)
+            snapshot = {
+                "revision": 1,
+                "payload_sha256": current_payload_sha,
+                "payload": current_payload,
+            }
+            snapshot_sha = SITE_SYNC.publication_snapshot_sha256(snapshot)
+            state_path.write_text(
+                json.dumps({
+                    "pending_sha": content_hash,
+                    "pending_payload_sha": current_payload_sha,
+                    "pending_date": "2026-07-12",
+                    "pending_snapshot_revision": 1,
+                    "pending_snapshot_sha256": snapshot_sha,
+                }),
+                encoding="utf-8",
+            )
+            site_data.write_text(SITE_SYNC.serialized_payload(current_payload), encoding="utf-8")
+            report_path.write_text("report", encoding="utf-8")
             with (
                 patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "report_for_date", return_value=(report_path, "2026-07-12")),
+                patch.object(SITE_SYNC, "site_input_hash", return_value=content_hash),
+                patch.object(SITE_SYNC, "load_publication_snapshot", return_value=snapshot),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
                 patch.object(
                     sys,
                     "argv",
                     [
                         "sync_briefing_site.py",
                         "--mark-deployed",
-                        "abc",
+                        content_hash,
                         "--deployment-url",
                         "https://example.com",
                         "--verification-artifact",
@@ -505,6 +726,97 @@ class WorkspaceSyncTests(unittest.TestCase):
             state = json.loads(state_path.read_text(encoding="utf-8"))
 
         self.assertNotIn("last_deployed_sha", state)
+
+    def test_mark_deployed_rejects_unfrozen_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "site-sync-state.json"
+            site_data = root / "briefing.generated.json"
+            content_hash = "c" * 64
+            current_payload = {"reportDate": "2026-07-12", "contentHash": content_hash}
+            current_payload_sha = SITE_SYNC.payload_sha256(current_payload)
+            state_path.write_text(
+                json.dumps({
+                    "pending_sha": content_hash,
+                    "pending_payload_sha": current_payload_sha,
+                    "pending_date": "2026-07-12",
+                }),
+                encoding="utf-8",
+            )
+            site_data.write_text(SITE_SYNC.serialized_payload(current_payload), encoding="utf-8")
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["sync_briefing_site.py", "--mark-deployed", content_hash],
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), 2)
+
+            result = json.loads(output.getvalue())
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertTrue(any("not bound to a frozen" in reason for reason in result["reasons"]))
+        self.assertNotIn("last_deployed_sha", state)
+
+    def test_unready_candidate_is_staged_without_touching_deployable_site_json(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "site-sync-state.json"
+            site_data = root / "briefing.generated.json"
+            site_manifest = root / "publication.generated.json"
+            candidate_root = root / "publication_candidates"
+            report_path = root / "每日全球晨间简报-2026-07-12.md"
+            report_path.write_text("report", encoding="utf-8")
+            state_path.write_text("{}", encoding="utf-8")
+            site_data.write_text('{"sentinel":"payload"}\n', encoding="utf-8")
+            site_manifest.write_text('{"sentinel":"manifest"}\n', encoding="utf-8")
+            content_hash = "7" * 64
+            payload = {"reportDate": "2026-07-12", "contentHash": content_hash}
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "PUBLICATION_CANDIDATE_ROOT", candidate_root),
+                patch.object(SITE_SYNC, "OUTPUTS", root),
+                patch.object(SITE_SYNC, "site_dependency_source_errors", return_value=[]),
+                patch.object(SITE_SYNC, "report_for_date", return_value=(report_path, "2026-07-12")),
+                patch.object(SITE_SYNC, "site_input_hash", return_value=content_hash),
+                patch.object(SITE_SYNC, "build_payload", return_value=payload),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(SITE_SYNC, "current_repository_commits", return_value=TEST_REPOSITORY_COMMITS),
+                patch.object(
+                    SITE_SYNC,
+                    "load_publication_snapshot",
+                    side_effect=ValueError("legacy snapshot schema is invalid"),
+                ),
+                patch.object(
+                    SITE_SYNC,
+                    "publication_snapshot_readiness",
+                    return_value={"ready": False, "reasons": ["gates not ready"], "evidence": {}},
+                ),
+                patch.object(sys, "argv", ["sync_briefing_site.py", "--date", "2026-07-12"]),
+                redirect_stdout(StringIO()) as output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), 0)
+
+            result = json.loads(output.getvalue())
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            staged = json.loads(Path(result["staged"]).read_text(encoding="utf-8"))
+            site_data_after = site_data.read_text(encoding="utf-8")
+            site_manifest_after = site_manifest.read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "staged")
+        self.assertTrue(any("existing publication snapshot conflicts" in reason for reason in result["reasons"]))
+        self.assertEqual(staged["payload"], payload)
+        self.assertEqual(staged["candidate_fingerprint"]["report_sha256"], SITE_SYNC.hashlib.sha256(b"report").hexdigest())
+        self.assertNotIn("pending_sha", state)
+        self.assertEqual(site_data_after, '{"sentinel":"payload"}\n')
+        self.assertEqual(site_manifest_after, '{"sentinel":"manifest"}\n')
 
     @requires_runtime_report("2026-07-12")
     def test_payload_identity_detects_telemetry_changes_without_changing_content_identity(self) -> None:
@@ -531,25 +843,139 @@ class WorkspaceSyncTests(unittest.TestCase):
             improvements = root / "improvements.json"
             alerts = root / "alerts.json"
             backup = root / "backup.json"
-            cycle.write_text(json.dumps({"date": "2026-07-13", "overall_passed": True}), encoding="utf-8")
-            healing.write_text(json.dumps({"date": "2026-07-13", "overall_status": "healthy", "counts": {"blocking": 0}}), encoding="utf-8")
+            quality = root / "research-quality-2026-07-13.json"
+            raw_report = b"current report"
+            content_hash = "8" * 64
+            candidate = candidate_fingerprint(
+                "2026-07-13",
+                raw_report,
+                content_hash,
+                {"reportDate": "2026-07-13", "contentHash": content_hash},
+            )
+            cycle.write_text(
+                json.dumps({
+                    "date": "2026-07-13",
+                    "overall_passed": True,
+                    "operational_gate_passed": True,
+                    "release_candidate_passed": True,
+                    "idempotent_replay": True,
+                    "execution_profile": {"full_tests": True},
+                    "stages": [
+                        {"name": "sync", "status": "passed"},
+                        {"name": "canonical_virtual_ledger_commit", "status": "passed"},
+                    ],
+                    "ledger": {"write_performed": True},
+                    "boundary": {
+                        "canonical_write_performed": True,
+                        "idempotency_verified_by_repeated_fingerprint": True,
+                        "full_test_suite_executed": True,
+                    },
+                    "workspace_lock": {
+                        "release_reproducible": True,
+                        "repositories": [
+                            {"name": name, "commit": commit}
+                            for name, commit in TEST_REPOSITORY_COMMITS.items()
+                        ],
+                    },
+                }),
+                encoding="utf-8",
+            )
+            healing.write_text(
+                json.dumps({
+                    "date": "2026-07-13",
+                    "overall_status": "healthy",
+                    "deep": True,
+                    "strict": True,
+                    "counts": {"blocking": 0, "failed": 0, "unresolved": 0},
+                    "checks": [
+                        {"check_id": "briefing_tests", "executed": True, "passed": True},
+                        {"check_id": "site_quality", "executed": True, "passed": True},
+                    ],
+                }),
+                encoding="utf-8",
+            )
             improvements.write_text(json.dumps({"date": "2026-07-13", "status": "degraded", "counts": {"blocking": 0}}), encoding="utf-8")
             alerts.write_text(json.dumps({"date": "2026-07-13", "status": "healthy", "finding_count": 0}), encoding="utf-8")
-            backup.write_text(json.dumps({"date": "2026-07-13", "verified": True, "restore_verified": True, "target_outside_workspace": True}), encoding="utf-8")
+            quality_payload = {
+                "date": "2026-07-13",
+                "report_sha256": SITE_SYNC.hashlib.sha256(raw_report).hexdigest(),
+                "operational_passed": True,
+                "report_audit": {"passed": True},
+            }
+            quality.write_text(json.dumps(quality_payload), encoding="utf-8")
+            backup_payload = {
+                "date": "2026-07-13",
+                "encrypted": True,
+                "encryption_algorithm": "AES-256-GCM",
+                "encrypted_container_authenticated": True,
+                "archive_integrity_verified": True,
+                "restore_verified": True,
+                "restore_scope": "configured_workspace_files_and_git_bundles",
+                "full_runtime_restore_verified": False,
+                "target_outside_workspace": True,
+            }
+            backup.write_text(json.dumps(backup_payload), encoding="utf-8")
             with (
                 patch.object(SITE_SYNC, "cycle_audit_path", return_value=cycle),
+                patch.object(SITE_SYNC, "DATA_DIR", root),
                 patch.object(SITE_SYNC, "ATLAS_SELF_HEALING_LATEST", healing),
                 patch.object(SITE_SYNC, "ATLAS_IMPROVEMENTS_LATEST", improvements),
                 patch.object(SITE_SYNC, "ATLAS_ALERTS_LATEST", alerts),
                 patch.object(SITE_SYNC, "ATLAS_BACKUPS_LATEST", backup),
             ):
-                ready = SITE_SYNC.publication_snapshot_readiness("2026-07-13")
-                backup.write_text(json.dumps({"date": "2026-07-12", "verified": True, "restore_verified": True, "target_outside_workspace": True}), encoding="utf-8")
-                blocked = SITE_SYNC.publication_snapshot_readiness("2026-07-13")
+                ready = SITE_SYNC.publication_snapshot_readiness(
+                    "2026-07-13", candidate_fingerprint=candidate
+                )
+                quality_payload["report_sha256"] = "0" * 64
+                quality.write_text(json.dumps(quality_payload), encoding="utf-8")
+                blocked_quality = SITE_SYNC.publication_snapshot_readiness(
+                    "2026-07-13", candidate_fingerprint=candidate
+                )
+                quality_payload["report_sha256"] = SITE_SYNC.hashlib.sha256(raw_report).hexdigest()
+                quality.write_text(json.dumps(quality_payload), encoding="utf-8")
+                backup_payload["encrypted"] = False
+                backup.write_text(json.dumps(backup_payload), encoding="utf-8")
+                blocked_backup = SITE_SYNC.publication_snapshot_readiness(
+                    "2026-07-13", candidate_fingerprint=candidate
+                )
+                backup_payload["encrypted"] = True
+                backup.write_text(json.dumps(backup_payload), encoding="utf-8")
+                healing_payload = json.loads(healing.read_text(encoding="utf-8"))
+                healing_payload["deep"] = False
+                healing.write_text(json.dumps(healing_payload), encoding="utf-8")
+                blocked = SITE_SYNC.publication_snapshot_readiness(
+                    "2026-07-13", candidate_fingerprint=candidate
+                )
+                healing_payload["deep"] = True
+                healing.write_text(json.dumps(healing_payload), encoding="utf-8")
+                cycle_payload = json.loads(cycle.read_text(encoding="utf-8"))
+                cycle_payload["release_candidate_passed"] = False
+                cycle.write_text(json.dumps(cycle_payload), encoding="utf-8")
+                blocked_release = SITE_SYNC.publication_snapshot_readiness(
+                    "2026-07-13", candidate_fingerprint=candidate
+                )
 
         self.assertTrue(ready["ready"])
+        self.assertEqual(ready["evidence"]["candidateFingerprint"], candidate)
+        self.assertEqual(
+            ready["evidence"]["candidateFormula"],
+            "sha256(utf8(json(candidate_inputs,sort_keys=true,separators=(',',':'))))",
+        )
+        self.assertTrue(
+            all(
+                evidence["candidateFingerprint"] == candidate["fingerprint_sha256"]
+                and len(evidence["sha256"]) == 64
+                for evidence in ready["evidence"]["gateArtifacts"].values()
+            )
+        )
+        self.assertFalse(blocked_quality["ready"])
+        self.assertTrue(any("current report SHA" in reason for reason in blocked_quality["reasons"]))
+        self.assertFalse(blocked_backup["ready"])
+        self.assertTrue(any("encrypted external backup" in reason for reason in blocked_backup["reasons"]))
         self.assertFalse(blocked["ready"])
-        self.assertTrue(any("backup" in reason for reason in blocked["reasons"]))
+        self.assertTrue(any("deep self-healing" in reason for reason in blocked["reasons"]))
+        self.assertFalse(blocked_release["ready"])
+        self.assertTrue(any("release candidate" in reason for reason in blocked_release["reasons"]))
 
     @requires_runtime_report("2026-07-12")
     def test_frozen_publication_snapshot_is_retry_stable_and_rejects_silent_report_drift(self) -> None:
@@ -557,7 +983,22 @@ class WorkspaceSyncTests(unittest.TestCase):
         raw = report_path.read_bytes()
         content_hash = SITE_SYNC.site_input_hash(raw, report_date)
         payload = SITE_SYNC.build_payload(raw.decode("utf-8"), report_date, 1, content_hash)
-        readiness = {"ready": True, "reasons": [], "evidence": {"cycle": {"overallPassed": True}}}
+        candidate = candidate_fingerprint(report_date, raw, content_hash, payload)
+        readiness = {
+            "ready": True,
+            "reasons": [],
+            "evidence": {
+                "candidateFingerprint": candidate,
+                "candidateFingerprintSha256": candidate["fingerprint_sha256"],
+                "candidateFormula": candidate["formula"],
+                "gateArtifacts": {
+                    "cycle": {
+                        "sha256": "9" * 64,
+                        "candidateFingerprint": candidate["fingerprint_sha256"],
+                    }
+                },
+            },
+        }
         with tempfile.TemporaryDirectory() as temporary:
             snapshot_root = Path(temporary) / "snapshots"
             with (
@@ -569,6 +1010,7 @@ class WorkspaceSyncTests(unittest.TestCase):
                     raw_report=raw,
                     content_hash=content_hash,
                     payload=payload,
+                    candidate_fingerprint=candidate,
                 )
                 loaded = SITE_SYNC.load_publication_snapshot(report_date, raw, content_hash)
                 with self.assertRaisesRegex(ValueError, "report changed"):
@@ -578,12 +1020,18 @@ class WorkspaceSyncTests(unittest.TestCase):
                     raw_report=raw,
                     content_hash=content_hash,
                     payload=payload,
+                    candidate_fingerprint=candidate,
                     refresh=True,
                 )
 
             history_exists = (snapshot_root / "history" / report_date / "revision-1.json").exists()
 
         self.assertEqual(first["revision"], 1)
+        self.assertEqual(first["candidate_fingerprint"], candidate)
+        self.assertEqual(
+            SITE_SYNC.build_publication_manifest(first)["payloadSha256"],
+            first["payload_sha256"],
+        )
         self.assertEqual(loaded["payload_sha256"], first["payload_sha256"])
         self.assertEqual(second["revision"], 2)
         self.assertTrue(history_exists)
@@ -624,12 +1072,14 @@ class WorkspaceSyncTests(unittest.TestCase):
                                 "initial_cash": 100000,
                                 "base_currency": "USD",
                                 "trades_file": "data/us.jsonl",
+                                "valuations_file": "data/paper_valuations_us.jsonl",
                             },
                             "CHINA": {
                                 "account_id": "china-test",
                                 "initial_cash": 100000,
                                 "base_currency": "CNY",
                                 "trades_file": "data/china.jsonl",
+                                "valuations_file": "data/paper_valuations_china.jsonl",
                             },
                         }
                     }
@@ -656,6 +1106,7 @@ class WorkspaceSyncTests(unittest.TestCase):
                                 "currency": "USD",
                                 "quantity": 1,
                                 "price": 100,
+                                "price_date": "2026-06-09",
                             }
                         ),
                         json.dumps(
@@ -674,6 +1125,29 @@ class WorkspaceSyncTests(unittest.TestCase):
                 + "\n",
                 encoding="utf-8",
             )
+            (data_dir / "paper_valuations_us.jsonl").write_text(
+                json.dumps({
+                    "date": "2026-06-14",
+                    "cash": 99900,
+                    "positions_value": 120,
+                    "equity": 100020,
+                    "price_snapshot": [
+                        {
+                            "key": "NASDAQ:AAPL",
+                            "symbol": "AAPL",
+                            "exchange": "NASDAQ",
+                            "currency": "USD",
+                            "fx_to_base": 1,
+                            "price": 120,
+                            "price_date": "2026-06-14",
+                            "source": "dated valuation",
+                        }
+                    ],
+                })
+                + "\n",
+                encoding="utf-8",
+            )
+            (data_dir / "paper_valuations_china.jsonl").write_text("", encoding="utf-8")
             (data_dir / "china.jsonl").write_text(
                 json.dumps(
                     {
@@ -698,5 +1172,43 @@ class WorkspaceSyncTests(unittest.TestCase):
                 china = SITE_SYNC.portfolio("CHINA", "2026-06-14")
 
         self.assertNotIn("CIBR", {item["symbol"] for item in us["positions"]})
+        self.assertEqual(us["positions"][0]["lastPrice"], 120)
+        self.assertEqual(us["positions"][0]["priceDate"], "2026-06-14")
+        self.assertEqual(us["equity"], 100020)
         self.assertEqual(china["baseCurrency"], "CNY")
         self.assertTrue(any("逐笔重建" in item for item in us["limitations"]))
+
+    def test_public_portfolio_exposes_account_totals_but_not_ledger_details(self) -> None:
+        public = SITE_SYNC.public_portfolio(
+            {
+                "name": "US 虚拟组合",
+                "value": "99,008.90",
+                "return": "-0.99%",
+                "returnPct": -0.99,
+                "asOf": "2026-07-16",
+                "baseCurrency": "USD",
+                "cash": 30000.0,
+                "cashPct": 30.3,
+                "equity": 99008.9,
+                "periodPnl": -340.16,
+                "periodReturnPct": -0.34,
+                "allocations": [
+                    {"label": "现金", "pct": 30.3},
+                    {"label": "SMH", "pct": 22.5},
+                    {"label": "其他", "pct": 47.2},
+                ],
+                "accountId": "private-account",
+                "positions": [{"symbol": "SMH"}],
+                "realizedPnl": 0.0,
+                "initialCash": 100000.0,
+                "paperTradingOnly": True,
+            }
+        )
+
+        self.assertEqual(public["equity"], 99008.9)
+        self.assertEqual(public["cash"], 30000.0)
+        self.assertEqual(public["periodPnl"], -340.16)
+        self.assertEqual(public["baseCurrency"], "USD")
+        self.assertEqual(public["allocations"][1]["label"], "匿名资产 1")
+        for field in ("accountId", "positions", "realizedPnl", "initialCash", "previousEquity"):
+            self.assertNotIn(field, public)

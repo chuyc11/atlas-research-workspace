@@ -33,3 +33,21 @@ class PaperTradingFeeTests(unittest.TestCase):
         fee, breakdown = MODULE.calculate_fee("BUY", 10_000.0, {}, 0.0)
         self.assertEqual(fee, 0.0)
         self.assertEqual(breakdown, {"commission": 0.0, "stamp_tax": 0.0})
+
+    def test_fee_model_rejects_non_finite_or_negative_fee_and_tax_parameters(self) -> None:
+        with self.assertRaisesRegex(ValueError, "gross notional must be finite"):
+            MODULE.calculate_fee("BUY", float("nan"), {})
+        with self.assertRaisesRegex(ValueError, "commission_rate must be non-negative"):
+            MODULE.calculate_fee("BUY", 10_000.0, {"commission_rate": -0.01})
+        with self.assertRaisesRegex(ValueError, "min_commission must be non-negative"):
+            MODULE.calculate_fee(
+                "BUY",
+                10_000.0,
+                {"commission_rate": 0.001, "min_commission": -1},
+            )
+        with self.assertRaisesRegex(ValueError, "stamp_tax_sell_rate must be non-negative"):
+            MODULE.calculate_fee(
+                "SELL",
+                10_000.0,
+                {"stamp_tax_sell_rate": -0.001},
+            )
