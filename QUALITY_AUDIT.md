@@ -50,6 +50,7 @@
 ## 验证证据
 
 - 根仓完整测试：227 passed、9 subtests passed；覆盖率 70.19%，高于 CI 的 60% 门槛。
+- 独立干净工作区：218 passed、9 skipped、9 subtests passed，覆盖率 66.04%；跳过项均要求未入库运行态工件。全新 `npm ci` 安装并审计 491 个包，0 漏洞，跨仓门禁后根仓与两个 gitlink 仍干净。
 - 虚拟交易专项：37 passed、6 subtests passed；覆盖批次崩溃恢复、锁顺序、币种一致性、日期单调和回放拒绝。
 - 发布、冻结快照、研究来源与生产验证专项：83 passed。
 - 灾备专项：16 passed；灾备、告警与改进验收联测：28 passed；错误密钥、篡改、额外 ZIP 成员和伪 Git bundle 均失败。
