@@ -7,6 +7,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from datetime import UTC, datetime
@@ -447,6 +448,37 @@ class AtlasCycleTests(unittest.TestCase):
             failed["audit"]["blocking_reasons"],
         )
         self.assertFalse(atlas.VIRTUAL_LEDGER_PATH.exists())
+
+    @unittest.skipUnless(os.name == "nt", "Windows user-environment fallback")
+    def test_windows_user_environment_fallback_preserves_explicit_empty_values(self) -> None:
+        values = {
+            atlas.TRUST_ANCHOR_ROOT_ENV: str(self.trust_root),
+            atlas.TRUST_ANCHOR_NAMESPACE_ENV: "registry-test-namespace",
+            atlas.TRUST_ANCHOR_HMAC_KEY_ENV: "registry-test-key",
+        }
+
+        class FakeWinReg:
+            HKEY_CURRENT_USER = object()
+
+            @staticmethod
+            def OpenKey(_hive: object, _path: str) -> contextlib.AbstractContextManager[object]:
+                return contextlib.nullcontext(object())
+
+            @staticmethod
+            def QueryValueEx(_key: object, name: str) -> tuple[str, int]:
+                return values[name], 1
+
+        with (
+            patch.dict(os.environ, {}, clear=True),
+            patch.dict(sys.modules, {"winreg": FakeWinReg}, clear=False),
+        ):
+            self.assertEqual(
+                atlas.configured_trust_anchor_value(atlas.TRUST_ANCHOR_ROOT_ENV),
+                str(self.trust_root),
+            )
+            self.assertEqual(atlas.trust_anchor_hmac_key(), b"registry-test-key")
+            with patch.dict(os.environ, {atlas.TRUST_ANCHOR_HMAC_KEY_ENV: ""}, clear=False):
+                self.assertIsNone(atlas.trust_anchor_hmac_key())
 
     def test_workspace_local_trust_anchor_root_is_rejected(self) -> None:
         with patch.dict(os.environ, {atlas.TRUST_ANCHOR_ROOT_ENV: str(self.root)}, clear=False):

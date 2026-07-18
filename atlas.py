@@ -410,6 +410,29 @@ def stable_hash(payload: Any) -> str:
     return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
 
 
+def configured_trust_anchor_value(name: str) -> str | None:
+    """Read an explicit process setting, or Windows' current-user fallback.
+
+    Persistent Windows user environment values are not inherited by terminals
+    that were already running when they were configured.  Falling back only
+    when the variable is *absent* lets a fresh direct ``python atlas.py``
+    invocation use the protected user setting without weakening explicit empty
+    values used to disable a key or exercise fail-closed checks.
+    """
+    if name in os.environ:
+        return os.environ.get(name)
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as key:
+            value, _value_type = winreg.QueryValueEx(key, name)
+    except OSError:
+        return None
+    return value if isinstance(value, str) else None
+
+
 def configured_trust_anchor_root() -> tuple[Path | None, str | None]:
     """Return the protected anchor root, rejecting workspace-local storage.
 
@@ -421,7 +444,7 @@ def configured_trust_anchor_root() -> tuple[Path | None, str | None]:
     responsibility; the HMAC below makes an altered checkpoint detectable when
     its key is kept outside the workspace.
     """
-    configured = os.environ.get(TRUST_ANCHOR_ROOT_ENV)
+    configured = configured_trust_anchor_value(TRUST_ANCHOR_ROOT_ENV)
     candidate = Path(configured).expanduser() if configured else Path.home() / ".atlas-trust"
     try:
         resolved = candidate.resolve()
@@ -443,7 +466,7 @@ def trust_anchor_path(kind: str, subject: str) -> Path:
     root, error = configured_trust_anchor_root()
     if root is None:
         raise RuntimeError(error or "external trust-anchor root is unavailable")
-    namespace = str(os.environ.get(TRUST_ANCHOR_NAMESPACE_ENV) or "").strip()
+    namespace = str(configured_trust_anchor_value(TRUST_ANCHOR_NAMESPACE_ENV) or "").strip()
     if not namespace:
         raise RuntimeError(
             f"{TRUST_ANCHOR_NAMESPACE_ENV} is required to select a stable external trust anchor"
@@ -460,7 +483,7 @@ def trust_anchor_path(kind: str, subject: str) -> Path:
 
 def trust_anchor_hmac_key() -> bytes | None:
     """Read, but never persist, the external trust-anchor signing key."""
-    raw = os.environ.get(TRUST_ANCHOR_HMAC_KEY_ENV)
+    raw = configured_trust_anchor_value(TRUST_ANCHOR_HMAC_KEY_ENV)
     if raw is None or not raw.strip():
         return None
     return raw.encode("utf-8")
@@ -2062,7 +2085,7 @@ def doctor_checks() -> list[Check]:
     )
 
     trust_root, trust_root_error = configured_trust_anchor_root()
-    namespace = str(os.environ.get(TRUST_ANCHOR_NAMESPACE_ENV) or "").strip()
+    namespace = str(configured_trust_anchor_value(TRUST_ANCHOR_NAMESPACE_ENV) or "").strip()
     trust_key_configured = trust_anchor_hmac_key() is not None
     trust_ready = bool(trust_root is not None and namespace and trust_key_configured)
     trust_detail = (
