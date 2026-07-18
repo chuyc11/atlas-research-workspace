@@ -192,6 +192,188 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertEqual(second["audit"]["source_counts"]["global_briefing_temp_orders"], 1)
         self.assertTrue(second["audit"]["reconciliation"]["passed"])
 
+    def test_symbolic_all_temp_order_reconciles_to_unique_executed_trade(self) -> None:
+        trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
+        executed = {
+            "account": "US",
+            "account_id": "global-briefing-us-paper-trading",
+            "action": "SELL",
+            "date": "2026-07-10",
+            "exchange": "NASDAQ",
+            "gross_value": 10,
+            "market_type": "US",
+            "order_id": "2026-07-10-US-SELL-TEST-P01",
+            "paper_trading_only": True,
+            "prediction_id": "2026-07-10-P01",
+            "price": 10,
+            "price_date": "2026-07-10",
+            "quantity": 1,
+            "reason": "risk threshold reached",
+            "risk": "the price could rebound",
+            "scenario": "reduce test exposure",
+            "source": "fixture close",
+            "symbol": "TEST",
+            "timestamp": "2026-07-10T10:00:00",
+        }
+        existing = [
+            json.loads(line)
+            for line in trades_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+
+        orders_path = self.briefing / "data" / "temp-orders-2026-07-10.json"
+        payload = json.loads(orders_path.read_text(encoding="utf-8"))
+        intent = {
+            "account": "US",
+            "action": "SELL",
+            "date": "2026-07-10",
+            "exchange": "NASDAQ",
+            "market": "US",
+            "order_id": executed["order_id"],
+            "paper_trading_only": True,
+            "prediction_id": executed["prediction_id"],
+            "price": executed["price"],
+            "price_date": executed["price_date"],
+            "previous_close": 9.5,
+            "quantity": "ALL",
+            "reason": executed["reason"],
+            "risk": executed["risk"],
+            "scenario": executed["scenario"],
+            "source": executed["source"],
+            "symbol": executed["symbol"],
+        }
+        executed["order_fingerprint"] = atlas.stable_hash(
+            {
+                "account_id": executed["account_id"],
+                "date": intent["date"],
+                "order": {
+                    key: value
+                    for key, value in intent.items()
+                    if key
+                    not in {
+                        "timestamp",
+                        "order_id",
+                        "idempotency_key",
+                        "account",
+                        "paper_account",
+                    }
+                },
+            }
+        )
+        write_jsonl(trades_path, [*existing, executed])
+        payload["orders"].append(intent)
+        write_json(orders_path, payload)
+        portfolio_path = self.briefing / "data" / "paper_portfolio_us.json"
+        portfolio = json.loads(portfolio_path.read_text(encoding="utf-8"))
+        portfolio["positions"]["NASDAQ:TEST"]["quantity"] = 1
+        write_json(portfolio_path, portfolio)
+
+        result = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertTrue(result["audit"]["overall_passed"])
+        resolved = next(
+            event
+            for event in result["events"]
+            if event["event_type"] == "virtual_order_intent"
+            and event["order_id"] == executed["order_id"]
+        )
+        self.assertEqual(resolved["filled_quantity"], 1)
+        self.assertEqual(resolved["source_hash"], atlas.stable_hash(intent))
+        self.assertEqual(resolved["quantity_resolution"], "executed_order_id")
+        self.assertEqual(resolved["resolved_source_hash"], atlas.stable_hash(executed))
+        self.assertEqual(
+            resolved["resolved_order_fingerprint"], executed["order_fingerprint"]
+        )
+        self.assertEqual(
+            json.loads(orders_path.read_text(encoding="utf-8"))["orders"][1]["quantity"],
+            "ALL",
+        )
+        self.assertEqual(
+            json.loads(trades_path.read_text(encoding="utf-8").splitlines()[-1])["quantity"],
+            1,
+        )
+
+    def test_symbolic_all_temp_order_mismatch_fails_closed(self) -> None:
+        trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
+        executed = {
+            "account": "US",
+            "account_id": "global-briefing-us-paper-trading",
+            "action": "SELL",
+            "date": "2026-07-10",
+            "exchange": "NASDAQ",
+            "gross_value": 10,
+            "market_type": "US",
+            "order_id": "2026-07-10-US-SELL-TEST-P01",
+            "paper_trading_only": True,
+            "prediction_id": "2026-07-10-P01",
+            "price": 10,
+            "price_date": "2026-07-10",
+            "quantity": 1,
+            "reason": "risk threshold reached",
+            "risk": "the price could rebound",
+            "scenario": "reduce test exposure",
+            "source": "fixture close",
+            "symbol": "TEST",
+            "timestamp": "2026-07-10T10:00:00",
+        }
+        existing = [
+            json.loads(line)
+            for line in trades_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        orders_path = self.briefing / "data" / "temp-orders-2026-07-10.json"
+        payload = json.loads(orders_path.read_text(encoding="utf-8"))
+        intent = {
+            "account": "US",
+            "action": "SELL",
+            "date": "2026-07-10",
+            "exchange": "NASDAQ",
+            "market": "US",
+            "order_id": executed["order_id"],
+            "paper_trading_only": True,
+            "prediction_id": executed["prediction_id"],
+            "price": executed["price"],
+            "price_date": executed["price_date"],
+            "previous_close": 9.5,
+            "quantity": "ALL",
+            "reason": executed["reason"],
+            "risk": executed["risk"],
+            "scenario": executed["scenario"],
+            "source": executed["source"],
+            "symbol": executed["symbol"],
+        }
+        executed["order_fingerprint"] = atlas.stable_hash(
+            {
+                "account_id": executed["account_id"],
+                "date": intent["date"],
+                "order": {
+                    key: value
+                    for key, value in intent.items()
+                    if key
+                    not in {
+                        "timestamp",
+                        "order_id",
+                        "idempotency_key",
+                        "account",
+                        "paper_account",
+                    }
+                },
+            }
+        )
+        write_jsonl(trades_path, [*existing, executed])
+        intent["previous_close"] = 9.25
+        payload["orders"].append(intent)
+        write_json(orders_path, payload)
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        reasons = "\n".join(failed["audit"]["blocking_reasons"])
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        self.assertIn("order_fingerprint mismatch", reasons)
+        self.assertIn(executed["order_id"], reasons)
+        self.assertFalse((self.ledger_root / "atlas_virtual_execution_ledger.jsonl").exists())
+
     def test_raw_virtual_source_rejects_nested_broker_keys_before_canonicalization(self) -> None:
         trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
         trade = json.loads(trades_path.read_text(encoding="utf-8").splitlines()[0])

@@ -230,12 +230,19 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     for field in (
         "price_date_required_from_date",
+        "prediction_reference_required_from_date",
         "theme_required_from_date",
         "maximum_theme_exposure_enforce_from_date",
         "theme_registry_history_required_from_date",
     ):
         if contract.get(field):
             datetime.strptime(str(contract[field])[:10], "%Y-%m-%d")
+    if contract.get("prediction_reference_required_from_date"):
+        prediction_ledger_file = config.get("prediction_ledger_file")
+        if not isinstance(prediction_ledger_file, str) or not prediction_ledger_file.strip():
+            raise ValueError(
+                "prediction_ledger_file is required when prediction-reference enforcement is configured."
+            )
     if contract.get("theme_registry_history_required_from_date") and not all(
         config.get(field) for field in ("theme_registry_history_file", "theme_registry_snapshot_dir")
     ):
@@ -1162,6 +1169,66 @@ def order_decision_date(order: dict[str, Any], run_date: str) -> str:
             f"Order date {canonical_order_date} must equal run date {canonical_run_date}; backdated orders are not allowed."
         )
     return canonical_order_date
+
+
+def prediction_reference_required(config: dict[str, Any], decision_date: str) -> bool:
+    contract = config.get("order_contract", {}) if isinstance(config.get("order_contract"), dict) else {}
+    required_from = str(contract.get("prediction_reference_required_from_date") or "9999-12-31")[:10]
+    return decision_date >= required_from
+
+
+def load_original_prediction_dates(config: dict[str, Any]) -> dict[str, list[str]]:
+    ledger_path = resolve_path(config, "prediction_ledger_file")
+    if not ledger_path.exists():
+        raise ValueError(f"Prediction ledger required for new paper orders does not exist: {ledger_path}")
+
+    originals: dict[str, list[str]] = {}
+    for index, row in enumerate(read_jsonl(ledger_path), start=1):
+        if isinstance(row.get("review"), dict):
+            continue
+        prediction_id = str(row.get("prediction_id") or "").strip()
+        if not prediction_id:
+            continue
+        record_date = strict_iso_date(
+            row.get("date"),
+            f"Prediction ledger row {index} date for {prediction_id}",
+        )
+        if prediction_id in originals:
+            raise ValueError(
+                "Prediction ledger contains duplicate original prediction_id "
+                f"{prediction_id}; new paper orders fail closed."
+            )
+        originals.setdefault(prediction_id, []).append(record_date)
+    return originals
+
+
+def required_prediction_id(order: dict[str, Any], decision_date: str) -> str:
+    prediction_id_raw = order.get("prediction_id")
+    if not isinstance(prediction_id_raw, str) or not prediction_id_raw.strip():
+        raise ValueError(
+            f"New paper order on {decision_date} requires prediction_id under the prediction-reference contract."
+        )
+    if prediction_id_raw != prediction_id_raw.strip():
+        raise ValueError("New paper order prediction_id must not contain leading or trailing whitespace.")
+    return prediction_id_raw.strip()
+
+
+def validate_prediction_reference(
+    prediction_id: str,
+    decision_date: str,
+    original_dates: dict[str, list[str]],
+) -> None:
+    dates = original_dates.get(prediction_id, [])
+    if not dates:
+        raise ValueError(
+            f"New paper order references prediction_id {prediction_id}, but no original prediction record exists."
+        )
+    if not any(record_date <= decision_date for record_date in dates):
+        earliest = min(dates)
+        raise ValueError(
+            f"New paper order references prediction_id {prediction_id} dated {earliest}, "
+            f"which follows order date {decision_date}."
+        )
 
 
 def position_key(symbol: str, exchange: str | None = None) -> str:
@@ -2267,6 +2334,7 @@ def apply_orders(input_path: Path, date: str, account: str | None = None) -> lis
 
     returned_records: list[dict[str, Any]] = []
     prepared: list[tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], bool]] = []
+    original_prediction_dates: dict[str, list[str]] | None = None
     recovery_contexts = [
         (account_name, account_config(base_config, account_name))
         for account_name in target_accounts(base_config, "ALL")
@@ -2339,6 +2407,12 @@ def apply_orders(input_path: Path, date: str, account: str | None = None) -> lis
                         f"Paper order payload duplicates order_fingerprint owned by "
                         f"{fingerprint_owner or '<legacy>'} with a different order_id."
                     )
+
+                if prediction_reference_required(config, date):
+                    prediction_id = required_prediction_id(order, date)
+                    if original_prediction_dates is None:
+                        original_prediction_dates = load_original_prediction_dates(config)
+                    validate_prediction_reference(prediction_id, date, original_prediction_dates)
 
                 record = apply_order(
                     state,

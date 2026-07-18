@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -545,6 +547,138 @@ class ResearchQualityTests(unittest.TestCase):
                     STORE.append_prediction_records(input_path, "2026-07-17", predictions)
 
             self.assertEqual(predictions.read_text(encoding="utf-8"), "")
+
+    def test_storage_validate_records_is_read_only_and_reports_idempotent_counts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            existing = v2_prediction()
+            predictions = root / "predictions.jsonl"
+            original_text = json.dumps(existing, ensure_ascii=False) + "\n"
+            predictions.write_text(original_text, encoding="utf-8")
+            input_path = root / "input.json"
+            input_path.write_text(
+                json.dumps([existing, v2_prediction("2026-07-12-P02")], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            settings = root / "settings.json"
+            settings.write_text(
+                json.dumps({"prediction_contract": {"enforce_from_date": "2026-07-12"}}),
+                encoding="utf-8",
+            )
+
+            with patch.object(STORE, "DEFAULT_SETTINGS", settings):
+                result = STORE.validate_prediction_records(input_path, "2026-07-12", predictions)
+
+            self.assertEqual(
+                result,
+                {"status": "ok", "would_record": 1, "skipped_identical": 1},
+            )
+            self.assertEqual(predictions.read_text(encoding="utf-8"), original_text)
+            self.assertFalse(predictions.with_suffix(".jsonl.lock").exists())
+
+    def test_storage_validate_records_cli_is_single_json_and_creates_no_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            predictions = root / "missing" / "predictions.jsonl"
+            input_path = root / "input.json"
+            input_path.write_text(json.dumps(v2_prediction()), encoding="utf-8")
+            settings = root / "settings.json"
+            settings.write_text(
+                json.dumps({"prediction_contract": {"enforce_from_date": "2026-07-12"}}),
+                encoding="utf-8",
+            )
+            output = io.StringIO()
+
+            with (
+                patch.object(STORE, "DEFAULT_SETTINGS", settings),
+                patch.object(STORE, "DEFAULT_PREDICTIONS", predictions),
+                redirect_stdout(output),
+            ):
+                returncode = STORE.main([
+                    "validate-records",
+                    "--date",
+                    "2026-07-12",
+                    "--input",
+                    str(input_path),
+                ])
+
+            lines = output.getvalue().splitlines()
+            self.assertEqual(returncode, 0)
+            self.assertEqual(len(lines), 1)
+            self.assertEqual(
+                json.loads(lines[0]),
+                {"status": "ok", "would_record": 1, "skipped_identical": 0},
+            )
+            self.assertFalse(predictions.exists())
+            self.assertFalse(predictions.with_suffix(".jsonl.lock").exists())
+
+    def test_storage_validate_records_and_record_reject_same_ledger_conflict(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            original = v2_prediction()
+            review = resolved_review()
+            conflicting_review = json.loads(json.dumps(review))
+            conflicting_review["review"]["notes"] = "same identity, different evidence"
+            predictions = root / "predictions.jsonl"
+            original_text = "".join(
+                json.dumps(record, ensure_ascii=False) + "\n"
+                for record in (original, review, conflicting_review)
+            )
+            predictions.write_text(original_text, encoding="utf-8")
+            input_path = root / "input.json"
+            input_path.write_text(json.dumps(v2_prediction("2026-07-12-P02")), encoding="utf-8")
+            settings = root / "settings.json"
+            settings.write_text(
+                json.dumps({"prediction_contract": {"enforce_from_date": "2026-07-12"}}),
+                encoding="utf-8",
+            )
+
+            with patch.object(STORE, "DEFAULT_SETTINGS", settings):
+                with self.assertRaisesRegex(ValueError, "conflicting review records") as preflight_error:
+                    STORE.validate_prediction_records(input_path, "2026-07-12", predictions)
+                with (
+                    patch.object(STORE, "ensure_files", side_effect=lambda **_: None),
+                    self.assertRaisesRegex(ValueError, "conflicting review records") as record_error,
+                ):
+                    STORE.append_prediction_records(input_path, "2026-07-12", predictions)
+
+            self.assertEqual(str(preflight_error.exception), str(record_error.exception))
+            self.assertEqual(predictions.read_text(encoding="utf-8"), original_text)
+
+    def test_storage_validate_records_and_record_reject_dirty_duplicate_originals(self) -> None:
+        for conflicting in (False, True):
+            with self.subTest(conflicting=conflicting), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                original = v2_prediction()
+                duplicate = json.loads(json.dumps(original))
+                if conflicting:
+                    duplicate["scenario"] = "same identity, conflicting scenario"
+                predictions = root / "predictions.jsonl"
+                original_text = "".join(
+                    json.dumps(record, ensure_ascii=False) + "\n"
+                    for record in (original, duplicate)
+                )
+                predictions.write_text(original_text, encoding="utf-8")
+                input_path = root / "input.json"
+                input_path.write_text(json.dumps(v2_prediction("2026-07-12-P02")), encoding="utf-8")
+                settings = root / "settings.json"
+                settings.write_text(
+                    json.dumps({"prediction_contract": {"enforce_from_date": "2026-07-12"}}),
+                    encoding="utf-8",
+                )
+
+                expected = "conflicting original records" if conflicting else "duplicate original records"
+                with patch.object(STORE, "DEFAULT_SETTINGS", settings):
+                    with self.assertRaisesRegex(ValueError, expected) as preflight_error:
+                        STORE.validate_prediction_records(input_path, "2026-07-12", predictions)
+                    with (
+                        patch.object(STORE, "ensure_files", side_effect=lambda **_: None),
+                        self.assertRaisesRegex(ValueError, expected) as record_error,
+                    ):
+                        STORE.append_prediction_records(input_path, "2026-07-12", predictions)
+
+                self.assertEqual(str(preflight_error.exception), str(record_error.exception))
+                self.assertEqual(predictions.read_text(encoding="utf-8"), original_text)
 
     def test_storage_serializes_concurrent_idempotent_appends(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

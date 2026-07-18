@@ -59,6 +59,12 @@ class ResolutionEvidenceTests(unittest.TestCase):
         self.assertAlmostEqual(result["benchmark_return_pct"], 1.0)
         self.assertFalse(result["ledger_mutation_allowed"])
         self.assertTrue(result["requires_source_verification"])
+        fragment = result["ledger_fragment_after_verification"]
+        self.assertEqual(fragment["price_field"], "adjusted_close")
+        self.assertEqual(fragment["symbol_start_price"], 100.0)
+        self.assertEqual(fragment["symbol_end_price"], 103.0)
+        self.assertEqual(fragment["benchmark_start_price"], 200.0)
+        self.assertEqual(fragment["benchmark_end_price"], 202.0)
 
     def test_missing_machine_contract_blocks_post_hoc_rule_inference(self) -> None:
         item = mapping()

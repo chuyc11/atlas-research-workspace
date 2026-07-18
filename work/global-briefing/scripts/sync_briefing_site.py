@@ -14,7 +14,9 @@ import hashlib
 import ipaddress
 import json
 import math
+import os
 import re
+import secrets
 import subprocess
 import sys
 from difflib import SequenceMatcher
@@ -51,10 +53,37 @@ ATLAS_ALERTS_LATEST = ATLAS_RUNTIME_ROOT / "alerts" / "latest.json"
 ATLAS_BACKUPS_LATEST = ATLAS_RUNTIME_ROOT / "backups" / "latest.json"
 PUBLICATION_SNAPSHOT_ROOT = ATLAS_RUNTIME_ROOT / "publication_snapshots"
 PUBLICATION_CANDIDATE_ROOT = ATLAS_RUNTIME_ROOT / "publication_candidates"
+PUBLICATION_RETRY_LOCK_ROOT = ATLAS_RUNTIME_ROOT / "publication_retry_locks"
 PUBLICATION_SNAPSHOT_SCHEMA_VERSION = 2
 PUBLICATION_MANIFEST_SCHEMA_VERSION = 1
 CANDIDATE_FINGERPRINT_SCHEMA_VERSION = 1
+PUBLICATION_CANDIDATE_SCHEMA_VERSION = 1
 MAX_GATE_ARTIFACT_AGE = timedelta(hours=72)
+BACKUP_SCHEMA_VERSION = 4
+DAILY_PUBLICATION_REQUIRED_CYCLE_STAGES = (
+    "sync",
+    "canonical_virtual_ledger_audit",
+    "targeted_integration_tests",
+    "canonical_virtual_ledger_commit",
+)
+DEPLOYABLE_GENERATED_PATHS = (
+    "app/briefing.generated.json",
+    "app/publication.generated.json",
+)
+RETRY_BLOCKED_EXIT_CODE = 3
+RETRY_NO_CANDIDATE_EXIT_CODE = 4
+STAGED_STATE_KEYS = (
+    "staged_sha",
+    "staged_payload_sha",
+    "staged_candidate_fingerprint",
+    "staged_report",
+    "staged_date",
+    "staged_path",
+    "staged_status",
+    "staged_last_evaluated_at",
+    "staged_reason_count",
+    "staged_reasons",
+)
 REPOSITORY_PATHS = {
     "root": ROOT,
     "site": ROOT / "src",
@@ -2180,6 +2209,30 @@ def canonical_json_sha256(payload: Any) -> str:
     return hashlib.sha256(serialized.encode("utf-8")).hexdigest()
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def generated_site_artifacts() -> list[dict[str, str]]:
+    artifacts: list[dict[str, str]] = []
+    for relative_path, workspace_path in (
+        (DEPLOYABLE_GENERATED_PATHS[0], SITE_DATA),
+        (DEPLOYABLE_GENERATED_PATHS[1], SITE_PUBLICATION_MANIFEST),
+    ):
+        if not workspace_path.is_file():
+            raise ValueError(f"generated site artifact is missing: {workspace_path}")
+        artifacts.append({
+            "relative_path": relative_path,
+            "workspace_path": str(workspace_path.resolve()),
+            "sha256": file_sha256(workspace_path),
+        })
+    return artifacts
+
+
 def current_repository_commits() -> dict[str, str]:
     commits: dict[str, str] = {}
     for name, path in REPOSITORY_PATHS.items():
@@ -2447,8 +2500,9 @@ def stage_publication_candidate(
 ) -> Path:
     path = publication_candidate_path(report_date)
     write_json_atomic(path, {
-        "schema_version": 1,
+        "schema_version": PUBLICATION_CANDIDATE_SCHEMA_VERSION,
         "staged_at": datetime.now(timezone.utc).isoformat(),
+        "status": "staged",
         "date": report_date,
         "report": _evidence_path(report_path),
         "candidate_fingerprint": candidate_fingerprint,
@@ -2456,6 +2510,761 @@ def stage_publication_candidate(
         "payload": payload,
     })
     return path
+
+
+def publication_retry_lock_path(report_date: str) -> Path:
+    return PUBLICATION_RETRY_LOCK_ROOT / f"atlas-publication-retry-{report_date}.lock"
+
+
+def acquire_publication_retry_lock(report_date: str) -> tuple[Path | None, str, str | None]:
+    """Acquire a fail-closed, per-date retry lock.
+
+    A retry may freeze a snapshot and replace the two deployable generated files.
+    We never reclaim an existing lock automatically: an empty or interrupted lock
+    is ambiguous, so another process must not silently take it over.
+    """
+    path = publication_retry_lock_path(report_date)
+    token = secrets.token_hex(16)
+    payload = {
+        "schema_version": 1,
+        "date": report_date,
+        "pid": os.getpid(),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "token": token,
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with path.open("x", encoding="utf-8") as handle:
+            handle.write(serialized_payload(payload))
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError:
+        return None, "", (
+            "publication retry lock already exists; refusing concurrent or interrupted retry: "
+            f"{path}"
+        )
+    except OSError as error:
+        return None, "", f"cannot acquire publication retry lock: {error}"
+    return path, token, None
+
+
+def release_publication_retry_lock(path: Path, token: str) -> None:
+    """Release only the lock created by this invocation.
+
+    A token check prevents a late cleanup from deleting a replacement lock.
+    Malformed locks intentionally remain in place and require explicit recovery.
+    """
+    payload = load_json(path, {})
+    if not isinstance(payload, dict) or payload.get("token") != token:
+        return
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+
+
+def _valid_timestamp(value: Any) -> bool:
+    if not isinstance(value, str) or not value.strip():
+        return False
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return parsed.tzinfo is not None
+
+
+def staged_candidate_material_errors(
+    candidate: dict[str, Any],
+    *,
+    report_date: str,
+    report_path: Path,
+    raw_report: bytes,
+) -> tuple[list[str], str]:
+    """Validate a staged candidate against current immutable inputs.
+
+    The candidate payload is deliberately *not* rebuilt.  Its hash, the source
+    report and all three current repository commits are recomputed instead, so a
+    stale or edited candidate cannot be promoted by a later retry.
+    """
+    errors: list[str] = []
+    if candidate.get("schema_version") != PUBLICATION_CANDIDATE_SCHEMA_VERSION:
+        errors.append("staged candidate schema version is invalid")
+    if candidate.get("status") not in {None, "staged", "blocked", "queued", "pending", "deployed"}:
+        errors.append("staged candidate status is invalid")
+    if candidate.get("date") != report_date:
+        errors.append("staged candidate date does not match the requested date")
+    if not _valid_timestamp(candidate.get("staged_at")):
+        errors.append("staged candidate timestamp is invalid")
+    if candidate.get("report") != _evidence_path(report_path):
+        errors.append("staged candidate report path does not match the canonical dated report")
+
+    payload = candidate.get("payload")
+    if not isinstance(payload, dict):
+        errors.append("staged candidate payload is missing or invalid")
+        payload = {}
+    else:
+        errors.extend(validate_payload(payload))
+
+    candidate_fingerprint = candidate.get("candidate_fingerprint")
+    if not isinstance(candidate_fingerprint, dict):
+        errors.append("staged candidate fingerprint is missing or invalid")
+        candidate_fingerprint = {}
+    else:
+        errors.extend(candidate_fingerprint_errors(candidate_fingerprint))
+
+    content_hash = site_input_hash(raw_report, report_date)
+    if payload.get("reportDate") != report_date:
+        errors.append("staged candidate payload date does not match the requested date")
+    if payload.get("contentHash") != content_hash:
+        errors.append("staged candidate payload content hash does not match the current report")
+    if candidate_fingerprint.get("date") != report_date:
+        errors.append("staged candidate fingerprint date does not match the requested date")
+    if candidate_fingerprint.get("report_sha256") != hashlib.sha256(raw_report).hexdigest():
+        errors.append("staged candidate fingerprint report hash does not match the current report")
+    if candidate_fingerprint.get("site_input_hash") != content_hash:
+        errors.append("staged candidate fingerprint site input hash does not match the current report")
+    if candidate_fingerprint.get("payload_sha256") != payload_sha256(payload):
+        errors.append("staged candidate fingerprint payload hash does not match the stored payload")
+
+    try:
+        expected_fingerprint = build_candidate_fingerprint(
+            report_date=report_date,
+            raw_report=raw_report,
+            content_hash=content_hash,
+            payload=payload,
+            repository_commits=current_repository_commits(),
+        )
+    except (OSError, subprocess.SubprocessError, ValueError) as error:
+        errors.append(f"cannot validate staged candidate against current repository commits: {error}")
+    else:
+        if candidate_fingerprint != expected_fingerprint:
+            errors.append(
+                "staged candidate fingerprint does not match the current report, payload, and repository commits"
+            )
+    return list(dict.fromkeys(errors)), content_hash
+
+
+def _candidate_retry_record(
+    candidate: dict[str, Any],
+    *,
+    status: str,
+    readiness: dict[str, Any] | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    previous = candidate.get("retry")
+    attempts = int(previous.get("attempt") or 0) if isinstance(previous, dict) else 0
+    retry: dict[str, Any] = {
+        "schema_version": 1,
+        "attempt": attempts + 1,
+        "status": status,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if isinstance(readiness, dict):
+        retry["ready"] = readiness.get("ready") is True
+        retry["reasons"] = list(readiness.get("reasons") or [])
+        retry["readiness_sha256"] = canonical_json_sha256(readiness)
+        retry["readiness"] = readiness
+    if isinstance(snapshot, dict):
+        retry["snapshot_revision"] = snapshot.get("revision")
+        retry["snapshot_sha256"] = publication_snapshot_sha256(snapshot)
+        retry["snapshot_payload_sha256"] = snapshot.get("payload_sha256")
+    return {**candidate, "status": status, "retry": retry}
+
+
+def record_candidate_retry(
+    path: Path,
+    candidate: dict[str, Any],
+    *,
+    status: str,
+    readiness: dict[str, Any] | None = None,
+    snapshot: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    updated = _candidate_retry_record(
+        candidate,
+        status=status,
+        readiness=readiness,
+        snapshot=snapshot,
+    )
+    write_json_atomic(path, updated)
+    return updated
+
+
+def update_staged_state(
+    state: dict[str, Any],
+    *,
+    report_date: str,
+    report_path: Path,
+    candidate_path: Path,
+    candidate_fingerprint: dict[str, Any],
+    content_hash: str,
+    payload: dict[str, Any],
+    status: str,
+    readiness: dict[str, Any] | None = None,
+) -> None:
+    reasons = list(readiness.get("reasons") or []) if isinstance(readiness, dict) else []
+    state.update({
+        "staged_sha": content_hash,
+        "staged_payload_sha": payload_sha256(payload),
+        "staged_candidate_fingerprint": candidate_fingerprint.get("fingerprint_sha256"),
+        "staged_report": str(report_path),
+        "staged_date": report_date,
+        "staged_path": str(candidate_path),
+        "staged_status": status,
+        "staged_last_evaluated_at": datetime.now(timezone.utc).isoformat(),
+        "staged_reason_count": len(reasons),
+        "staged_reasons": reasons,
+        "last_checked_at": datetime.now(timezone.utc).isoformat(),
+    })
+    write_json_atomic(STATE_FILE, state)
+
+
+def clear_staged_state(state: dict[str, Any]) -> None:
+    for key in STAGED_STATE_KEYS:
+        state.pop(key, None)
+
+
+def _paths_match(left: Any, right: Path) -> bool:
+    if not isinstance(left, str) or not left:
+        return False
+    try:
+        return Path(left).resolve() == right.resolve()
+    except OSError:
+        return False
+
+
+def staged_state_binding(
+    state: dict[str, Any],
+    *,
+    report_date: str,
+    report_path: Path,
+    candidate_path: Path,
+    content_hash: str,
+    payload: dict[str, Any],
+    candidate_fingerprint: dict[str, Any],
+) -> tuple[str, list[str]]:
+    """Require state to authorize the exact candidate selected for retry.
+
+    The date flag is only a selector.  It is never sufficient authority to
+    resurrect an arbitrary same-date candidate from disk after the active state
+    has moved on or been cleared by a successful queue operation.
+    """
+    if not any(key in state for key in STAGED_STATE_KEYS):
+        return "no_candidate", ["no active staged candidate is recorded in site sync state"]
+    errors: list[str] = []
+    if state.get("staged_date") != report_date:
+        errors.append("active staged candidate date does not match the requested date")
+    if not _paths_match(state.get("staged_path"), candidate_path):
+        errors.append("active staged candidate path does not match the canonical candidate path")
+    if not _paths_match(state.get("staged_report"), report_path):
+        errors.append("active staged report path does not match the canonical dated report")
+    if state.get("staged_sha") != content_hash:
+        errors.append("active staged content hash does not match the candidate")
+    if state.get("staged_payload_sha") != payload_sha256(payload):
+        errors.append("active staged payload hash does not match the candidate")
+    if state.get("staged_candidate_fingerprint") != candidate_fingerprint.get("fingerprint_sha256"):
+        errors.append("active staged candidate fingerprint does not match the candidate")
+    # Older staged records predate the explicit status field.  Their material
+    # bindings are still mandatory; a missing status is only a migration alias
+    # for "staged", while every explicit unknown status remains fail-closed.
+    if state.get("staged_status") not in {None, "staged", "blocked"}:
+        errors.append("active staged candidate status is not retryable")
+    return ("blocked" if errors else "ready"), errors
+
+
+def revalidate_retry_authority(
+    *,
+    report_date: str,
+    report_path: Path,
+    candidate_path: Path,
+    candidate: dict[str, Any],
+) -> tuple[int, dict[str, Any]]:
+    """Repeat authorization immediately before a retry mutates publication state.
+
+    Gate evaluation can take long enough for another process to stage a newer
+    candidate or for the report/checkout to move.  Re-read all mutable inputs
+    just before freeze/queue and fail closed instead of using an earlier view.
+    """
+    try:
+        candidate_path.resolve().relative_to(PUBLICATION_CANDIDATE_ROOT.resolve())
+    except (OSError, ValueError):
+        return 2, {
+            "status": "error",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "error": "canonical staged candidate path escapes the candidate runtime directory",
+        }
+    if candidate_path.is_symlink():
+        return 2, {
+            "status": "error",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "error": "canonical staged candidate path must not be a symbolic link",
+        }
+    try:
+        latest_candidate = json.loads(candidate_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return 2, {
+            "status": "error",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "error": f"cannot reread staged publication candidate: {error}",
+        }
+    if not isinstance(latest_candidate, dict):
+        return 2, {
+            "status": "error",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "error": "staged publication candidate is not a JSON object",
+        }
+    if (
+        latest_candidate.get("date") != candidate.get("date")
+        or latest_candidate.get("payload") != candidate.get("payload")
+        or latest_candidate.get("candidate_fingerprint") != candidate.get("candidate_fingerprint")
+    ):
+        return RETRY_BLOCKED_EXIT_CODE, {
+            "status": "blocked",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "reasons": ["staged candidate changed while retry was in progress"],
+        }
+    try:
+        raw_report = report_path.read_bytes()
+    except (OSError, FileNotFoundError) as error:
+        return 2, {
+            "status": "error",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "error": f"cannot reread canonical dated report: {error}",
+        }
+    candidate_errors, content_hash = staged_candidate_material_errors(
+        latest_candidate,
+        report_date=report_date,
+        report_path=report_path,
+        raw_report=raw_report,
+    )
+    if candidate_errors:
+        return 2, {
+            "status": "error",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "error": "staged publication candidate integrity check failed",
+            "reasons": candidate_errors,
+        }
+    latest_state = load_json(STATE_FILE, {})
+    if not isinstance(latest_state, dict):
+        return 2, {
+            "status": "error",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "error": "site sync state is not a JSON object",
+        }
+    binding_status, binding_errors = staged_state_binding(
+        latest_state,
+        report_date=report_date,
+        report_path=report_path,
+        candidate_path=candidate_path,
+        content_hash=content_hash,
+        payload=latest_candidate["payload"],
+        candidate_fingerprint=latest_candidate["candidate_fingerprint"],
+    )
+    if binding_status != "ready":
+        return (
+            RETRY_NO_CANDIDATE_EXIT_CODE if binding_status == "no_candidate" else RETRY_BLOCKED_EXIT_CODE,
+            {
+                "status": binding_status,
+                "date": report_date,
+                "candidate": str(candidate_path),
+                "reasons": binding_errors,
+            },
+        )
+    return 0, {
+        "status": "ready",
+        "candidate_record": latest_candidate,
+        "raw_report": raw_report,
+        "content_hash": content_hash,
+        "state": latest_state,
+    }
+
+
+def queue_frozen_publication(
+    *,
+    snapshot: dict[str, Any],
+    state: dict[str, Any],
+    report_path: Path,
+    report_date: str,
+    content_hash: str,
+    payload: dict[str, Any],
+    force: bool,
+) -> tuple[str, dict[str, Any]]:
+    """Write or reuse exactly one frozen payload/manifest pair.
+
+    This function has no research, prediction, valuation, or order side effects.
+    Repeated calls with the same snapshot only report the already queued/deployed
+    state, rather than creating a new snapshot or re-running Phase A.
+    """
+    payload_hash = payload_sha256(payload)
+    manifest = build_publication_manifest(snapshot)
+    manifest_sha = payload_sha256(manifest)
+    snapshot_hash = publication_snapshot_sha256(snapshot)
+    snapshot_revision = int(snapshot.get("revision") or 0)
+    base = {
+        "sha256": content_hash,
+        "payload_sha256": payload_hash,
+        "candidate_fingerprint": snapshot["candidate_fingerprint"]["fingerprint_sha256"],
+        "report": str(report_path),
+        "date": report_date,
+        "publication_snapshot": "frozen",
+        "snapshot_revision": snapshot_revision,
+        "snapshot_sha256": snapshot_hash,
+        "build_id": manifest["buildId"],
+        "deployment_id": manifest["deploymentId"],
+    }
+    if (
+        not force
+        and state.get("last_deployed_sha") == content_hash
+        and state.get("last_deployed_payload_sha") == payload_hash
+        and state.get("last_deployed_manifest_sha") == manifest_sha
+        and site_data_matches(content_hash, payload_hash, manifest)
+    ):
+        return "unchanged", base
+    if (
+        not force
+        and state.get("pending_sha") == content_hash
+        and state.get("pending_payload_sha") == payload_hash
+        and state.get("pending_manifest_sha") == manifest_sha
+        and site_data_matches(content_hash, payload_hash, manifest)
+    ):
+        return "pending", {
+            **base,
+            "generated": str(SITE_DATA),
+            "generated_artifacts": generated_site_artifacts(),
+            "allowed_deployment_diff_paths": list(DEPLOYABLE_GENERATED_PATHS),
+        }
+
+    manifest = write_frozen_site_artifacts(snapshot)
+    state.update({
+        "pending_sha": content_hash,
+        "pending_payload_sha": payload_hash,
+        "pending_manifest_sha": manifest_sha,
+        "pending_report": str(report_path),
+        "pending_date": report_date,
+        "pending_snapshot_revision": snapshot_revision or None,
+        "pending_snapshot_sha256": snapshot_hash or None,
+        "pending_build_id": manifest["buildId"],
+        "pending_deployment_id": manifest["deploymentId"],
+        "last_checked_at": datetime.now(timezone.utc).isoformat(),
+    })
+    clear_staged_state(state)
+    write_json_atomic(STATE_FILE, state)
+    return "queued", {
+        **base,
+        "generated": str(SITE_DATA),
+        "publication_manifest": str(SITE_PUBLICATION_MANIFEST),
+        "generated_artifacts": generated_site_artifacts(),
+        "allowed_deployment_diff_paths": list(DEPLOYABLE_GENERATED_PATHS),
+    }
+
+
+def retry_staged_publication_candidate(
+    *,
+    report_date: str,
+    state: dict[str, Any],
+    dry_run: bool = False,
+    force: bool = False,
+) -> tuple[int, dict[str, Any]]:
+    """Re-attest and publish a stored candidate without rebuilding Phase A.
+
+    The staged payload is the only payload that can be frozen.  Current report
+    bytes and repository commits must still match its fingerprint; gates are
+    re-read from their artifacts.  A failed re-attestation remains explicitly
+    blocked and leaves the existing deployable files untouched.
+    """
+    candidate_path = publication_candidate_path(report_date)
+    report_path = OUTPUTS / f"每日全球晨间简报-{report_date}.md"
+    if not any(key in state for key in STAGED_STATE_KEYS):
+        return RETRY_NO_CANDIDATE_EXIT_CODE, {
+            "status": "no_candidate",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "reasons": ["no active staged candidate is recorded in site sync state"],
+        }
+    preliminary_binding_errors: list[str] = []
+    if state.get("staged_date") != report_date:
+        preliminary_binding_errors.append("active staged candidate date does not match the requested date")
+    if not _paths_match(state.get("staged_path"), candidate_path):
+        preliminary_binding_errors.append(
+            "active staged candidate path does not match the canonical candidate path"
+        )
+    if not _paths_match(state.get("staged_report"), report_path):
+        preliminary_binding_errors.append(
+            "active staged report path does not match the canonical dated report"
+        )
+    if state.get("staged_status") not in {None, "staged", "blocked"}:
+        preliminary_binding_errors.append("active staged candidate status is not retryable")
+    if preliminary_binding_errors:
+        return RETRY_BLOCKED_EXIT_CODE, {
+            "status": "blocked",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "reasons": preliminary_binding_errors,
+        }
+    try:
+        candidate_path.resolve().relative_to(PUBLICATION_CANDIDATE_ROOT.resolve())
+    except (OSError, ValueError):
+        return 2, {
+            "status": "error",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "error": "canonical staged candidate path escapes the candidate runtime directory",
+        }
+    if candidate_path.is_symlink():
+        return 2, {
+            "status": "error",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "error": "canonical staged candidate path must not be a symbolic link",
+        }
+    if not candidate_path.is_file():
+        return RETRY_BLOCKED_EXIT_CODE, {
+            "status": "blocked",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "reasons": ["active staged candidate file is missing"],
+        }
+
+    lock_path, lock_token, lock_error = acquire_publication_retry_lock(report_date)
+    if lock_error:
+        return RETRY_BLOCKED_EXIT_CODE, {
+            "status": "blocked",
+            "date": report_date,
+            "candidate": str(candidate_path),
+            "reasons": [lock_error],
+        }
+    assert lock_path is not None
+    try:
+        try:
+            raw_candidate = candidate_path.read_bytes()
+            candidate = json.loads(raw_candidate.decode("utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+            return 2, {
+                "status": "error",
+                "date": report_date,
+                "candidate": str(candidate_path),
+                "error": f"cannot read staged publication candidate: {error}",
+            }
+        if not isinstance(candidate, dict):
+            return 2, {
+                "status": "error",
+                "date": report_date,
+                "candidate": str(candidate_path),
+                "error": "staged publication candidate is not a JSON object",
+            }
+
+        try:
+            raw_report = report_path.read_bytes()
+        except (OSError, FileNotFoundError) as error:
+            return 2, {
+                "status": "error",
+                "date": report_date,
+                "candidate": str(candidate_path),
+                "error": f"cannot read canonical dated report: {error}",
+            }
+        candidate_errors, content_hash = staged_candidate_material_errors(
+            candidate,
+            report_date=report_date,
+            report_path=report_path,
+            raw_report=raw_report,
+        )
+        if candidate_errors:
+            return 2, {
+                "status": "error",
+                "date": report_date,
+                "candidate": str(candidate_path),
+                "error": "staged publication candidate integrity check failed",
+                "reasons": candidate_errors,
+            }
+
+        payload = candidate["payload"]
+        candidate_fingerprint = candidate["candidate_fingerprint"]
+        binding_status, binding_errors = staged_state_binding(
+            state,
+            report_date=report_date,
+            report_path=report_path,
+            candidate_path=candidate_path,
+            content_hash=content_hash,
+            payload=payload,
+            candidate_fingerprint=candidate_fingerprint,
+        )
+        if binding_status != "ready":
+            return (
+                RETRY_NO_CANDIDATE_EXIT_CODE if binding_status == "no_candidate" else RETRY_BLOCKED_EXIT_CODE,
+                {
+                    "status": binding_status,
+                    "date": report_date,
+                    "candidate": str(candidate_path),
+                    "reasons": binding_errors,
+                },
+            )
+        snapshot: dict[str, Any] | None = None
+        try:
+            snapshot = load_publication_snapshot(report_date, raw_report, content_hash)
+        except ValueError as error:
+            return 2, {
+                "status": "error",
+                "date": report_date,
+                "candidate": str(candidate_path),
+                "error": "existing publication snapshot cannot be safely reused",
+                "reasons": [str(error)],
+            }
+        if snapshot is not None:
+            if (
+                snapshot.get("candidate_fingerprint") != candidate_fingerprint
+                or snapshot.get("payload") != payload
+            ):
+                return 2, {
+                    "status": "error",
+                    "date": report_date,
+                    "candidate": str(candidate_path),
+                    "error": "existing frozen snapshot conflicts with the staged candidate",
+                }
+            if dry_run:
+                return 0, {
+                    "status": "pending" if state.get("pending_sha") == content_hash else "ready_to_queue",
+                    "dry_run": True,
+                    "date": report_date,
+                    "candidate": str(candidate_path),
+                    "publication_snapshot": "frozen",
+                    "snapshot_revision": snapshot.get("revision"),
+                    "candidate_fingerprint": candidate_fingerprint["fingerprint_sha256"],
+                }
+            result_status, result = queue_frozen_publication(
+                snapshot=snapshot,
+                state=state,
+                report_path=report_path,
+                report_date=report_date,
+                content_hash=content_hash,
+                payload=payload,
+                force=force,
+            )
+            if result_status in {"unchanged", "pending"}:
+                clear_staged_state(state)
+                write_json_atomic(STATE_FILE, state)
+            candidate_status = "deployed" if result_status == "unchanged" else "pending"
+            record_candidate_retry(
+                candidate_path,
+                candidate,
+                status=candidate_status,
+                snapshot=snapshot,
+            )
+            return 0, {"status": result_status, "candidate": str(candidate_path), **result}
+
+        readiness = publication_snapshot_readiness(
+            report_date,
+            candidate_fingerprint=candidate_fingerprint,
+        )
+        if readiness.get("ready") is not True:
+            if not dry_run:
+                update_staged_state(
+                    state,
+                    report_date=report_date,
+                    report_path=report_path,
+                    candidate_path=candidate_path,
+                    candidate_fingerprint=candidate_fingerprint,
+                    content_hash=content_hash,
+                    payload=payload,
+                    status="blocked",
+                    readiness=readiness,
+                )
+                record_candidate_retry(
+                    candidate_path,
+                    candidate,
+                    status="blocked",
+                    readiness=readiness,
+                )
+            return RETRY_BLOCKED_EXIT_CODE, {
+                "status": "blocked",
+                "dry_run": dry_run,
+                "date": report_date,
+                "candidate": str(candidate_path),
+                "candidate_fingerprint": candidate_fingerprint["fingerprint_sha256"],
+                "reasons": list(readiness.get("reasons") or []),
+            }
+        if dry_run:
+            return 0, {
+                "status": "ready_to_freeze",
+                "dry_run": True,
+                "date": report_date,
+                "candidate": str(candidate_path),
+                "candidate_fingerprint": candidate_fingerprint["fingerprint_sha256"],
+            }
+        try:
+            snapshot = freeze_publication_snapshot(
+                report_date=report_date,
+                raw_report=raw_report,
+                content_hash=content_hash,
+                payload=payload,
+                candidate_fingerprint=candidate_fingerprint,
+            )
+        except ValueError as error:
+            # Freeze repeats the attestation immediately before its atomic write.
+            # Treat an intervening gate change as a blocked candidate, rather than
+            # accepting a stale readiness result from a few lines above.
+            latest_readiness = publication_snapshot_readiness(
+                report_date,
+                candidate_fingerprint=candidate_fingerprint,
+            )
+            if latest_readiness.get("ready") is not True:
+                update_staged_state(
+                    state,
+                    report_date=report_date,
+                    report_path=report_path,
+                    candidate_path=candidate_path,
+                    candidate_fingerprint=candidate_fingerprint,
+                    content_hash=content_hash,
+                    payload=payload,
+                    status="blocked",
+                    readiness=latest_readiness,
+                )
+                record_candidate_retry(
+                    candidate_path,
+                    candidate,
+                    status="blocked",
+                    readiness=latest_readiness,
+                )
+                return RETRY_BLOCKED_EXIT_CODE, {
+                    "status": "blocked",
+                    "date": report_date,
+                    "candidate": str(candidate_path),
+                    "candidate_fingerprint": candidate_fingerprint["fingerprint_sha256"],
+                    "reasons": list(latest_readiness.get("reasons") or []),
+                }
+            return 2, {
+                "status": "error",
+                "date": report_date,
+                "candidate": str(candidate_path),
+                "error": f"cannot freeze staged publication candidate: {error}",
+            }
+
+        result_status, result = queue_frozen_publication(
+            snapshot=snapshot,
+            state=state,
+            report_path=report_path,
+            report_date=report_date,
+            content_hash=content_hash,
+            payload=payload,
+            force=force,
+        )
+        candidate_status = "deployed" if result_status == "unchanged" else "pending"
+        record_candidate_retry(
+            candidate_path,
+            candidate,
+            status=candidate_status,
+            readiness=readiness,
+            snapshot=snapshot,
+        )
+        return 0, {"status": result_status, "candidate": str(candidate_path), **result}
+    finally:
+        release_publication_retry_lock(lock_path, lock_token)
 
 
 def write_frozen_site_artifacts(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -2506,10 +3315,16 @@ def _publication_snapshot_status_checks(
         or cycle.get("operational_gate_passed", cycle.get("overall_passed")) is not True
     ):
         reasons.append("date-aligned ATLAS cycle has not passed")
-    if not isinstance(cycle, dict) or cycle.get("release_candidate_passed") is not True:
-        reasons.append("date-aligned ATLAS cycle is not a release candidate")
-    if cycle_stages.get("sync", {}).get("status") != "passed":
-        reasons.append("date-aligned ATLAS sync stage did not pass")
+    failed_cycle_stages = [
+        name
+        for name in DAILY_PUBLICATION_REQUIRED_CYCLE_STAGES
+        if cycle_stages.get(name, {}).get("status") != "passed"
+    ]
+    if failed_cycle_stages:
+        reasons.append(
+            "date-aligned daily publication cycle stages did not pass: "
+            + ", ".join(failed_cycle_stages)
+        )
     if (
         cycle_stages.get("canonical_virtual_ledger_commit", {}).get("status") != "passed"
         or not isinstance(ledger, dict)
@@ -2518,22 +3333,6 @@ def _publication_snapshot_status_checks(
         or cycle_boundary.get("canonical_write_performed") is not True
     ):
         reasons.append("date-aligned canonical virtual ledger commit was not performed")
-    if (
-        cycle.get("idempotent_replay") is not True
-        or not isinstance(cycle_boundary, dict)
-        or cycle_boundary.get("idempotency_verified_by_repeated_fingerprint") is not True
-    ):
-        reasons.append("date-aligned cycle idempotency replay was not verified")
-    execution_profile = cycle.get("execution_profile", {}) if isinstance(cycle, dict) else {}
-    if (
-        not isinstance(cycle_boundary, dict)
-        or cycle_boundary.get("full_test_suite_executed") is not True
-        or not isinstance(execution_profile, dict)
-        or execution_profile.get("full_tests") is not True
-    ):
-        reasons.append("date-aligned full regression suite was not executed")
-    if not isinstance(workspace_lock, dict) or workspace_lock.get("release_reproducible") is not True:
-        reasons.append("date-aligned workspace provenance is not reproducible")
 
     healing_counts = healing.get("counts", {}) if isinstance(healing, dict) else {}
     healing_checks = healing.get("checks", []) if isinstance(healing, dict) else []
@@ -2573,7 +3372,9 @@ def _publication_snapshot_status_checks(
         reasons.append("date-aligned alerts are missing or still require attention")
     if (
         not isinstance(backup, dict)
+        or backup.get("schema_version") != BACKUP_SCHEMA_VERSION
         or backup.get("date") != report_date
+        or backup.get("verified") is not True
         or backup.get("encrypted") is not True
         or backup.get("encryption_algorithm") != "AES-256-GCM"
         or backup.get("encrypted_container_authenticated") is not True
@@ -2591,8 +3392,18 @@ def _publication_snapshot_status_checks(
             "cycle": {
                 "date": cycle.get("date") if isinstance(cycle, dict) else None,
                 "overallPassed": cycle.get("overall_passed") is True if isinstance(cycle, dict) else False,
+                "operationalGatePassed": (
+                    cycle.get("operational_gate_passed", cycle.get("overall_passed")) is True
+                    if isinstance(cycle, dict)
+                    else False
+                ),
+                "dailyPublicationStages": {
+                    name: cycle_stages.get(name, {}).get("status") == "passed"
+                    for name in DAILY_PUBLICATION_REQUIRED_CYCLE_STAGES
+                },
+                # Software-release evidence remains visible, but it is deliberately
+                # not a prerequisite for an isolated two-file content deployment.
                 "releaseCandidatePassed": cycle.get("release_candidate_passed") is True if isinstance(cycle, dict) else False,
-                "syncPassed": cycle_stages.get("sync", {}).get("status") == "passed",
                 "canonicalWritePerformed": ledger.get("write_performed") is True if isinstance(ledger, dict) else False,
                 "idempotentReplay": cycle.get("idempotent_replay") is True if isinstance(cycle, dict) else False,
                 "fullTestsExecuted": (
@@ -2631,7 +3442,9 @@ def _publication_snapshot_status_checks(
                 "findingCount": int(alerts.get("finding_count") or 0) if isinstance(alerts, dict) else 0,
             },
             "backup": {
+                "schemaVersion": backup.get("schema_version") if isinstance(backup, dict) else None,
                 "date": backup.get("date") if isinstance(backup, dict) else None,
+                "verified": backup.get("verified") is True if isinstance(backup, dict) else False,
                 "encrypted": backup.get("encrypted") is True if isinstance(backup, dict) else False,
                 "encryptionAlgorithm": (
                     backup.get("encryption_algorithm") if isinstance(backup, dict) else None
@@ -2748,6 +3561,161 @@ def _gate_artifact_attestation(
     }, reasons, payload
 
 
+def _metadata_authentication_shape_errors(payload: dict[str, Any], label: str) -> list[str]:
+    authentication = payload.get("metadata_authentication")
+    if not isinstance(authentication, dict) or set(authentication) != {"algorithm", "key_id", "value"}:
+        return [f"{label} metadata authentication is missing or malformed"]
+    errors: list[str] = []
+    if authentication.get("algorithm") != "HMAC-SHA256":
+        errors.append(f"{label} metadata authentication algorithm is invalid")
+    if not re.fullmatch(r"[0-9a-f]{16}", str(authentication.get("key_id") or "")):
+        errors.append(f"{label} metadata authentication key id is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(authentication.get("value") or "")):
+        errors.append(f"{label} metadata authentication value is invalid")
+    return errors
+
+
+def _backup_content_binding(
+    *,
+    report_date: str,
+    candidate_fingerprint: dict[str, Any],
+    backup: dict[str, Any],
+    artifact_paths: dict[str, Path | None],
+    gate_artifacts: dict[str, Any],
+) -> tuple[dict[str, Any], list[str]]:
+    """Verify that the external schema-4 snapshot contains this exact candidate evidence.
+
+    The backup is created before the publication snapshot, so binding is expressed as
+    one verified archive manifest containing the report and every mutable prerequisite
+    used to freeze the candidate. The frozen snapshot then records this binding plus the
+    final candidate fingerprint and payload hash without introducing a circular input.
+    """
+    errors: list[str] = []
+    evidence: dict[str, Any] = {
+        "schemaVersion": backup.get("schema_version") if isinstance(backup, dict) else None,
+        "reportSha256": candidate_fingerprint.get("report_sha256"),
+        "siteInputHash": candidate_fingerprint.get("site_input_hash"),
+        "payloadSha256": candidate_fingerprint.get("payload_sha256"),
+        "candidateFingerprintSha256": candidate_fingerprint.get("fingerprint_sha256"),
+        "members": {},
+    }
+    if not isinstance(backup, dict) or backup.get("schema_version") != BACKUP_SCHEMA_VERSION:
+        return evidence, ["backup content binding requires schema version 4"]
+
+    errors.extend(_metadata_authentication_shape_errors(backup, "backup latest"))
+    archive_value = backup.get("archive")
+    manifest_value = backup.get("manifest_sidecar")
+    archive_hash = str(backup.get("archive_sha256") or "")
+    manifest_hash = str(backup.get("manifest_sha256") or "")
+    if not isinstance(archive_value, str) or not archive_value or not Path(archive_value).is_absolute():
+        errors.append("backup archive path is missing or not absolute")
+        archive_path = None
+    else:
+        archive_path = Path(archive_value).resolve()
+    if not isinstance(manifest_value, str) or not manifest_value or not Path(manifest_value).is_absolute():
+        errors.append("backup manifest sidecar path is missing or not absolute")
+        manifest_path = None
+    else:
+        manifest_path = Path(manifest_value).resolve()
+    if not re.fullmatch(r"[0-9a-f]{64}", archive_hash):
+        errors.append("backup archive SHA-256 is invalid")
+    if not re.fullmatch(r"[0-9a-f]{64}", manifest_hash):
+        errors.append("backup manifest SHA-256 is invalid")
+
+    if archive_path is not None:
+        evidence["archivePath"] = str(archive_path)
+        evidence["archiveSha256"] = archive_hash
+        if not archive_path.is_file():
+            errors.append("backup archive is missing")
+        elif file_sha256(archive_path) != archive_hash:
+            errors.append("backup archive SHA-256 does not match the external file")
+        try:
+            archive_path.relative_to(ROOT.resolve())
+        except ValueError:
+            pass
+        else:
+            errors.append("backup archive is not outside the workspace")
+
+    manifest: dict[str, Any] = {}
+    if manifest_path is not None:
+        evidence["manifestPath"] = str(manifest_path)
+        evidence["manifestSha256"] = manifest_hash
+        if not manifest_path.is_file():
+            errors.append("backup manifest sidecar is missing")
+        else:
+            loaded_manifest = load_json(manifest_path, {})
+            if not isinstance(loaded_manifest, dict) or not loaded_manifest:
+                errors.append("backup manifest sidecar is invalid")
+            else:
+                manifest = loaded_manifest
+                if canonical_json_sha256(manifest) != manifest_hash:
+                    errors.append("backup manifest SHA-256 does not match the sidecar")
+                if archive_path is not None and manifest_path != archive_path.with_suffix(".manifest.json"):
+                    errors.append("backup manifest sidecar path is inconsistent with the archive")
+
+    if manifest:
+        if manifest.get("schema_version") != BACKUP_SCHEMA_VERSION:
+            errors.append("backup manifest schema version is not 4")
+        if manifest.get("date") != report_date:
+            errors.append("backup manifest is not date-aligned")
+        if manifest.get("encrypted") is not True or manifest.get("encryption_algorithm") != "AES-256-GCM":
+            errors.append("backup manifest is not AES-256-GCM encrypted")
+        if manifest.get("restore_scope") != "configured_workspace_files_and_git_bundles":
+            errors.append("backup manifest restore scope is invalid")
+        errors.extend(_metadata_authentication_shape_errors(manifest, "backup manifest"))
+        latest_auth = backup.get("metadata_authentication", {})
+        manifest_auth = manifest.get("metadata_authentication", {})
+        if (
+            isinstance(latest_auth, dict)
+            and isinstance(manifest_auth, dict)
+            and latest_auth.get("key_id") != manifest_auth.get("key_id")
+        ):
+            errors.append("backup latest and manifest authentication key ids differ")
+
+        rows = manifest.get("files")
+        if not isinstance(rows, list):
+            errors.append("backup manifest files list is missing")
+            rows = []
+        member_hashes: dict[str, str] = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            path = str(row.get("path") or "").replace("\\", "/")
+            digest = str(row.get("sha256") or "")
+            if path in member_hashes:
+                errors.append(f"backup manifest contains duplicate member: {path}")
+                continue
+            member_hashes[path] = digest
+
+        report_path = OUTPUTS / f"每日全球晨间简报-{report_date}.md"
+        expected_members: dict[str, str] = {
+            _evidence_path(report_path).replace("\\", "/"): str(
+                candidate_fingerprint.get("report_sha256") or ""
+            ),
+        }
+        for name, path in artifact_paths.items():
+            if name == "backup" or path is None:
+                continue
+            attestation = gate_artifacts.get(name, {})
+            expected_members[_evidence_path(path).replace("\\", "/")] = str(
+                attestation.get("sha256") or ""
+            )
+        for path, expected_hash in expected_members.items():
+            observed_hash = member_hashes.get(path)
+            evidence["members"][path] = {
+                "expectedSha256": expected_hash,
+                "manifestSha256": observed_hash,
+                "matched": observed_hash == expected_hash,
+            }
+            if not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+                errors.append(f"candidate evidence hash is invalid for backup member: {path}")
+            elif observed_hash != expected_hash:
+                errors.append(f"backup manifest is not bound to current candidate evidence: {path}")
+
+    evidence["memberSetSha256"] = canonical_json_sha256(evidence["members"])
+    return evidence, errors
+
+
 def publication_snapshot_readiness(
     report_date: str,
     *,
@@ -2809,14 +3777,51 @@ def publication_snapshot_readiness(
     if workspace_commits != candidate.get("repository_commits"):
         reasons.append("cycle workspace lock is not bound to the current three-repository commits")
 
+    cycle_fingerprint = cycle.get("fingerprint_after", {}) if isinstance(cycle, dict) else {}
+    cycle_files = cycle_fingerprint.get("files", []) if isinstance(cycle_fingerprint, dict) else []
+    report_path = OUTPUTS / f"每日全球晨间简报-{report_date}.md"
+    report_relative_path = _evidence_path(report_path).replace("\\", "/")
+    cycle_report_hashes = [
+        str(item.get("sha256") or "")
+        for item in cycle_files
+        if isinstance(item, dict)
+        and str(item.get("path") or "").replace("\\", "/") == report_relative_path
+    ]
+    if (
+        not re.fullmatch(r"[0-9a-f]{64}", str(cycle_fingerprint.get("fingerprint") or ""))
+        or cycle_report_hashes != [candidate.get("report_sha256")]
+    ):
+        reasons.append("cycle fingerprint is not bound to the current dated report SHA")
+    ledger = cycle.get("ledger", {}) if isinstance(cycle, dict) else {}
+    if not re.fullmatch(r"[0-9a-f]{64}", str(ledger.get("content_hash") or "")):
+        reasons.append("cycle canonical ledger content hash is missing or invalid")
+
+    backup_binding, backup_binding_errors = _backup_content_binding(
+        report_date=report_date,
+        candidate_fingerprint=candidate,
+        backup=artifact_payloads.get("backup", {}),
+        artifact_paths=artifact_paths,
+        gate_artifacts=gate_artifacts,
+    )
+    reasons.extend(backup_binding_errors)
+
     evidence.update({
         "candidateFingerprint": candidate,
         "candidateFingerprintSha256": candidate.get("fingerprint_sha256"),
         "candidateFormula": candidate.get("formula"),
         "attestedAt": checked_at.isoformat(),
         "gateArtifacts": gate_artifacts,
+        "contentBinding": {
+            "reportSha256": candidate.get("report_sha256"),
+            "siteInputHash": candidate.get("site_input_hash"),
+            "payloadSha256": candidate.get("payload_sha256"),
+            "cycleFingerprint": cycle_fingerprint.get("fingerprint") if isinstance(cycle_fingerprint, dict) else None,
+            "canonicalLedgerContentHash": ledger.get("content_hash") if isinstance(ledger, dict) else None,
+            "backup": backup_binding,
+        },
     })
     reasons = list(dict.fromkeys(reasons))
+    evidence["dailyContentPublicationPassed"] = not reasons
     return {"ready": not reasons, "reasons": reasons, "evidence": evidence}
 
 
@@ -2981,11 +3986,25 @@ def main() -> int:
         action="store_true",
         help="Create an explicit same-day snapshot revision after all closed-loop gates have been rerun.",
     )
+    parser.add_argument(
+        "--retry-staged-candidate",
+        action="store_true",
+        help=(
+            "Re-attest one stored staged candidate and queue it only when all "
+            "closed-loop gates now pass; never rebuild Phase A."
+        ),
+    )
     args = parser.parse_args()
 
     state = load_json(STATE_FILE, {})
     if not isinstance(state, dict):
         state = {}
+    if args.retry_staged_candidate and args.mark_deployed:
+        print(json.dumps({
+            "status": "error",
+            "error": "--retry-staged-candidate cannot be combined with --mark-deployed",
+        }, ensure_ascii=False))
+        return 2
     if args.mark_deployed:
         current_payload = load_json(SITE_DATA, {})
         current_manifest = load_json(SITE_PUBLICATION_MANIFEST, {})
@@ -3114,6 +4133,34 @@ def main() -> int:
             "reason_count": len(dependency_errors),
         }, ensure_ascii=False))
         return 2
+
+    if args.retry_staged_candidate:
+        if args.candidate_only or args.refresh_publication_snapshot:
+            print(json.dumps({
+                "status": "error",
+                "error": "--retry-staged-candidate cannot be combined with candidate-only or snapshot refresh modes",
+            }, ensure_ascii=False))
+            return 2
+        report_date = args.date
+        if report_date is None:
+            staged_date = state.get("staged_date")
+            try:
+                report_date = valid_iso_date(str(staged_date or ""))
+            except argparse.ArgumentTypeError:
+                print(json.dumps({
+                    "status": "no_candidate",
+                    "date": None,
+                    "reasons": ["no valid staged candidate date is recorded; pass --date explicitly"],
+                }, ensure_ascii=False))
+                return RETRY_NO_CANDIDATE_EXIT_CODE
+        result_code, result = retry_staged_publication_candidate(
+            report_date=report_date,
+            state=state,
+            dry_run=args.dry_run,
+            force=args.force,
+        )
+        print(json.dumps(result, ensure_ascii=False))
+        return result_code
 
     try:
         report_path, report_date = report_for_date(args.date)
@@ -3245,6 +4292,10 @@ def main() -> int:
             "staged_report": str(report_path),
             "staged_date": report_date,
             "staged_path": str(staged_path),
+            "staged_status": "blocked" if args.refresh_publication_snapshot else "staged",
+            "staged_last_evaluated_at": datetime.now(timezone.utc).isoformat(),
+            "staged_reason_count": len(readiness.get("reasons") or []),
+            "staged_reasons": list(readiness.get("reasons") or []),
             "last_checked_at": datetime.now(timezone.utc).isoformat(),
         })
         write_json_atomic(STATE_FILE, state)
@@ -3301,6 +4352,7 @@ def main() -> int:
         and state.get("last_deployed_manifest_sha") == manifest_sha
         and site_data_matches(sha256, payload_hash, manifest)
     ):
+        generated_artifacts = generated_site_artifacts()
         print(json.dumps({
             "status": "unchanged",
             "sha256": sha256,
@@ -3309,6 +4361,8 @@ def main() -> int:
             "deployment_id": manifest["deploymentId"],
             "report": str(report_path),
             "date": report_date,
+            "generated_artifacts": generated_artifacts,
+            "allowed_deployment_diff_paths": list(DEPLOYABLE_GENERATED_PATHS),
         }, ensure_ascii=False))
         return 0
     if (
@@ -3318,6 +4372,7 @@ def main() -> int:
         and state.get("pending_manifest_sha") == manifest_sha
         and site_data_matches(sha256, payload_hash, manifest)
     ):
+        generated_artifacts = generated_site_artifacts()
         print(json.dumps({
             "status": "pending",
             "sha256": sha256,
@@ -3327,6 +4382,8 @@ def main() -> int:
             "report": str(report_path),
             "date": report_date,
             "generated": str(SITE_DATA),
+            "generated_artifacts": generated_artifacts,
+            "allowed_deployment_diff_paths": list(DEPLOYABLE_GENERATED_PATHS),
         }, ensure_ascii=False))
         return 0
     manifest = write_frozen_site_artifacts(snapshot)
@@ -3342,16 +4399,9 @@ def main() -> int:
         "pending_deployment_id": manifest["deploymentId"],
         "last_checked_at": datetime.now(timezone.utc).isoformat(),
     })
-    for key in (
-        "staged_sha",
-        "staged_payload_sha",
-        "staged_candidate_fingerprint",
-        "staged_report",
-        "staged_date",
-        "staged_path",
-    ):
-        state.pop(key, None)
+    clear_staged_state(state)
     write_json_atomic(STATE_FILE, state)
+    generated_artifacts = generated_site_artifacts()
     print(json.dumps({
         "status": "changed",
         "sha256": sha256,
@@ -3360,6 +4410,8 @@ def main() -> int:
         "date": report_date,
         "generated": str(SITE_DATA),
         "publication_manifest": str(SITE_PUBLICATION_MANIFEST),
+        "generated_artifacts": generated_artifacts,
+        "allowed_deployment_diff_paths": list(DEPLOYABLE_GENERATED_PATHS),
         "publication_snapshot": snapshot_status,
         "snapshot_revision": snapshot_revision,
         "snapshot_sha256": snapshot_hash,

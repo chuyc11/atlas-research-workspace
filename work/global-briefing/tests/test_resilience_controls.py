@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -51,7 +52,97 @@ def valid_manifest(root: Path, files: list[dict], *, key: bytes | None = None) -
     return DR.signed_metadata(payload, key, "manifest")
 
 
+def legacy_snapshot_v2(root: Path, target: Path, latest: Path) -> dict:
+    payload = b"verified legacy state"
+    manifest = {
+        "schema_version": DR.LEGACY_MANIFEST_SCHEMA_VERSION,
+        "date": "2026-07-11",
+        "created_at": "2026-07-11T00:00:00Z",
+        "workspace": str(root.resolve()),
+        "previous_manifest_sha256": None,
+        "files": [
+            {
+                "path": "legacy-state.txt",
+                "size": len(payload),
+                "sha256": DR.hashlib.sha256(payload).hexdigest(),
+                "kind": "workspace_file",
+            }
+        ],
+    }
+    archive = target / "atlas-backup-legacy.zip"
+    with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+        bundle.writestr("legacy-state.txt", payload)
+        bundle.writestr(DR.MANIFEST_MEMBER, json.dumps(manifest, ensure_ascii=False))
+    manifest_sidecar = archive.with_suffix(".manifest.json")
+    manifest_digest = DR.stable_json_sha256(manifest)
+    write_json(manifest_sidecar, manifest)
+    archive.with_suffix(".manifest.sha256").write_text(manifest_digest + "\n", encoding="ascii")
+    legacy_latest = {
+        "schema_version": DR.LEGACY_MANIFEST_SCHEMA_VERSION,
+        "date": manifest["date"],
+        "created_at": manifest["created_at"],
+        "archive": str(archive.resolve()),
+        "archive_sha256": DR.sha256(archive),
+        "manifest_sha256": manifest_digest,
+        "previous_manifest_sha256": None,
+        "legacy_previous_archive_sha256": None,
+        "manifest_sidecar": str(manifest_sidecar.resolve()),
+        "file_count": 1,
+        "git_bundle_count": 0,
+        "total_source_bytes": len(payload),
+        "verified": True,
+        "restore_verified": True,
+        "verification_errors": [],
+        "retention_days": 14,
+        "target_outside_workspace": True,
+        "target_on_different_volume": True,
+    }
+    write_json(latest, legacy_latest)
+    return legacy_latest
+
+
 class ResilienceControlTests(unittest.TestCase):
+    def test_staging_cleanup_retries_transient_windows_permission_errors(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary) / "transient.tmp"
+            target.write_text("temporary", encoding="utf-8")
+            attempts = 0
+
+            def transient_unlink(path: str) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts < 3:
+                    raise PermissionError("simulated transient file handle")
+                Path(path).unlink()
+
+            with patch.object(DR.time, "sleep") as sleep:
+                DR.retry_staging_cleanup(
+                    transient_unlink,
+                    str(target),
+                    PermissionError("initial cleanup failure"),
+                )
+
+            self.assertEqual(attempts, 3)
+            self.assertEqual(sleep.call_count, 2)
+            self.assertFalse(target.exists())
+
+    def test_backup_cli_reports_missing_key_without_traceback_or_configuration_text(self) -> None:
+        missing_key_message = (
+            "required backup encryption key environment variable is not set: "
+            "ATLAS_BACKUP_ENCRYPTION_KEY"
+        )
+        stdout = io.StringIO()
+        with patch.object(sys, "argv", ["disaster_recovery.py", "--date", "2026-07-18"]):
+            with patch.object(DR, "create_snapshot", side_effect=ValueError(missing_key_message)):
+                with patch("sys.stdout", stdout):
+                    self.assertEqual(DR.main(), 1)
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(payload["status"], "blocked")
+        self.assertEqual(payload["reason"], "backup_encryption_key_unavailable")
+        self.assertEqual(payload["error_type"], "ValueError")
+        self.assertNotIn("ATLAS_BACKUP_ENCRYPTION_KEY", stdout.getvalue())
+        self.assertNotIn(missing_key_message, stdout.getvalue())
+
     def test_backup_configuration_and_file_selection_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -141,6 +232,20 @@ class ResilienceControlTests(unittest.TestCase):
 
             key = b"atlas-test-backup-key-material!!"[:32]
             encoded_key = DR.base64.b64encode(key).decode("ascii")
+            with (
+                patch.dict(DR.os.environ, {}, clear=True),
+                patch.object(
+                    DR,
+                    "persistent_user_environment_value",
+                    return_value=encoded_key,
+                ) as persistent_value,
+            ):
+                self.assertEqual(
+                    DR.encryption_key_for_config(DR.load_config(config)),
+                    key,
+                )
+            persistent_value.assert_called_once_with(key_variable)
+
             with patch.dict(DR.os.environ, {"CUSTOM_DR_MATERIAL": encoded_key}, clear=False):
                 self.assertNotIn(
                     "CUSTOM_DR_MATERIAL",
@@ -162,6 +267,7 @@ class ResilienceControlTests(unittest.TestCase):
             self.assertTrue(result["encrypted_container_authenticated"])
             self.assertFalse(result["full_runtime_restore_verified"])
             self.assertEqual(result["schema_version"], DR.MANIFEST_SCHEMA_VERSION)
+            self.assertNotIn("legacy_migration_genesis", result)
             self.assertEqual(
                 latest_payload["metadata_authentication"]["algorithm"],
                 DR.METADATA_AUTHENTICATION_ALGORITHM,
@@ -201,6 +307,7 @@ class ResilienceControlTests(unittest.TestCase):
                     latest_path=latest,
                 )
             self.assertEqual(chained["previous_manifest_sha256"], result["manifest_sha256"])
+            self.assertNotIn("legacy_migration_genesis", chained)
             self.assertFalse(any(path.name.startswith(".atlas-") for path in target.iterdir()))
 
             forged_latest = DR.read_json(latest)
@@ -508,7 +615,129 @@ class ResilienceControlTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "AES-256-GCM encrypted and authenticated"):
                 DR.create_snapshot(date="2026-07-12", root=root, config_path=config, latest_path=latest)
 
-    def test_backup_rejects_legacy_snapshot_that_cannot_be_authenticated_and_restored(self) -> None:
+    def test_encrypted_backup_can_start_authenticated_genesis_from_verified_schema2(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as external:
+            root = Path(workspace)
+            target = Path(external)
+            latest = root / "runtime" / "latest.json"
+            latest.parent.mkdir(parents=True)
+            source = root / "source.txt"
+            source.write_text("new protected state", encoding="utf-8")
+            legacy = legacy_snapshot_v2(root, target, latest)
+            legacy_archive = Path(legacy["archive"])
+            legacy_bytes = {
+                path: path.read_bytes()
+                for path in (
+                    legacy_archive,
+                    Path(legacy["manifest_sidecar"]),
+                    legacy_archive.with_suffix(".manifest.sha256"),
+                )
+            }
+            config = root / "config.json"
+            key_variable = "ATLAS_TEST_LEGACY_MIGRATION_KEY"
+            write_json(
+                config,
+                {
+                    "disaster_recovery": {
+                        "enabled": True,
+                        "target_directory": external,
+                        "include_paths": ["source.txt"],
+                        "git_repositories": [],
+                        "encryption": {
+                            "required": True,
+                            "algorithm": "AES-256-GCM",
+                            "key_environment_variable": key_variable,
+                        },
+                    }
+                },
+            )
+            key = b"L" * 32
+            with patch.dict(
+                DR.os.environ,
+                {key_variable: DR.base64.b64encode(key).decode("ascii")},
+                clear=False,
+            ):
+                result = DR.create_snapshot(
+                    date="2026-07-12",
+                    root=root,
+                    config_path=config,
+                    latest_path=latest,
+                )
+
+            migration = result["legacy_migration_genesis"]
+            self.assertIsNone(result["previous_manifest_sha256"])
+            self.assertEqual(migration["legacy_schema_version"], 2)
+            self.assertEqual(migration["legacy_archive"], str(legacy_archive.resolve()))
+            self.assertEqual(migration["legacy_manifest_digest"], legacy["manifest_sha256"])
+            self.assertTrue(Path(migration["legacy_latest_manifest_path"]).is_file())
+            self.assertEqual(
+                DR.sha256(Path(migration["legacy_latest_manifest_path"])),
+                migration["legacy_latest_manifest_sha256"],
+            )
+            for path, original in legacy_bytes.items():
+                self.assertEqual(path.read_bytes(), original)
+            manifest = DR.read_json(Path(result["manifest_sidecar"]))
+            self.assertEqual(manifest["legacy_migration_genesis"], migration)
+            self.assertIsNone(manifest["previous_manifest_sha256"])
+            DR.authenticate_metadata(manifest, key, "manifest")
+            DR.authenticate_metadata(result, key, "latest")
+            with patch.dict(
+                DR.os.environ,
+                {key_variable: DR.base64.b64encode(key).decode("ascii")},
+                clear=False,
+            ):
+                chained = DR.create_snapshot(
+                    date="2026-07-13",
+                    root=root,
+                    config_path=config,
+                    latest_path=latest,
+                )
+            self.assertEqual(chained["previous_manifest_sha256"], result["manifest_sha256"])
+            self.assertEqual(chained["legacy_migration_genesis"], migration)
+            DR.authenticate_metadata(DR.read_json(latest), key, "latest")
+
+    def test_encrypted_backup_rejects_tampered_schema2_migration_source(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as external:
+            root = Path(workspace)
+            target = Path(external)
+            latest = root / "runtime" / "latest.json"
+            latest.parent.mkdir(parents=True)
+            (root / "source.txt").write_text("new protected state", encoding="utf-8")
+            legacy = legacy_snapshot_v2(root, target, latest)
+            Path(legacy["archive"]).write_bytes(b"tampered legacy archive")
+            config = root / "config.json"
+            key_variable = "ATLAS_TEST_TAMPERED_LEGACY_KEY"
+            write_json(
+                config,
+                {
+                    "disaster_recovery": {
+                        "enabled": True,
+                        "target_directory": external,
+                        "include_paths": ["source.txt"],
+                        "git_repositories": [],
+                        "encryption": {
+                            "required": True,
+                            "algorithm": "AES-256-GCM",
+                            "key_environment_variable": key_variable,
+                        },
+                    }
+                },
+            )
+            with patch.dict(
+                DR.os.environ,
+                {key_variable: DR.base64.b64encode(b"T" * 32).decode("ascii")},
+                clear=False,
+            ):
+                with self.assertRaisesRegex(ValueError, "archive integrity check failed"):
+                    DR.create_snapshot(
+                        date="2026-07-12",
+                        root=root,
+                        config_path=config,
+                        latest_path=latest,
+                    )
+            self.assertFalse(any(target.glob("*.atlasdr")))
+
+    def test_backup_rejects_unknown_legacy_snapshot_schema(self) -> None:
         with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as external:
             root = Path(workspace)
             target = Path(external)
@@ -530,7 +759,7 @@ class ResilienceControlTests(unittest.TestCase):
                 "archive_sha256": DR.sha256(legacy_archive),
             })
 
-            with self.assertRaisesRegex(ValueError, "predates authenticated schema 4"):
+            with self.assertRaisesRegex(ValueError, "unsupported previous disaster-recovery schema"):
                 DR.create_snapshot(date="2026-07-12", root=root, config_path=config, latest_path=latest)
 
             legacy_archive.write_bytes(b"tampered")
@@ -539,7 +768,7 @@ class ResilienceControlTests(unittest.TestCase):
                 "archive": str(legacy_archive),
                 "archive_sha256": "0" * 64,
             })
-            with self.assertRaisesRegex(ValueError, "predates authenticated schema 4"):
+            with self.assertRaisesRegex(ValueError, "unsupported previous disaster-recovery schema"):
                 DR.create_snapshot(date="2026-07-12", root=root, config_path=config, latest_path=latest)
 
     def test_backup_rejects_workspace_target(self) -> None:

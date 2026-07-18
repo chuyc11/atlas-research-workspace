@@ -277,7 +277,7 @@ def reports_in_period(period: str, date: str) -> list[tuple[str, Path, str]]:
     return reports
 
 
-def append_prediction_records(input_path: Path, date: str, predictions: Path = DEFAULT_PREDICTIONS) -> int:
+def load_prediction_input(input_path: Path) -> list[Any]:
     raw = input_path.read_text(encoding="utf-8")
     value = strict_json_loads(raw, source=str(input_path))
     if isinstance(value, dict):
@@ -286,126 +286,180 @@ def append_prediction_records(input_path: Path, date: str, predictions: Path = D
         records = value
     else:
         raise ValueError("Prediction input must be a JSON object, a list, or an object with a predictions list.")
+    if not isinstance(records, list):
+        raise ValueError("Prediction input 'predictions' must be a list.")
+    return records
+
+
+def load_prediction_settings() -> dict[str, Any]:
+    value = strict_json_loads(
+        DEFAULT_SETTINGS.read_text(encoding="utf-8"),
+        source=str(DEFAULT_SETTINGS),
+    )
+    if not isinstance(value, dict):
+        raise ValueError(f"Prediction settings must be a JSON object: {DEFAULT_SETTINGS}")
+    return value
+
+
+def prepare_prediction_records(
+    records: list[Any],
+    date: str,
+    existing: list[dict[str, Any]],
+    settings: dict[str, Any],
+) -> tuple[list[dict[str, Any]], int]:
+    """Validate a prediction batch against a ledger snapshot without writing files."""
 
     run_day = parse_contract_date(date)
     if run_day.isoformat() != date:
         raise ValueError(f"Run date must be canonical YYYY-MM-DD: {date!r}")
 
+    contract = settings.get("prediction_contract", {})
+    enforce_from = parse_contract_date(contract.get("enforce_from_date") or "9999-12-31")
+    originals: dict[str, dict[str, Any]] = {}
+    for item in existing:
+        prediction_id = str(item.get("prediction_id") or "")
+        if not prediction_id or isinstance(item.get("review"), dict):
+            continue
+        if prediction_id in originals:
+            classification = "duplicate" if originals[prediction_id] == item else "conflicting"
+            raise ValueError(
+                f"Prediction ledger contains {classification} original records for "
+                f"prediction_id {prediction_id!r}."
+            )
+        originals[prediction_id] = item
+    reviews_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
+    for item in existing:
+        if not isinstance(item.get("review"), dict):
+            continue
+        review_key = (
+            str(item.get("prediction_id") or ""),
+            str(item.get("status") or ""),
+            str(item.get("review", {}).get("review_date") or item.get("date") or ""),
+        )
+        previous = reviews_by_key.get(review_key)
+        if previous is not None and previous != item:
+            raise ValueError(
+                "Prediction ledger contains conflicting review records for "
+                f"identity {review_key!r}."
+            )
+        reviews_by_key[review_key] = item
+
+    prepared: list[dict[str, Any]] = []
+    errors: list[str] = []
+    skipped_identical = 0
+    for raw_record in records:
+        if not isinstance(raw_record, dict):
+            raise ValueError("Each prediction record must be a JSON object.")
+        record = dict(raw_record)
+        supplied_date = record.get("date")
+        if supplied_date not in (None, "") and str(supplied_date) != date:
+            errors.append(
+                f"{record.get('prediction_id') or '<missing-id>'}: "
+                f"record date {supplied_date!r} must equal run date {date}"
+            )
+        record["date"] = date
+        record.setdefault("status", "open")
+        prediction_id = str(record.get("prediction_id") or "")
+        is_review = isinstance(record.get("review"), dict)
+        try:
+            record_day = parse_contract_date(record.get("date"))
+        except (TypeError, ValueError):
+            errors.append(f"{prediction_id or '<missing-id>'}: invalid date")
+            prepared.append(record)
+            continue
+        if is_review:
+            review = record.get("review") if isinstance(record.get("review"), dict) else {}
+            review_key = (
+                prediction_id,
+                str(record.get("status") or ""),
+                str(review.get("review_date") or record.get("date") or ""),
+            )
+            previous_review = reviews_by_key.get(review_key)
+            if previous_review is not None:
+                if previous_review == record:
+                    skipped_identical += 1
+                    continue
+                errors.append(
+                    f"{prediction_id}: review identity {review_key!r} already exists "
+                    "with different content"
+                )
+                continue
+            reviews_by_key[review_key] = record
+        elif prediction_id in originals:
+            if originals[prediction_id] == record:
+                skipped_identical += 1
+                continue
+            errors.append(f"{prediction_id}: original prediction already exists with different content")
+        if record_day >= enforce_from:
+            if is_review:
+                original = originals.get(prediction_id)
+                original_is_v2 = bool(
+                    original
+                    and original.get("schema_version") == 2
+                    and parse_contract_date(original.get("date")) >= enforce_from
+                )
+                if original is None or original_is_v2:
+                    errors.extend(
+                        validate_v2_review(
+                            record,
+                            original,
+                            price_recompute_enforce_from_date=str(
+                                settings.get("review_queue", {}).get(
+                                    "market_resolution_price_recompute_enforce_from_date"
+                                )
+                                or "2026-07-16"
+                            ),
+                        )
+                    )
+            else:
+                errors.extend(validate_v2_prediction(
+                    record,
+                    machine_evaluation_enforce_from_date=str(
+                        settings.get("review_queue", {}).get("machine_evaluation_enforce_from_date") or ""
+                    ) or None,
+                    event_asset_separation_enforce_from_date=str(
+                        settings.get("review_queue", {}).get("event_asset_separation_enforce_from_date") or ""
+                    ) or None,
+                    independence_enforce_from_date=str(
+                        settings.get("prediction_contract", {}).get("independence_enforce_from_date") or ""
+                    ) or None,
+                    evidence_reproducibility_enforce_from_date=str(
+                        settings.get("prediction_contract", {}).get("evidence_reproducibility_enforce_from_date") or ""
+                    ) or None,
+                ))
+        if not is_review and prediction_id:
+            originals[prediction_id] = record
+        prepared.append(record)
+    if errors:
+        raise ValueError("Prediction contract rejected the batch: " + "; ".join(errors))
+    return prepared, skipped_identical
+
+
+def validate_prediction_records(
+    input_path: Path,
+    date: str,
+    predictions: Path = DEFAULT_PREDICTIONS,
+) -> dict[str, Any]:
+    """Read-only preflight using the same ledger and contract checks as record."""
+    records = load_prediction_input(input_path)
+    existing = load_json_records(predictions)
+    settings = load_prediction_settings()
+    prepared, skipped_identical = prepare_prediction_records(records, date, existing, settings)
+    return {
+        "status": "ok",
+        "would_record": len(prepared),
+        "skipped_identical": skipped_identical,
+    }
+
+
+def append_prediction_records(input_path: Path, date: str, predictions: Path = DEFAULT_PREDICTIONS) -> int:
+    records = load_prediction_input(input_path)
+
     with prediction_ledger_lock(predictions):
         ensure_files(predictions=predictions)
         existing = load_json_records(predictions)
-        settings = strict_json_loads(
-            DEFAULT_SETTINGS.read_text(encoding="utf-8"),
-            source=str(DEFAULT_SETTINGS),
-        )
-        contract = settings.get("prediction_contract", {})
-        enforce_from = parse_contract_date(contract.get("enforce_from_date") or "9999-12-31")
-        originals: dict[str, dict[str, Any]] = {}
-        for item in existing:
-            prediction_id = str(item.get("prediction_id") or "")
-            if prediction_id and not isinstance(item.get("review"), dict) and prediction_id not in originals:
-                originals[prediction_id] = item
-        reviews_by_key: dict[tuple[str, str, str], dict[str, Any]] = {}
-        for item in existing:
-            if not isinstance(item.get("review"), dict):
-                continue
-            review_key = (
-                str(item.get("prediction_id") or ""),
-                str(item.get("status") or ""),
-                str(item.get("review", {}).get("review_date") or item.get("date") or ""),
-            )
-            previous = reviews_by_key.get(review_key)
-            if previous is not None and previous != item:
-                raise ValueError(
-                    "Prediction ledger contains conflicting review records for "
-                    f"identity {review_key!r}."
-                )
-            reviews_by_key[review_key] = item
-        prepared: list[dict[str, Any]] = []
-        errors: list[str] = []
-        for raw_record in records:
-            if not isinstance(raw_record, dict):
-                raise ValueError("Each prediction record must be a JSON object.")
-            record = dict(raw_record)
-            supplied_date = record.get("date")
-            if supplied_date not in (None, "") and str(supplied_date) != date:
-                errors.append(
-                    f"{record.get('prediction_id') or '<missing-id>'}: "
-                    f"record date {supplied_date!r} must equal run date {date}"
-                )
-            record["date"] = date
-            record.setdefault("status", "open")
-            prediction_id = str(record.get("prediction_id") or "")
-            is_review = isinstance(record.get("review"), dict)
-            try:
-                record_day = parse_contract_date(record.get("date"))
-            except (TypeError, ValueError):
-                errors.append(f"{prediction_id or '<missing-id>'}: invalid date")
-                prepared.append(record)
-                continue
-            if is_review:
-                review = record.get("review") if isinstance(record.get("review"), dict) else {}
-                review_key = (
-                    prediction_id,
-                    str(record.get("status") or ""),
-                    str(review.get("review_date") or record.get("date") or ""),
-                )
-                previous_review = reviews_by_key.get(review_key)
-                if previous_review is not None:
-                    if previous_review == record:
-                        continue
-                    errors.append(
-                        f"{prediction_id}: review identity {review_key!r} already exists "
-                        "with different content"
-                    )
-                    continue
-                reviews_by_key[review_key] = record
-            elif prediction_id in originals:
-                if originals[prediction_id] == record:
-                    continue
-                errors.append(f"{prediction_id}: original prediction already exists with different content")
-            if record_day >= enforce_from:
-                if is_review:
-                    original = originals.get(prediction_id)
-                    original_is_v2 = bool(
-                        original
-                        and original.get("schema_version") == 2
-                        and parse_contract_date(original.get("date")) >= enforce_from
-                    )
-                    if original is None or original_is_v2:
-                        errors.extend(
-                            validate_v2_review(
-                                record,
-                                original,
-                                price_recompute_enforce_from_date=str(
-                                    settings.get("review_queue", {}).get(
-                                        "market_resolution_price_recompute_enforce_from_date"
-                                    )
-                                    or "2026-07-16"
-                                ),
-                            )
-                        )
-                else:
-                    errors.extend(validate_v2_prediction(
-                        record,
-                        machine_evaluation_enforce_from_date=str(
-                            settings.get("review_queue", {}).get("machine_evaluation_enforce_from_date") or ""
-                        ) or None,
-                        event_asset_separation_enforce_from_date=str(
-                            settings.get("review_queue", {}).get("event_asset_separation_enforce_from_date") or ""
-                        ) or None,
-                        independence_enforce_from_date=str(
-                            settings.get("prediction_contract", {}).get("independence_enforce_from_date") or ""
-                        ) or None,
-                        evidence_reproducibility_enforce_from_date=str(
-                            settings.get("prediction_contract", {}).get("evidence_reproducibility_enforce_from_date") or ""
-                        ) or None,
-                    ))
-            if not is_review and prediction_id:
-                originals[prediction_id] = record
-            prepared.append(record)
-        if errors:
-            raise ValueError("Prediction contract rejected the batch: " + "; ".join(errors))
+        settings = load_prediction_settings()
+        prepared, _ = prepare_prediction_records(records, date, existing, settings)
         if not prepared:
             return 0
 
@@ -762,6 +816,13 @@ def main(argv: list[str] | None = None) -> int:
     record_parser.add_argument("--date", required=True)
     record_parser.add_argument("--input", required=True, type=Path)
 
+    validate_records_parser = subparsers.add_parser(
+        "validate-records",
+        help="Read-only preflight of prediction records against the complete ledger.",
+    )
+    validate_records_parser.add_argument("--date", required=True)
+    validate_records_parser.add_argument("--input", required=True, type=Path)
+
     context_parser = subparsers.add_parser("summary-context", help="Print daily reports for a week or month.")
     context_parser.add_argument("--period", choices=["week", "month"], required=True)
     context_parser.add_argument("--date", required=True)
@@ -797,6 +858,24 @@ def main(argv: list[str] | None = None) -> int:
         count = append_prediction_records(args.input, args.date)
         print(f"recorded {count} prediction(s)")
         print(DEFAULT_PREDICTIONS)
+        return 0
+    if args.command == "validate-records":
+        try:
+            result = validate_prediction_records(
+                args.input,
+                args.date,
+                predictions=DEFAULT_PREDICTIONS,
+            )
+        except Exception as exc:
+            result = {
+                "status": "error",
+                "would_record": 0,
+                "skipped_identical": 0,
+                "error": str(exc),
+            }
+            print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+            return 1
+        print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
     if args.command == "summary-context":
         print_summary_context(args.period, args.date)

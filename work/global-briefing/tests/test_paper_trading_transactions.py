@@ -75,6 +75,24 @@ class PaperTradingTransactionTests(unittest.TestCase):
         path.write_text(json.dumps({"orders": orders}), encoding="utf-8")
         return path
 
+    def enable_prediction_reference_contract(self) -> Path:
+        ledger_path = self.root / "data" / "predictions.jsonl"
+        self.config["prediction_ledger_file"] = "data/predictions.jsonl"
+        self.config["order_contract"] = {
+            "prediction_reference_required_from_date": "2026-07-17"
+        }
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+        return ledger_path
+
+    def write_predictions(self, rows: list[dict]) -> Path:
+        path = self.root / "data" / "predictions.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        return path
+
     def order(self, order_id: str, symbol: str = "AAA", notional: float = 10000.0) -> dict:
         return {
             "order_id": order_id,
@@ -126,6 +144,102 @@ class PaperTradingTransactionTests(unittest.TestCase):
         self.assertEqual(portfolio_path.read_bytes(), first_portfolio)
         self.assertEqual(trades_path.read_bytes(), first_ledger)
         self.assertEqual(len(MODULE.read_jsonl(trades_path)), 1)
+
+    def test_prediction_reference_contract_allows_pre_enforcement_order(self) -> None:
+        self.enable_prediction_reference_contract()
+
+        applied = MODULE.apply_orders(
+            self.write_orders([self.order("ORDER-BEFORE-PREDICTION-GATE")]),
+            "2026-07-16",
+            account="US",
+        )
+
+        self.assertEqual(len(applied), 1)
+        self.assertFalse(applied[0]["idempotent_replay"])
+
+    def test_prediction_reference_contract_rejects_missing_and_review_only_references(self) -> None:
+        self.enable_prediction_reference_contract()
+        missing = self.order("ORDER-MISSING-PREDICTION")
+
+        with self.assertRaisesRegex(ValueError, "requires prediction_id"):
+            MODULE.apply_orders(self.write_orders([missing]), "2026-07-17", account="US")
+
+        review_only = self.order("ORDER-REVIEW-ONLY")
+        review_only["prediction_id"] = "2026-07-17-P01"
+        self.write_predictions(
+            [
+                {
+                    "date": "2026-07-17",
+                    "prediction_id": "2026-07-17-P01",
+                    "review": {"review_date": "2026-07-17"},
+                }
+            ]
+        )
+        with self.assertRaisesRegex(ValueError, "no original prediction record exists"):
+            MODULE.apply_orders(self.write_orders([review_only]), "2026-07-17", account="US")
+
+        self.assertEqual(MODULE.read_jsonl(self.root / "data" / "trades.jsonl"), [])
+
+    def test_prediction_reference_contract_rejects_future_original(self) -> None:
+        self.enable_prediction_reference_contract()
+        order = self.order("ORDER-FUTURE-PREDICTION")
+        order["prediction_id"] = "2026-07-18-P01"
+        self.write_predictions(
+            [{"date": "2026-07-18", "prediction_id": "2026-07-18-P01"}]
+        )
+
+        with self.assertRaisesRegex(ValueError, "follows order date 2026-07-17"):
+            MODULE.apply_orders(self.write_orders([order]), "2026-07-17", account="US")
+
+        self.assertEqual(MODULE.read_jsonl(self.root / "data" / "trades.jsonl"), [])
+
+    def test_prediction_reference_contract_rejects_duplicate_original_ids(self) -> None:
+        self.enable_prediction_reference_contract()
+        order = self.order("ORDER-DUPLICATE-PREDICTION")
+        order["prediction_id"] = "2026-07-17-P01"
+
+        for conflicting in (False, True):
+            with self.subTest(conflicting=conflicting):
+                original = {"date": "2026-07-17", "prediction_id": "2026-07-17-P01"}
+                duplicate = dict(original)
+                if conflicting:
+                    duplicate["scenario"] = "same identity, conflicting scenario"
+                self.write_predictions([original, duplicate])
+
+                with self.assertRaisesRegex(ValueError, "duplicate original prediction_id"):
+                    MODULE.apply_orders(self.write_orders([order]), "2026-07-17", account="US")
+
+        self.assertEqual(MODULE.read_jsonl(self.root / "data" / "trades.jsonl"), [])
+
+    def test_prediction_reference_contract_rejects_noncanonical_whitespace(self) -> None:
+        self.enable_prediction_reference_contract()
+        self.write_predictions(
+            [{"date": "2026-07-17", "prediction_id": "2026-07-17-P01"}]
+        )
+        order = self.order("ORDER-WHITESPACE-PREDICTION")
+        order["prediction_id"] = " 2026-07-17-P01 "
+
+        with self.assertRaisesRegex(ValueError, "leading or trailing whitespace"):
+            MODULE.apply_orders(self.write_orders([order]), "2026-07-17", account="US")
+
+        self.assertEqual(MODULE.read_jsonl(self.root / "data" / "trades.jsonl"), [])
+
+    def test_prediction_reference_contract_accepts_original_and_replay_survives_missing_ledger(self) -> None:
+        ledger_path = self.enable_prediction_reference_contract()
+        self.write_predictions(
+            [{"date": "2026-07-17", "prediction_id": "2026-07-17-P01"}]
+        )
+        order = self.order("ORDER-LINKED-PREDICTION")
+        order["prediction_id"] = "2026-07-17-P01"
+        path = self.write_orders([order])
+
+        first = MODULE.apply_orders(path, "2026-07-17", account="US")
+        ledger_path.unlink()
+        second = MODULE.apply_orders(path, "2026-07-17", account="US")
+
+        self.assertFalse(first[0]["idempotent_replay"])
+        self.assertTrue(second[0]["idempotent_replay"])
+        self.assertEqual(len(MODULE.read_jsonl(self.root / "data" / "trades.jsonl")), 1)
 
     def test_later_invalid_order_rolls_back_the_whole_account_batch(self) -> None:
         invalid = self.order("ORDER-INVALID", symbol="BBB")

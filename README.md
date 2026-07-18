@@ -131,6 +131,24 @@ cycle 通过 `work/shared/atlas/cycle.lock` 阻止并发运行；doctor 或 sync
 同日两个非空别名并存会 fail-closed；
 实际旧账本仍不会被 cycle 直接追加。
 
+### 发布闭环
+
+普通非 dry-run `cycle` 会在核心审计锚定后自动执行 Phase B：必要时先生成引导灾备，随后按
+improvements → deep/strict heal → final alert → encrypted backup/restore → staged-candidate retry
+的顺序完成发布前证据。它不会重复报告、预测、虚拟订单或估值；失败结果写入独立发布审计，
+不会改写已锚定的基础 cycle 结果。
+
+项目默认不安装高频 Windows 计划任务。门禁修复后需要单独重试现有冻结候选时，运行：
+
+```powershell
+python atlas.py publish --date YYYY-MM-DD
+```
+
+该命令只执行 Phase B 并复用已暂存候选；成功仅生成冻结/待部署站点文件，**不会自动声称公开 URL 已更新**。
+生产上线仍须经过独立可信部署、构建、生产验证和 `--mark-deployed` 流程。
+默认 `cycle` 请求 Phase B 时会把其阻断或错误码作为整个命令的退出码返回，自动化不能只因基础周期通过就误报发布成功；
+显式使用 `--skip-publication` 时才仅按基础周期结果退出。
+
 cycle 的 `overall_passed` 仅为向后兼容字段，语义等同 `operational_gate_passed`。`release_candidate_passed`
 还要求 `--full-tests`、同一 workspace-lock 上输入不变的幂等复跑、三仓干净且每个当前 commit 都被至少一个远端 ref 明确发布；
 `research_promotion_passed` 单独表示研究证据门禁，三者不能互相替代。普通站点同步在门禁或冻结证据不足时只写 staging，
@@ -203,7 +221,7 @@ atlas doctor
 - 根 CI 固定 GitHub Action 提交，执行 Ruff、Bandit、秘密扫描、Python 依赖审计、60% 覆盖率及 Python 3.11/3.12 矩阵。组合工作区 checkout 对私有子仓要求仓库 secret `ATLAS_SUBMODULE_TOKEN`；缺失时明确失败，不会降级成缺子仓的假绿。
 - 灾备写入 `D:/ATLAS-Backups`，要求与工作区不同卷；生产配置强制使用 AES-256-GCM。32 字节密钥以 Base64 放入密钥管理器提供的 `ATLAS_BACKUP_ENCRYPTION_KEY` 环境变量，不得写入仓库。schema 4 快照使用分用途 HMAC 认证 manifest sidecar 与 latest 索引，前序介质必须先通过 AEAD、逐文件哈希以及 Git `bundle verify → mirror clone → fsck` 才能接链；明文 staging 仅位于受保护的备份目标并可靠清理。旧 schema 2 `latest.json` 必须由运维显式归档后建立新的加密 genesis，系统不会静默信任迁移。该证据不宣称操作系统凭据等完整运行时已恢复。
 - 高/严重改进项需要确认；告警具备稳定 ID、重试上限、确认超时和升级状态。仅生成路由文件不算送达，每个目的地必须记录不可变回执后才能确认：`python atlas.py alerts --date YYYY-MM-DD --receipt-destination DESTINATION --receipt-id RECEIPT_ID`。真实 connector 回执还会更新独立、带新鲜度约束的 `channel_health.json`，使健康日能力验收保持幂等；需确认告警只有到 `acknowledged` 才通过。Slack 连接器未返回回执时不得宣称已送达。
-- 由计划任务至少每 5 分钟执行 `python atlas.py alerts --process-due --json`，消费已持久化的 retry/ack deadline。它只创建 `pending_handoff` 或 `escalation_required` 状态，绝不伪造 connector 的送达回执；已升级告警必须由人工处置，不能通过 retry 降级。
+- 如需消费已持久化的 retry/ack deadline，可在正常维护时按需执行 `python atlas.py alerts --process-due --json`。项目默认不注册高频计划任务；该命令只创建 `pending_handoff` 或 `escalation_required` 状态，绝不伪造 connector 的送达回执；已升级告警必须由人工处置，不能通过 retry 降级。
 
 预测系统的分层设计、契约示例和晋升标准见 [RESEARCH_ARCHITECTURE.md](RESEARCH_ARCHITECTURE.md)。
 

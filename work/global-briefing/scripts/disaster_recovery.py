@@ -17,6 +17,7 @@ import stat
 import struct
 import subprocess
 import tempfile
+import time
 import unicodedata
 import zipfile
 from datetime import UTC, datetime
@@ -48,6 +49,7 @@ DEFAULT_INCLUDES = (
     "src",
     "work/trading-core",
 )
+STAGING_CLEANUP_RETRY_DELAYS_SECONDS = (0.05, 0.1, 0.25, 0.5, 1.0)
 EXCLUDED_PARTS = {
     "__pycache__",
     ".pytest_cache",
@@ -125,7 +127,9 @@ GCM_TAG_BYTES = 16
 ENCRYPTION_CHUNK_BYTES = 1024 * 1024
 RESTORE_SCOPE = "configured_workspace_files_and_git_bundles"
 MANIFEST_SCHEMA_VERSION = 4
+LEGACY_MANIFEST_SCHEMA_VERSION = 2
 METADATA_AUTHENTICATION_ALGORITHM = "HMAC-SHA256"
+LEGACY_MIGRATION_REASON = "authenticated_schema_4_genesis_from_verified_legacy_schema_2"
 MANIFEST_MEMBER = "_atlas_backup_manifest.json"
 MAX_MANIFEST_BYTES = 16 * 1024 * 1024
 MAX_MANIFEST_FILES = 100_000
@@ -143,7 +147,19 @@ MANIFEST_REQUIRED_KEYS = {
     "previous_manifest_sha256",
     "files",
 }
-MANIFEST_OPTIONAL_KEYS = {"metadata_authentication"}
+MANIFEST_OPTIONAL_KEYS = {"legacy_migration_genesis", "metadata_authentication"}
+LEGACY_MIGRATION_KEYS = {
+    "reason",
+    "legacy_schema_version",
+    "legacy_latest_manifest_path",
+    "legacy_latest_manifest_sha256",
+    "legacy_archive",
+    "legacy_archive_sha256",
+    "legacy_manifest_sidecar",
+    "legacy_manifest_sha256",
+    "legacy_manifest_digest_sidecar",
+    "legacy_manifest_digest",
+}
 
 
 def utc_now() -> str:
@@ -234,6 +250,26 @@ def signed_metadata(payload: dict[str, Any], key: bytes | None, purpose: str) ->
     return signed
 
 
+def retry_staging_cleanup(function: Any, path: str, _error: BaseException) -> None:
+    """Retry transient Windows handle/AV races without abandoning plaintext staging."""
+    attempts = (0.0, *STAGING_CLEANUP_RETRY_DELAYS_SECONDS)
+    last_error: OSError | None = None
+    for delay in attempts:
+        if delay:
+            time.sleep(delay)
+        with contextlib.suppress(OSError):
+            os.chmod(path, 0o700)
+        try:
+            function(path)
+            return
+        except FileNotFoundError:
+            return
+        except OSError as exc:
+            last_error = exc
+    assert last_error is not None
+    raise last_error
+
+
 @contextlib.contextmanager
 def private_staging_directory(parent: Path, *, prefix: str) -> Iterator[Path]:
     """Keep plaintext restore material beside the protected target, never in the OS temp root."""
@@ -266,11 +302,7 @@ def private_staging_directory(parent: Path, *, prefix: str) -> Iterator[Path]:
                         handle.flush()
                         os.fsync(handle.fileno())
 
-            def retry_writable(function: Any, path: str, _error: BaseException) -> None:
-                os.chmod(path, 0o700)
-                function(path)
-
-            shutil.rmtree(staging, ignore_errors=False, onexc=retry_writable)
+            shutil.rmtree(staging, ignore_errors=False, onexc=retry_staging_cleanup)
 
 
 def sanitized_subprocess_environment(
@@ -370,12 +402,37 @@ def decode_encryption_key(value: str) -> bytes:
     return key
 
 
+def persistent_user_environment_value(variable: str) -> str | None:
+    """Read a Windows CurrentUser environment value when the parent is stale.
+
+    Windows GUI applications keep the environment block they inherited at
+    startup.  A newly provisioned user-scoped backup key therefore may not be
+    visible to a long-running Codex process even though it is correctly stored
+    for the user.  This fallback reads only the configured value name from the
+    current user's own Environment key; it never enumerates or logs variables.
+    """
+    if os.name != "nt":
+        return None
+    try:
+        import winreg
+
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as handle:
+            value, value_type = winreg.QueryValueEx(handle, variable)
+    except (OSError, ImportError):
+        return None
+    if value_type not in {winreg.REG_SZ, winreg.REG_EXPAND_SZ} or not isinstance(value, str):
+        return None
+    return value
+
+
 def encryption_key_for_config(config: dict[str, Any]) -> bytes | None:
     encryption = config.get("encryption", {})
     if not isinstance(encryption, dict) or encryption.get("required") is not True:
         return None
     variable = str(encryption["key_environment_variable"]).strip()
     encoded = os.environ.get(variable)
+    if encoded is None:
+        encoded = persistent_user_environment_value(variable)
     if not encoded:
         raise ValueError(f"required backup encryption key environment variable is not set: {variable}")
     return decode_encryption_key(encoded)
@@ -530,6 +587,130 @@ def canonical_path_identity(value: str) -> str:
     return unicodedata.normalize("NFC", value).casefold()
 
 
+def validate_legacy_migration_genesis(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != LEGACY_MIGRATION_KEYS:
+        raise ValueError("legacy migration genesis metadata is missing or malformed")
+    if value.get("reason") != LEGACY_MIGRATION_REASON:
+        raise ValueError("legacy migration genesis reason is invalid")
+    if (
+        type(value.get("legacy_schema_version")) is not int
+        or value["legacy_schema_version"] != LEGACY_MANIFEST_SCHEMA_VERSION
+    ):
+        raise ValueError("legacy migration genesis schema is unsupported")
+    path_names = (
+        "legacy_latest_manifest_path",
+        "legacy_archive",
+        "legacy_manifest_sidecar",
+        "legacy_manifest_digest_sidecar",
+    )
+    paths: dict[str, Path] = {}
+    for name in path_names:
+        raw_path = value.get(name)
+        if not isinstance(raw_path, str) or not raw_path or "\0" in raw_path or not Path(raw_path).is_absolute():
+            raise ValueError(f"legacy migration genesis {name} is invalid")
+        paths[name] = Path(raw_path).resolve()
+    for name in (
+        "legacy_latest_manifest_sha256",
+        "legacy_archive_sha256",
+        "legacy_manifest_sha256",
+        "legacy_manifest_digest",
+    ):
+        digest = value.get(name)
+        if not isinstance(digest, str) or not HEX_SHA256.fullmatch(digest):
+            raise ValueError(f"legacy migration genesis {name} is invalid")
+    archive = paths["legacy_archive"]
+    if paths["legacy_manifest_sidecar"] != archive.with_suffix(".manifest.json"):
+        raise ValueError("legacy migration genesis manifest sidecar path is inconsistent")
+    if paths["legacy_manifest_digest_sidecar"] != archive.with_suffix(".manifest.sha256"):
+        raise ValueError("legacy migration genesis digest sidecar path is inconsistent")
+    expected_latest = archive.with_suffix(f".legacy-latest-schema-{LEGACY_MANIFEST_SCHEMA_VERSION}.json")
+    if paths["legacy_latest_manifest_path"] != expected_latest:
+        raise ValueError("legacy migration genesis preserved latest path is inconsistent")
+    if value["legacy_manifest_digest"] != value["legacy_manifest_sha256"]:
+        raise ValueError("legacy migration genesis manifest digest is inconsistent")
+    return value
+
+
+def validate_manifest_files(files: Any) -> list[dict[str, Any]]:
+    if not isinstance(files, list) or not files:
+        raise ValueError("backup manifest files must be a non-empty list")
+    if len(files) > MAX_MANIFEST_FILES:
+        raise ValueError("backup manifest contains too many file entries")
+    identities: set[str] = set()
+    validated: list[dict[str, Any]] = []
+    for index, item in enumerate(files):
+        if not isinstance(item, dict):
+            raise ValueError(f"backup manifest file entry {index} must be an object")
+        kind = item.get("kind")
+        expected_keys = {"path", "size", "sha256", "kind"}
+        if kind == "git_bundle":
+            expected_keys.add("repository")
+        if set(item) != expected_keys or kind not in {"workspace_file", "git_bundle"}:
+            raise ValueError(f"backup manifest file entry {index} has an invalid schema")
+        path = normalized_archive_path(item.get("path"))
+        if path == MANIFEST_MEMBER:
+            raise ValueError("backup manifest member path is reserved")
+        identity = canonical_path_identity(path)
+        if identity in identities:
+            raise ValueError(f"backup manifest contains a duplicate path: {path}")
+        identities.add(identity)
+        size = item.get("size")
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ValueError(f"backup manifest file size is invalid: {path}")
+        digest = item.get("sha256")
+        if not isinstance(digest, str) or not HEX_SHA256.fullmatch(digest):
+            raise ValueError(f"backup manifest file hash is invalid: {path}")
+        if kind == "git_bundle":
+            normalized_archive_path(item.get("repository"), allow_workspace_root=True)
+        validated.append(item)
+    return validated
+
+
+def validate_legacy_manifest_v2(manifest: dict[str, Any]) -> list[dict[str, Any]]:
+    if not isinstance(manifest, dict):
+        raise ValueError("legacy backup manifest must be a JSON object")
+    required = {"schema_version", "date", "created_at", "workspace", "previous_manifest_sha256", "files"}
+    optional = {"legacy_predecessor"}
+    if set(manifest) - required - optional or required - set(manifest):
+        raise ValueError("legacy backup manifest schema mismatch")
+    if type(manifest.get("schema_version")) is not int or manifest["schema_version"] != LEGACY_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"unsupported legacy backup manifest schema: {manifest.get('schema_version')!r}")
+    date = manifest.get("date")
+    try:
+        if not isinstance(date, str) or datetime.strptime(date, "%Y-%m-%d").strftime("%Y-%m-%d") != date:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("legacy backup manifest date must use YYYY-MM-DD") from exc
+    created_at = manifest.get("created_at")
+    try:
+        if not isinstance(created_at, str) or not created_at.endswith("Z"):
+            raise ValueError
+        datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("legacy backup manifest created_at must be an ISO-8601 UTC timestamp") from exc
+    workspace = manifest.get("workspace")
+    if (
+        not isinstance(workspace, str)
+        or not workspace.strip()
+        or "\0" in workspace
+        or not Path(workspace).is_absolute()
+    ):
+        raise ValueError("legacy backup manifest workspace must be an absolute path")
+    previous_hash = manifest.get("previous_manifest_sha256")
+    if previous_hash is not None and (not isinstance(previous_hash, str) or not HEX_SHA256.fullmatch(previous_hash)):
+        raise ValueError("legacy backup manifest predecessor hash is invalid")
+    predecessor = manifest.get("legacy_predecessor")
+    if predecessor is not None:
+        if not isinstance(predecessor, dict) or set(predecessor) != {"schema_version", "date", "archive_sha256"}:
+            raise ValueError("legacy backup manifest predecessor metadata is invalid")
+        if type(predecessor.get("schema_version")) is not int or predecessor["schema_version"] != 1:
+            raise ValueError("legacy backup manifest predecessor schema is invalid")
+        archive_hash = predecessor.get("archive_sha256")
+        if not isinstance(archive_hash, str) or not HEX_SHA256.fullmatch(archive_hash):
+            raise ValueError("legacy backup manifest predecessor hash is invalid")
+    return validate_manifest_files(manifest.get("files"))
+
+
 def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
     if not isinstance(manifest, dict):
         raise ValueError("backup manifest must be a JSON object")
@@ -595,39 +776,12 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
             raise ValueError("encrypted backup manifest authentication is malformed")
     elif "metadata_authentication" in manifest:
         raise ValueError("unencrypted backup manifest must not claim metadata authentication")
-    files = manifest.get("files")
-    if not isinstance(files, list) or not files:
-        raise ValueError("backup manifest files must be a non-empty list")
-    if len(files) > MAX_MANIFEST_FILES:
-        raise ValueError("backup manifest contains too many file entries")
-    identities: set[str] = set()
-    validated: list[dict[str, Any]] = []
-    for index, item in enumerate(files):
-        if not isinstance(item, dict):
-            raise ValueError(f"backup manifest file entry {index} must be an object")
-        kind = item.get("kind")
-        expected_keys = {"path", "size", "sha256", "kind"}
-        if kind == "git_bundle":
-            expected_keys.add("repository")
-        if set(item) != expected_keys or kind not in {"workspace_file", "git_bundle"}:
-            raise ValueError(f"backup manifest file entry {index} has an invalid schema")
-        path = normalized_archive_path(item.get("path"))
-        if path == MANIFEST_MEMBER:
-            raise ValueError("backup manifest member path is reserved")
-        identity = canonical_path_identity(path)
-        if identity in identities:
-            raise ValueError(f"backup manifest contains a duplicate path: {path}")
-        identities.add(identity)
-        size = item.get("size")
-        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
-            raise ValueError(f"backup manifest file size is invalid: {path}")
-        digest = item.get("sha256")
-        if not isinstance(digest, str) or not HEX_SHA256.fullmatch(digest):
-            raise ValueError(f"backup manifest file hash is invalid: {path}")
-        if kind == "git_bundle":
-            normalized_archive_path(item.get("repository"), allow_workspace_root=True)
-        validated.append(item)
-    return validated
+    migration = manifest.get("legacy_migration_genesis")
+    if migration is not None:
+        if not encrypted:
+            raise ValueError("legacy migration genesis requires an encrypted schema-4 manifest")
+        validate_legacy_migration_genesis(migration)
+    return validate_manifest_files(manifest.get("files"))
 
 
 def iter_files(
@@ -835,6 +989,175 @@ def verify_archive(
     return bool(verification["verified"]), list(verification["verification_errors"])
 
 
+def verify_legacy_archive_v2(archive: Path, manifest: dict[str, Any]) -> None:
+    """Verify a schema-2 ZIP and every referenced member without modifying legacy state."""
+    manifest_items = validate_legacy_manifest_v2(manifest)
+    if is_encrypted_archive(archive) or archive.suffix.casefold() != ".zip":
+        raise ValueError("legacy schema-2 archive must be an unencrypted ZIP")
+    try:
+        with zipfile.ZipFile(archive) as bundle:
+            members = bundle.infolist()
+            identities: set[str] = set()
+            names: set[str] = set()
+            expected_names = {item["path"] for item in manifest_items} | {MANIFEST_MEMBER}
+            for member in members:
+                safe_name = normalized_archive_path(member.filename)
+                identity = canonical_path_identity(safe_name)
+                if identity in identities:
+                    raise ValueError(f"duplicate legacy archive member: {member.filename}")
+                identities.add(identity)
+                names.add(safe_name)
+                mode = member.external_attr >> 16
+                if member.is_dir() or (member.create_system == 3 and mode and not stat.S_ISREG(mode)):
+                    raise ValueError(f"non-regular legacy archive member: {member.filename}")
+            if names != expected_names:
+                raise ValueError("legacy archive members do not match its manifest")
+            info_by_name = {member.filename: member for member in members}
+            embedded_info = info_by_name[MANIFEST_MEMBER]
+            if embedded_info.file_size > MAX_MANIFEST_BYTES:
+                raise ValueError("legacy embedded manifest exceeds the size limit")
+            embedded = strict_json_loads(bundle.read(MANIFEST_MEMBER))
+            if not isinstance(embedded, dict) or stable_json_sha256(embedded) != stable_json_sha256(manifest):
+                raise ValueError("legacy embedded manifest hash mismatch")
+            for item in manifest_items:
+                info = info_by_name[item["path"]]
+                if info.file_size != item["size"]:
+                    raise ValueError(f"legacy archive size mismatch: {item['path']}")
+                digest = hashlib.sha256()
+                with bundle.open(info) as source:
+                    for chunk in iter(lambda: source.read(ENCRYPTION_CHUNK_BYTES), b""):
+                        digest.update(chunk)
+                if digest.hexdigest() != item["sha256"]:
+                    raise ValueError(f"legacy archive hash mismatch: {item['path']}")
+    except (KeyError, OSError, UnicodeDecodeError, zipfile.BadZipFile, json.JSONDecodeError) as exc:
+        raise ValueError(f"legacy backup archive integrity check failed: {exc}") from exc
+
+
+def verify_legacy_snapshot_v2(
+    previous: dict[str, Any],
+    latest_path: Path,
+) -> dict[str, Any]:
+    if read_json(latest_path) != previous:
+        raise ValueError("legacy latest metadata changed before migration verification")
+    if type(previous.get("schema_version")) is not int or previous["schema_version"] != LEGACY_MANIFEST_SCHEMA_VERSION:
+        raise ValueError(f"unsupported previous disaster-recovery schema: {previous.get('schema_version')!r}")
+    if previous.get("verified") is not True or previous.get("restore_verified") is not True:
+        raise ValueError("legacy disaster-recovery snapshot was not restore-verified")
+    if previous.get("verification_errors") != []:
+        raise ValueError("legacy disaster-recovery snapshot has unresolved verification errors")
+    archive_value = previous.get("archive")
+    archive_hash = previous.get("archive_sha256")
+    sidecar_value = previous.get("manifest_sidecar")
+    manifest_hash = previous.get("manifest_sha256")
+    if (
+        not isinstance(archive_value, str)
+        or not archive_value
+        or not isinstance(archive_hash, str)
+        or not HEX_SHA256.fullmatch(archive_hash)
+        or not isinstance(sidecar_value, str)
+        or not sidecar_value
+        or not isinstance(manifest_hash, str)
+        or not HEX_SHA256.fullmatch(manifest_hash)
+    ):
+        raise ValueError("legacy disaster-recovery latest metadata is malformed")
+    archive = Path(archive_value).resolve()
+    manifest_sidecar = Path(sidecar_value).resolve()
+    digest_sidecar = archive.with_suffix(".manifest.sha256")
+    if manifest_sidecar != archive.with_suffix(".manifest.json"):
+        raise ValueError("legacy disaster-recovery sidecar path is inconsistent")
+    if not archive.is_file() or not manifest_sidecar.is_file() or not digest_sidecar.is_file():
+        raise ValueError("legacy disaster-recovery snapshot is missing")
+    if sha256(archive) != archive_hash:
+        raise ValueError("legacy disaster-recovery archive integrity check failed")
+    manifest = read_json(manifest_sidecar)
+    manifest_items = validate_legacy_manifest_v2(manifest)
+    if stable_json_sha256(manifest) != manifest_hash:
+        raise ValueError("legacy disaster-recovery manifest integrity check failed")
+    try:
+        digest = digest_sidecar.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError("legacy disaster-recovery manifest digest is unreadable") from exc
+    if digest != manifest_hash:
+        raise ValueError("legacy disaster-recovery manifest digest sidecar is invalid")
+    if previous.get("date") != manifest.get("date"):
+        raise ValueError("legacy disaster-recovery metadata date is inconsistent")
+    if (
+        previous.get("file_count") != len(manifest_items)
+        or previous.get("git_bundle_count") != sum(item["kind"] == "git_bundle" for item in manifest_items)
+        or previous.get("total_source_bytes") != sum(item["size"] for item in manifest_items)
+    ):
+        raise ValueError("legacy disaster-recovery latest metadata is inconsistent")
+    verify_legacy_archive_v2(archive, manifest)
+    preserved_latest = archive.with_suffix(f".legacy-latest-schema-{LEGACY_MANIFEST_SCHEMA_VERSION}.json")
+    migration = {
+        "reason": LEGACY_MIGRATION_REASON,
+        "legacy_schema_version": LEGACY_MANIFEST_SCHEMA_VERSION,
+        "legacy_latest_manifest_path": str(preserved_latest),
+        "legacy_latest_manifest_sha256": sha256(latest_path),
+        "legacy_archive": str(archive),
+        "legacy_archive_sha256": archive_hash,
+        "legacy_manifest_sidecar": str(manifest_sidecar),
+        "legacy_manifest_sha256": manifest_hash,
+        "legacy_manifest_digest_sidecar": str(digest_sidecar),
+        "legacy_manifest_digest": digest,
+    }
+    return validate_legacy_migration_genesis(migration)
+
+
+def preserve_legacy_latest_manifest(latest_path: Path, migration: dict[str, Any]) -> None:
+    """Preserve the mutable legacy latest pointer once, without overwriting any artifact."""
+    payload = latest_path.read_bytes()
+    if hashlib.sha256(payload).hexdigest() != migration["legacy_latest_manifest_sha256"]:
+        raise ValueError("legacy latest metadata changed during migration")
+    preserved = Path(migration["legacy_latest_manifest_path"])
+    if preserved.exists():
+        if (
+            preserved.is_symlink()
+            or not preserved.is_file()
+            or sha256(preserved) != migration["legacy_latest_manifest_sha256"]
+        ):
+            raise ValueError("preserved legacy latest metadata conflicts with the migration genesis")
+        return
+    preserved.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with preserved.open("xb") as handle:
+            with contextlib.suppress(OSError):
+                os.chmod(preserved, 0o600)
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except FileExistsError as exc:
+        if (
+            preserved.is_symlink()
+            or not preserved.is_file()
+            or sha256(preserved) != migration["legacy_latest_manifest_sha256"]
+        ):
+            raise ValueError("preserved legacy latest metadata conflicts with the migration genesis") from exc
+
+
+def assert_legacy_migration_artifacts_unchanged(
+    migration: dict[str, Any],
+    *,
+    source_latest_path: Path | None = None,
+) -> None:
+    validate_legacy_migration_genesis(migration)
+    checks = (
+        (Path(migration["legacy_latest_manifest_path"]), migration["legacy_latest_manifest_sha256"]),
+        (Path(migration["legacy_archive"]), migration["legacy_archive_sha256"]),
+    )
+    for path, expected_hash in checks:
+        if path.is_symlink() or not path.is_file() or sha256(path) != expected_hash:
+            raise ValueError(f"legacy migration artifact changed: {path}")
+    if source_latest_path is not None and sha256(source_latest_path) != migration["legacy_latest_manifest_sha256"]:
+        raise ValueError("legacy latest metadata changed during migration")
+    manifest = read_json(Path(migration["legacy_manifest_sidecar"]))
+    if stable_json_sha256(manifest) != migration["legacy_manifest_sha256"]:
+        raise ValueError("legacy migration manifest changed")
+    digest = Path(migration["legacy_manifest_digest_sidecar"]).read_text(encoding="ascii").strip()
+    if digest != migration["legacy_manifest_digest"]:
+        raise ValueError("legacy migration manifest digest changed")
+
+
 def create_git_bundles(
     root: Path,
     repositories: Iterable[str],
@@ -890,6 +1213,9 @@ def verify_previous_snapshot(previous: dict[str, Any], encryption_key: bytes | N
     if encryption_key is None:
         raise ValueError("previous encrypted disaster-recovery snapshot requires its encryption key")
     authenticate_metadata(previous, encryption_key, "latest")
+    previous_migration = previous.get("legacy_migration_genesis")
+    if previous_migration is not None:
+        validate_legacy_migration_genesis(previous_migration)
     archive_value = previous.get("archive")
     sidecar_value = previous.get("manifest_sidecar")
     archive_hash = previous.get("archive_sha256")
@@ -929,6 +1255,7 @@ def verify_previous_snapshot(previous: dict[str, Any], encryption_key: bytes | N
     expected_total_bytes = sum(item["size"] for item in previous_items)
     if (
         previous.get("previous_manifest_sha256") != previous_manifest.get("previous_manifest_sha256")
+        or previous_migration != previous_manifest.get("legacy_migration_genesis")
         or previous.get("file_count") != len(previous_items)
         or previous.get("git_bundle_count") != expected_bundle_count
         or previous.get("total_source_bytes") != expected_total_bytes
@@ -999,8 +1326,26 @@ def create_snapshot(
     created_at = utc_now()
     previous = read_json(latest_path) if latest_path.exists() else {}
     previous_manifest_sha256: str | None = None
+    legacy_migration_genesis: dict[str, Any] | None = None
+    legacy_source_latest_path: Path | None = None
     if previous:
-        previous_manifest_sha256 = verify_previous_snapshot(previous, encryption_key)
+        previous_schema = previous.get("schema_version")
+        if type(previous_schema) is not int:
+            raise ValueError(f"unsupported previous disaster-recovery schema: {previous_schema!r}")
+        if previous_schema == MANIFEST_SCHEMA_VERSION:
+            previous_manifest_sha256 = verify_previous_snapshot(previous, encryption_key)
+            inherited_migration = previous.get("legacy_migration_genesis")
+            if inherited_migration is not None:
+                legacy_migration_genesis = validate_legacy_migration_genesis(inherited_migration)
+                assert_legacy_migration_artifacts_unchanged(legacy_migration_genesis)
+        elif previous_schema == LEGACY_MANIFEST_SCHEMA_VERSION:
+            if encryption_key is None:
+                raise ValueError("legacy schema-2 migration requires a valid AES-256-GCM backup key")
+            legacy_migration_genesis = verify_legacy_snapshot_v2(previous, latest_path)
+            preserve_legacy_latest_manifest(latest_path, legacy_migration_genesis)
+            legacy_source_latest_path = latest_path
+        else:
+            raise ValueError(f"unsupported previous disaster-recovery schema: {previous_schema!r}")
     with private_staging_directory(target, prefix=".atlas-create-") as staging:
         bundle_entries = create_git_bundles(
             root,
@@ -1027,6 +1372,7 @@ def create_snapshot(
             "full_runtime_restore_expected": False,
             "excluded_sensitive_file_patterns": list(sensitive_patterns),
             "previous_manifest_sha256": previous_manifest_sha256,
+            **({"legacy_migration_genesis": legacy_migration_genesis} if legacy_migration_genesis is not None else {}),
             "files": [
                 {
                     "path": archive_path,
@@ -1070,6 +1416,15 @@ def create_snapshot(
         verification["archive_integrity_verified"] = False
         verification["restore_verified"] = False
         verification["verification_errors"].append("backup archive changed during restore verification")
+    if legacy_migration_genesis is not None:
+        try:
+            assert_legacy_migration_artifacts_unchanged(
+                legacy_migration_genesis,
+                source_latest_path=legacy_source_latest_path,
+            )
+        except (OSError, ValueError) as exc:
+            archive.unlink(missing_ok=True)
+            raise ValueError(f"legacy migration verification failed: {exc}") from exc
     verified = bool(verification["verified"])
     errors = list(verification["verification_errors"])
     manifest_sha256 = stable_json_sha256(manifest)
@@ -1102,6 +1457,7 @@ def create_snapshot(
         "manifest_sha256": manifest_sha256,
         "previous_manifest_sha256": previous_manifest_sha256,
         "legacy_previous_archive_sha256": None,
+        **({"legacy_migration_genesis": legacy_migration_genesis} if legacy_migration_genesis is not None else {}),
         "manifest_sidecar": str(manifest_sidecar.resolve()),
         "file_count": len(manifest["files"]),
         "git_bundle_count": sum(item.get("kind") == "git_bundle" for item in manifest["files"]),
@@ -1127,11 +1483,46 @@ def create_snapshot(
         reverse=True,
     )
     for old in archives[minimum_snapshots:]:
-        if old != archive and old.stat().st_mtime < cutoff:
+        protected_legacy_archive = (
+            Path(legacy_migration_genesis["legacy_archive"]).resolve() if legacy_migration_genesis is not None else None
+        )
+        if old != archive and old.resolve() != protected_legacy_archive and old.stat().st_mtime < cutoff:
             old.unlink()
             for suffix in (".manifest.json", ".manifest.sha256"):
                 old.with_suffix(suffix).unlink(missing_ok=True)
     return result
+
+
+def cli_failure_payload(date: str, exc: Exception) -> dict[str, Any]:
+    """Return a bounded, machine-readable failure without exposing configuration values.
+
+    The command is called by the root publication orchestrator, whose output is
+    often retained with long-lived audit evidence.  In particular, a missing or
+    malformed encryption key must not turn into a Python traceback (or copy a
+    provider/configuration value) in those records.  ``create_snapshot`` still
+    raises to preserve its library API and fail-closed tests; this boundary only
+    normalizes expected operational failures for the CLI.
+    """
+    if isinstance(exc, ValueError):
+        # Deliberately inspect but never retain the original text: config values
+        # can include paths or provider data, and the key itself must never be
+        # written even if an upstream implementation accidentally includes it.
+        message = str(exc).lower()
+        if "encryption key" in message:
+            reason = "backup_encryption_key_unavailable"
+        else:
+            reason = "backup_configuration_invalid"
+    elif isinstance(exc, OSError):
+        reason = "backup_storage_unavailable"
+    else:
+        reason = "backup_or_restore_verification_failed"
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "date": date,
+        "status": "blocked",
+        "reason": reason,
+        "error_type": type(exc).__name__,
+    }
 
 
 def main() -> int:
@@ -1139,7 +1530,14 @@ def main() -> int:
     parser.add_argument("--date", required=True)
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
-    result = create_snapshot(date=args.date)
+    try:
+        result = create_snapshot(date=args.date)
+    except (OSError, RuntimeError, ValueError) as exc:
+        # A nonzero exit is important: callers must not infer a passing backup
+        # from this diagnostic payload.  Do not write ``latest.json`` here;
+        # only a fully encrypted, restore-verified snapshot may replace it.
+        print(json.dumps(cli_failure_payload(args.date, exc), ensure_ascii=False))
+        return 1
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:

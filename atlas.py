@@ -28,6 +28,7 @@ BRIEFING_ROOT = ROOT / "work" / "global-briefing"
 TRADING_ROOT = ROOT / "work" / "trading-core"
 SITE_ROOT = ROOT / "src"
 BRIEFING_SETTINGS_PATH = BRIEFING_ROOT / "config" / "settings.json"
+IMPROVEMENT_TRACKING_CONFIG_PATH = BRIEFING_ROOT / "config" / "improvement_tracking.json"
 OUTPUTS_ROOT = ROOT / "outputs"
 ATLAS_RUNTIME_ROOT = ROOT / "work" / "shared" / "atlas"
 VIRTUAL_LEDGER_ROOT = ATLAS_RUNTIME_ROOT / "virtual_execution"
@@ -59,6 +60,10 @@ RELEASE_REQUIRED_STAGES = (
     "targeted_integration_tests",
     "canonical_virtual_ledger_commit",
 )
+PUBLICATION_ORCHESTRATION_SCHEMA_VERSION = 1
+PUBLICATION_BLOCKED_RETURN_CODE = 3
+PUBLICATION_NO_CANDIDATE_RETURN_CODE = 4
+PUBLICATION_ERROR_RETURN_CODE = 2
 FORBIDDEN_LEDGER_KEYS = {
     "broker_order_id",
     "broker_account",
@@ -1116,15 +1121,186 @@ def temp_order_date(path: Path, row: dict[str, Any]) -> str:
     return match.group(1) if match else ""
 
 
-def canonicalize_temp_order_intent(row: dict[str, Any], source_path: Path, order_index: int) -> dict[str, Any]:
+def is_symbolic_all_temp_quantity(value: Any) -> bool:
+    """Recognize only the exact paper-trading sentinel used by persisted order inputs."""
+    return isinstance(value, str) and value == "ALL"
+
+
+def reconcile_symbolic_all_temp_order(
+    row: dict[str, Any],
+    executed_orders_by_id: dict[str, list[dict[str, Any]]],
+) -> dict[str, Any]:
+    """Resolve a persisted ``quantity=ALL`` intent from its one executed paper trade.
+
+    The symbolic input remains the provenance-bearing source record.  Resolution is
+    deliberately limited to an already-persisted paper execution with the same stable
+    order id and the same decision/execution fields; it never infers a quantity from a
+    portfolio snapshot and never creates or replays an economic action.
+    """
+    if not is_symbolic_all_temp_quantity(row.get("quantity")):
+        raise ValueError("symbolic reconciliation requires the exact quantity sentinel 'ALL'")
+    order_id = row.get("order_id")
+    if not isinstance(order_id, str) or not order_id or order_id != order_id.strip():
+        raise ValueError("symbolic ALL quantity requires a non-empty, whitespace-stable order_id")
+    if row.get("action") != "SELL":
+        raise ValueError("symbolic ALL quantity is only valid for a SELL order")
+
+    matches = executed_orders_by_id.get(order_id, [])
+    if not matches:
+        raise ValueError(
+            f"symbolic ALL order {order_id} has no matching executed paper trade"
+        )
+    if len(matches) != 1:
+        raise ValueError(
+            f"symbolic ALL order {order_id} has {len(matches)} matching executed paper trades; "
+            "resolution is ambiguous"
+        )
+    match = matches[0]
+    executed = match["row"]
+
+    exact_fields = (
+        ("date", "date"),
+        ("account", "account"),
+        ("action", "action"),
+        ("symbol", "symbol"),
+        ("exchange", "exchange"),
+        ("market", "market_type"),
+        ("price_date", "price_date"),
+        ("prediction_id", "prediction_id"),
+        ("scenario", "scenario"),
+        ("reason", "reason"),
+        ("risk", "risk"),
+        ("source", "source"),
+    )
+    mismatches: list[str] = []
+    for intent_field, executed_field in exact_fields:
+        if intent_field not in row or executed_field not in executed:
+            mismatches.append(
+                f"{intent_field}/{executed_field} missing from intent or execution"
+            )
+        elif row[intent_field] != executed[executed_field]:
+            mismatches.append(
+                f"{intent_field} mismatch intent={row[intent_field]!r} "
+                f"execution={executed[executed_field]!r}"
+            )
+
+    account = row.get("account")
+    expected_account_id = (
+        row.get("account_id")
+        if row.get("account_id") is not None
+        else f"global-briefing-{str(account).lower()}-paper-trading"
+    )
+    if executed.get("account_id") != expected_account_id:
+        mismatches.append(
+            f"account_id mismatch intent={expected_account_id!r} "
+            f"execution={executed.get('account_id')!r}"
+        )
+
+    expected_fingerprint = stable_hash(
+        {
+            "account_id": expected_account_id,
+            "date": row.get("date"),
+            "order": {
+                key: value
+                for key, value in row.items()
+                if key
+                not in {
+                    "timestamp",
+                    "order_id",
+                    "idempotency_key",
+                    "account",
+                    "paper_account",
+                }
+            },
+        }
+    )
+    executed_fingerprint = executed.get("order_fingerprint")
+    if not isinstance(executed_fingerprint, str) or executed_fingerprint != expected_fingerprint:
+        mismatches.append(
+            f"order_fingerprint mismatch expected={expected_fingerprint!r} "
+            f"execution={executed_fingerprint!r}"
+        )
+
+    try:
+        intent_price = maybe_float(row.get("price"))
+        executed_price = maybe_float(executed.get("price"))
+    except ValueError as exc:
+        mismatches.append(f"price is not finite numeric: {exc}")
+        intent_price = executed_price = 0.0
+    else:
+        if intent_price <= 0 or executed_price <= 0 or intent_price != executed_price:
+            mismatches.append(
+                f"price mismatch intent={row.get('price')!r} execution={executed.get('price')!r}"
+            )
+
+    try:
+        quantity = maybe_float(executed.get("quantity"))
+    except ValueError as exc:
+        mismatches.append(f"executed quantity is not finite numeric: {exc}")
+        quantity = 0.0
+    if quantity <= 0:
+        mismatches.append(f"executed quantity must be positive, got {executed.get('quantity')!r}")
+
+    try:
+        executed_gross = maybe_float(executed.get("gross_value"))
+    except ValueError as exc:
+        mismatches.append(f"executed gross_value is not finite numeric: {exc}")
+        executed_gross = 0.0
+    expected_gross = executed_price * quantity
+    if not math.isclose(executed_gross, expected_gross, rel_tol=1e-12, abs_tol=1e-9):
+        mismatches.append(
+            f"gross_value mismatch execution={executed.get('gross_value')!r} "
+            f"price_times_quantity={expected_gross!r}"
+        )
+    if row.get("gross_value") is not None:
+        try:
+            intent_gross = maybe_float(row.get("gross_value"))
+        except ValueError as exc:
+            mismatches.append(f"intent gross_value is not finite numeric: {exc}")
+        else:
+            if intent_gross != executed_gross:
+                mismatches.append(
+                    f"gross_value mismatch intent={row.get('gross_value')!r} "
+                    f"execution={executed.get('gross_value')!r}"
+                )
+
+    if mismatches:
+        raise ValueError(
+            f"symbolic ALL order {order_id} does not exactly match its executed paper trade: "
+            + "; ".join(mismatches)
+        )
+    return {
+        "mode": "executed_order_id",
+        "symbolic_quantity": "ALL",
+        "resolved_quantity": quantity,
+        "matched_order_id": order_id,
+        "resolved_source_ledger": str(match["source_ledger"]),
+        "resolved_source_path": relative_path(match["path"]),
+        "resolved_source_line": int(match["line_number"]),
+        "resolved_source_hash": stable_hash(executed),
+        "resolved_order_fingerprint": executed_fingerprint,
+    }
+
+
+def canonicalize_temp_order_intent(
+    row: dict[str, Any],
+    source_path: Path,
+    order_index: int,
+    *,
+    quantity_resolution: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     identity = source_identity(source_path, order_index, row)
     event_id = ledger_event_id("ATLASORDERINTENT", identity)
     action = str(row.get("action") or row.get("side") or "HOLD").upper()
     account = str(row.get("account") or row.get("paper_account") or row.get("market_scope") or "AUTO").upper()
     date = temp_order_date(source_path, row)
-    quantity = maybe_float(row.get("quantity"))
+    quantity = maybe_float(
+        quantity_resolution["resolved_quantity"]
+        if quantity_resolution is not None
+        else row.get("quantity")
+    )
     price = maybe_float(row.get("price"))
-    return {
+    event = {
         "ledger_id": LEDGER_ID,
         "schema_version": LEDGER_SCHEMA_VERSION,
         "ledger_event_id": event_id,
@@ -1160,6 +1336,16 @@ def canonicalize_temp_order_intent(row: dict[str, Any], source_path: Path, order
         "isolated_replay": False,
         "no_real_broker_order": row.get("no_real_broker_order", True) is True,
     }
+    if quantity_resolution is not None:
+        event["quantity_resolution"] = quantity_resolution["mode"]
+        event.update(
+            {
+                key: value
+                for key, value in quantity_resolution.items()
+                if key != "mode"
+            }
+        )
+    return event
 
 
 def load_virtual_account_snapshots(*, source_errors: list[str] | None = None) -> dict[str, Any]:
@@ -1708,6 +1894,7 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
     warnings: list[str] = []
     source_errors: list[str] = []
     source_expectations: list[dict[str, Any]] = []
+    executed_orders_by_id: dict[str, list[dict[str, Any]]] = {}
     for source_ledger, path in {
         "global_briefing_paper_us": BRIEFING_ROOT / "data" / "paper_trades_us.jsonl",
         "global_briefing_paper_china": BRIEFING_ROOT / "data" / "paper_trades_china.jsonl",
@@ -1732,6 +1919,16 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
                 source_errors.extend(safety_errors)
                 continue
             events.append(canonicalize_global_paper_trade(row, path, line_number, source_ledger))
+            order_id = row.get("order_id")
+            if isinstance(order_id, str) and order_id:
+                executed_orders_by_id.setdefault(order_id, []).append(
+                    {
+                        "row": row,
+                        "path": path,
+                        "line_number": line_number,
+                        "source_ledger": source_ledger,
+                    }
+                )
 
     temp_order_dates: dict[str, list[Path]] = {}
     for path in discover_briefing_temp_files("orders"):
@@ -1750,11 +1947,34 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         if date:
             temp_order_dates.setdefault(date, []).append(path)
         for order_index, row in enumerate(rows, 1):
-            safety_errors = raw_virtual_source_safety_errors(row, path, f"order {order_index}")
+            quantity_resolution: dict[str, Any] | None = None
+            safety_payload = row
+            if is_symbolic_all_temp_quantity(row.get("quantity")):
+                try:
+                    quantity_resolution = reconcile_symbolic_all_temp_order(
+                        row, executed_orders_by_id
+                    )
+                except ValueError as exc:
+                    source_errors.append(
+                        f"{relative_path(path)}:order {order_index}: {exc}"
+                    )
+                    continue
+                safety_payload = dict(row)
+                safety_payload["quantity"] = quantity_resolution["resolved_quantity"]
+            safety_errors = raw_virtual_source_safety_errors(
+                safety_payload, path, f"order {order_index}"
+            )
             if safety_errors:
                 source_errors.extend(safety_errors)
                 continue
-            events.append(canonicalize_temp_order_intent(row, path, order_index))
+            events.append(
+                canonicalize_temp_order_intent(
+                    row,
+                    path,
+                    order_index,
+                    quantity_resolution=quantity_resolution,
+                )
+            )
     for date, paths in temp_order_dates.items():
         non_empty = [path for path in paths if load_temp_orders(path)]
         if len(non_empty) > 1:
@@ -2409,6 +2629,871 @@ def command_alerts(args: argparse.Namespace) -> int:
     return run_command(command)
 
 
+def publication_orchestration_path(date: str) -> Path:
+    """Return the independent, mutable Phase-B audit for one dated candidate.
+
+    Cycle history is deliberately immutable once it has been anchored.  Publication
+    happens only after that core audit exists, so its outcome must be recorded in a
+    separate artifact instead of rewriting a previously verified cycle record.
+    """
+    return (
+        ATLAS_RUNTIME_ROOT
+        / "publication_orchestration"
+        / f"atlas-publication-orchestration-{date}.json"
+    )
+
+
+def staged_publication_candidate_path(date: str) -> Path:
+    return (
+        ATLAS_RUNTIME_ROOT
+        / "publication_candidates"
+        / f"atlas-publication-candidate-{date}.json"
+    )
+
+
+def publication_gate_artifact_paths() -> dict[str, Path]:
+    """Keep Phase-B gate locations derived from the current runtime root.
+
+    Derivation rather than module-level paths keeps the control plane testable and
+    avoids accidentally reading a prior workspace when a caller redirects runtime
+    paths for recovery or verification.
+    """
+    return {
+        "improvements": ATLAS_RUNTIME_ROOT / "improvements" / "latest.json",
+        "self_healing": ATLAS_RUNTIME_ROOT / "self_healing" / "latest.json",
+        "alerts": ATLAS_RUNTIME_ROOT / "alerts" / "latest.json",
+        "backup": ATLAS_RUNTIME_ROOT / "backups" / "latest.json",
+    }
+
+
+def _publication_artifact_metadata(path: Path, payload: dict[str, Any] | None) -> dict[str, Any]:
+    metadata: dict[str, Any] = {
+        "path": relative_path(path),
+        "present": path.is_file(),
+        "sha256": None,
+        "date": payload.get("date") if isinstance(payload, dict) else None,
+    }
+    if path.is_file():
+        try:
+            metadata["sha256"] = file_sha256(path)
+        except OSError:
+            metadata["sha256"] = None
+    return metadata
+
+
+def _load_publication_artifact(path: Path, label: str) -> tuple[dict[str, Any] | None, str | None]:
+    if not path.is_file():
+        return None, f"{label} artifact is missing: {relative_path(path)}"
+    try:
+        payload = read_json_file(path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return None, f"{label} artifact is unreadable: {type(exc).__name__}"
+    if not isinstance(payload, dict):
+        return None, f"{label} artifact must be a JSON object"
+    return payload, None
+
+
+def _gate_count(
+    payload: dict[str, Any],
+    *,
+    field: str,
+    label: str,
+    errors: list[str],
+) -> int | None:
+    value = payload.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        errors.append(f"{label}.{field} must be a non-negative integer")
+        return None
+    return value
+
+
+def publication_backup_bootstrap_readiness(
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    """Check whether improvement verification can trust the existing backup.
+
+    Improvement verification intentionally runs before the *final* publication
+    backup.  When the previous backup is older than policy (a common weekend
+    case), that creates a dependency cycle: improvements block because no fresh
+    backup exists, while the final backup cannot be bound to passing improvement
+    evidence.  A provisional, restore-verified backup breaks that cycle.  It is
+    never publication evidence itself; the normal final backup still runs after
+    improvements, healing, and alerts and binds their exact bytes.
+    """
+    reasons: list[str] = []
+    evidence: dict[str, Any] = {
+        "config_path": relative_path(IMPROVEMENT_TRACKING_CONFIG_PATH),
+        "backup_path": relative_path(publication_gate_artifact_paths()["backup"]),
+    }
+    try:
+        config_payload = read_json_file(IMPROVEMENT_TRACKING_CONFIG_PATH, default={})
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "ready": False,
+            "reasons": [f"backup bootstrap configuration is unreadable: {type(exc).__name__}"],
+            "evidence": evidence,
+        }
+    recovery = (
+        config_payload.get("disaster_recovery", {})
+        if isinstance(config_payload, dict)
+        else {}
+    )
+    if not isinstance(recovery, dict) or recovery.get("enabled") is not True:
+        reasons.append("disaster recovery is not enabled")
+        recovery = {}
+    try:
+        maximum_age_hours = float(recovery.get("maximum_backup_age_hours") or 24)
+    except (TypeError, ValueError):
+        maximum_age_hours = 24.0
+        reasons.append("maximum backup age is invalid")
+    if not math.isfinite(maximum_age_hours) or maximum_age_hours <= 0:
+        maximum_age_hours = 24.0
+        reasons.append("maximum backup age is invalid")
+    evidence["maximum_age_hours"] = maximum_age_hours
+
+    backup_path = publication_gate_artifact_paths()["backup"]
+    try:
+        backup = read_json_file(backup_path, default={})
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        return {
+            "ready": False,
+            "reasons": [f"existing backup metadata is unreadable: {type(exc).__name__}"],
+            "evidence": evidence,
+        }
+    if not isinstance(backup, dict):
+        backup = {}
+        reasons.append("existing backup metadata is not a JSON object")
+    requirements = {
+        "schema_version": 4,
+        "verified": True,
+        "encrypted": True,
+        "encryption_algorithm": "AES-256-GCM",
+        "encrypted_container_authenticated": True,
+        "archive_integrity_verified": True,
+        "restore_verified": True,
+        "restore_scope": "configured_workspace_files_and_git_bundles",
+        "target_outside_workspace": True,
+    }
+    failed_fields = [
+        name for name, expected in requirements.items() if backup.get(name) != expected
+    ]
+    if failed_fields:
+        reasons.append("existing backup lacks required controls: " + ", ".join(failed_fields))
+
+    authentication = backup.get("metadata_authentication")
+    if (
+        not isinstance(authentication, dict)
+        or authentication.get("algorithm") != "HMAC-SHA256"
+        or not re.fullmatch(r"[0-9a-f]{16}", str(authentication.get("key_id") or ""))
+        or not re.fullmatch(r"[0-9a-f]{64}", str(authentication.get("value") or ""))
+    ):
+        reasons.append("existing backup metadata authentication is missing or malformed")
+
+    created_at = backup.get("created_at")
+    age_hours: float | None = None
+    try:
+        created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            raise ValueError("backup timestamp lacks timezone")
+        age_hours = (
+            ((now or datetime.now(UTC)).astimezone(UTC) - created.astimezone(UTC)).total_seconds()
+            / 3600
+        )
+    except (TypeError, ValueError):
+        reasons.append("existing backup timestamp is invalid")
+    else:
+        if age_hours < 0 or age_hours > maximum_age_hours:
+            reasons.append("existing backup is outside the configured freshness window")
+    evidence["age_hours"] = age_hours
+
+    archive_value = backup.get("archive")
+    archive_path = Path(str(archive_value)) if isinstance(archive_value, str) else Path()
+    archive_hash = str(backup.get("archive_sha256") or "")
+    archive_ok = False
+    if not archive_path.is_absolute() or not archive_path.is_file():
+        reasons.append("existing external backup archive is missing")
+    else:
+        try:
+            archive_path.resolve().relative_to(ROOT.resolve())
+        except ValueError:
+            try:
+                archive_ok = (
+                    bool(re.fullmatch(r"[0-9a-f]{64}", archive_hash))
+                    and file_sha256(archive_path) == archive_hash
+                )
+            except OSError:
+                archive_ok = False
+        if not archive_ok:
+            reasons.append("existing external backup archive hash is invalid")
+    evidence["archive_present"] = archive_path.is_file() if archive_path.is_absolute() else False
+    evidence["archive_hash_verified"] = archive_ok
+    evidence["date"] = backup.get("date")
+    return {
+        "ready": not reasons,
+        "reasons": list(dict.fromkeys(reasons)),
+        "evidence": evidence,
+    }
+
+
+def publication_gate_artifact_readiness(date: str) -> dict[str, Any]:
+    """Perform a conservative local preflight before the authoritative site retry.
+
+    The site synchronizer remains the sole authority for candidate fingerprint and
+    backup-content binding.  This preflight exists to avoid asking it to freeze when
+    an obvious dated gate is absent, malformed, or still blocking, while retaining
+    clear operational diagnostics for each independent control plane.
+    """
+    paths = publication_gate_artifact_paths()
+    blockers: list[str] = []
+    errors: list[str] = []
+    checks: dict[str, dict[str, Any]] = {}
+
+    def load(name: str) -> dict[str, Any] | None:
+        payload, error = _load_publication_artifact(paths[name], name)
+        check = {
+            "artifact": _publication_artifact_metadata(paths[name], payload),
+            "ready": False,
+            "blockers": [],
+            "errors": [],
+        }
+        checks[name] = check
+        if error:
+            check["errors"].append(error)
+            errors.append(error)
+            return None
+        assert payload is not None
+        if payload.get("date") != date:
+            reason = f"{name} artifact is not date-aligned"
+            check["blockers"].append(reason)
+            blockers.append(reason)
+        return payload
+
+    improvements = load("improvements")
+    if improvements is not None:
+        check = checks["improvements"]
+        counts = improvements.get("counts")
+        if not isinstance(counts, dict):
+            reason = "improvements.counts must be a JSON object"
+            check["errors"].append(reason)
+            errors.append(reason)
+        else:
+            count_errors: list[str] = []
+            blocking_count = _gate_count(
+                counts,
+                field="blocking",
+                label="improvements.counts",
+                errors=count_errors,
+            )
+            for reason in count_errors:
+                check["errors"].append(reason)
+                errors.append(reason)
+            if blocking_count is not None and blocking_count != 0:
+                reason = "date-aligned improvement verification is blocking"
+                check["blockers"].append(reason)
+                blockers.append(reason)
+
+    healing = load("self_healing")
+    if healing is not None:
+        check = checks["self_healing"]
+        counts = healing.get("counts")
+        if not isinstance(counts, dict):
+            reason = "self_healing.counts must be a JSON object"
+            check["errors"].append(reason)
+            errors.append(reason)
+        else:
+            count_errors: list[str] = []
+            observed_counts = {
+                field: _gate_count(
+                    counts,
+                    field=field,
+                    label="self_healing.counts",
+                    errors=count_errors,
+                )
+                for field in ("blocking", "failed", "unresolved")
+            }
+            for reason in count_errors:
+                check["errors"].append(reason)
+                errors.append(reason)
+            if any(value not in {None, 0} for value in observed_counts.values()):
+                reason = "date-aligned deep self-healing is blocking"
+                check["blockers"].append(reason)
+                blockers.append(reason)
+        if healing.get("deep") is not True or healing.get("strict") is not True:
+            reason = "date-aligned self-healing was not run with deep and strict gates"
+            check["blockers"].append(reason)
+            blockers.append(reason)
+        if healing.get("overall_status") != "healthy":
+            reason = "date-aligned deep self-healing is not healthy"
+            check["blockers"].append(reason)
+            blockers.append(reason)
+        healing_checks = healing.get("checks")
+        if not isinstance(healing_checks, list):
+            reason = "self_healing.checks must be a JSON array"
+            check["errors"].append(reason)
+            errors.append(reason)
+        else:
+            check_index: dict[str, dict[str, Any]] = {}
+            malformed = False
+            for item in healing_checks:
+                if not isinstance(item, dict):
+                    malformed = True
+                    continue
+                check_id = str(item.get("check_id") or "")
+                if check_id:
+                    check_index[check_id] = item
+            if malformed:
+                reason = "self_healing.checks contains a non-object entry"
+                check["errors"].append(reason)
+                errors.append(reason)
+            for check_id in ("briefing_tests", "site_quality"):
+                item = check_index.get(check_id)
+                if item is None or item.get("executed") is not True or item.get("passed") is not True:
+                    reason = f"date-aligned self-healing required check did not pass: {check_id}"
+                    check["blockers"].append(reason)
+                    blockers.append(reason)
+            failed_checks = sorted(
+                check_id
+                for check_id, item in check_index.items()
+                if item.get("executed") is not True or item.get("passed") is not True
+            )
+            if failed_checks:
+                reason = "date-aligned self-healing checks did not pass: " + ", ".join(failed_checks)
+                check["blockers"].append(reason)
+                blockers.append(reason)
+
+    alerts = load("alerts")
+    if alerts is not None:
+        check = checks["alerts"]
+        if alerts.get("status") != "healthy":
+            reason = "date-aligned alerts are missing or still require attention"
+            check["blockers"].append(reason)
+            blockers.append(reason)
+
+    backup = load("backup")
+    if backup is not None:
+        check = checks["backup"]
+        backup_requirements = {
+            "schema_version": 4,
+            "verified": True,
+            "encrypted": True,
+            "encryption_algorithm": "AES-256-GCM",
+            "encrypted_container_authenticated": True,
+            "archive_integrity_verified": True,
+            "restore_verified": True,
+            "restore_scope": "configured_workspace_files_and_git_bundles",
+            "target_outside_workspace": True,
+        }
+        failed_requirements = [
+            name for name, expected in backup_requirements.items() if backup.get(name) != expected
+        ]
+        if failed_requirements:
+            reason = (
+                "date-aligned encrypted external backup and restore verification did not pass: "
+                + ", ".join(failed_requirements)
+            )
+            check["blockers"].append(reason)
+            blockers.append(reason)
+
+    for check in checks.values():
+        check["ready"] = not check["blockers"] and not check["errors"]
+    return {
+        "ready": not blockers and not errors,
+        "blockers": list(dict.fromkeys(blockers)),
+        "errors": list(dict.fromkeys(errors)),
+        "checks": checks,
+    }
+
+
+def publication_core_cycle_readiness(date: str) -> dict[str, Any]:
+    """Require an anchored, passed Phase-A audit before Phase-B can mutate site data."""
+    audit_path = RUN_AUDIT_ROOT / f"atlas-cycle-{date}.json"
+    blockers: list[str] = []
+    errors: list[str] = []
+    audit, load_error = _load_publication_artifact(audit_path, "cycle audit")
+    evidence: dict[str, Any] = {
+        "audit": _publication_artifact_metadata(audit_path, audit),
+        "history": None,
+    }
+    if load_error:
+        # Absence means Phase A has not completed, whereas unreadable data is an
+        # integrity failure and must never be treated as an ordinary retry state.
+        if not audit_path.exists():
+            blockers.append("date-aligned core cycle audit has not been written")
+        else:
+            errors.append(load_error)
+        return {"ready": False, "blockers": blockers, "errors": errors, "evidence": evidence}
+    assert audit is not None
+    if audit.get("date") != date:
+        errors.append("cycle audit date does not match requested publication date")
+    stages = audit.get("stages")
+    if not isinstance(stages, list):
+        errors.append("cycle audit stages must be a JSON array")
+    elif not required_cycle_stages_passed(
+        [item for item in stages if isinstance(item, dict)]
+    ):
+        blockers.append("date-aligned core cycle required stages did not pass")
+    if audit.get("operational_gate_passed") is not True:
+        blockers.append("date-aligned core cycle operational gate did not pass")
+    ledger = audit.get("ledger")
+    if not isinstance(ledger, dict):
+        errors.append("cycle audit ledger evidence must be a JSON object")
+    elif ledger.get("write_performed") is not True:
+        blockers.append("date-aligned core cycle canonical ledger commit was not performed")
+
+    run_id = audit.get("run_id")
+    if not isinstance(run_id, str) or not run_id:
+        errors.append("cycle audit run_id is missing")
+    else:
+        history_root = RUN_AUDIT_ROOT / "history" / date
+        history_path = history_root / f"{run_id}.json"
+        evidence["history"] = {"path": relative_path(history_path), "present": history_path.is_file()}
+        if not history_path.is_file():
+            errors.append("anchored cycle history record is missing")
+        else:
+            try:
+                history_integrity = audit_cycle_history(history_root)
+            except Exception as exc:
+                errors.append(f"cycle history verification raised {type(exc).__name__}")
+            else:
+                evidence["history"]["integrity_passed"] = history_integrity.get("passed") is True
+                evidence["history"]["anchor_path"] = history_integrity.get("anchor_path")
+                if history_integrity.get("passed") is not True:
+                    errors.append("cycle history integrity verification failed")
+            try:
+                audit_hash = file_sha256(audit_path)
+                history_hash = file_sha256(history_path)
+            except OSError as exc:
+                errors.append(f"cannot hash core cycle audit history: {type(exc).__name__}")
+            else:
+                evidence["history"]["audit_sha256"] = audit_hash
+                evidence["history"]["record_sha256"] = history_hash
+                if audit_hash != history_hash:
+                    errors.append("cycle audit differs from its anchored history record")
+    return {
+        "ready": not blockers and not errors,
+        "blockers": list(dict.fromkeys(blockers)),
+        "errors": list(dict.fromkeys(errors)),
+        "evidence": evidence,
+    }
+
+
+def publication_staged_candidate_readiness(date: str) -> dict[str, Any]:
+    """Require an immutable staged candidate; Phase B must never rebuild Phase A."""
+    path = staged_publication_candidate_path(date)
+    payload, load_error = _load_publication_artifact(path, "staged publication candidate")
+    state_path = BRIEFING_ROOT / "data" / "site-sync-state.json"
+    state, state_error = _load_publication_artifact(state_path, "site sync state")
+    evidence = {
+        "candidate": _publication_artifact_metadata(path, payload),
+        "site_sync_state": _publication_artifact_metadata(state_path, state),
+    }
+    if load_error:
+        if not path.exists():
+            return {
+                "ready": False,
+                "returncode": PUBLICATION_NO_CANDIDATE_RETURN_CODE,
+                "reason": "no staged publication candidate exists for the requested date",
+                "evidence": evidence,
+            }
+        return {
+            "ready": False,
+            "returncode": PUBLICATION_ERROR_RETURN_CODE,
+            "reason": load_error,
+            "evidence": evidence,
+        }
+    assert payload is not None
+    if state_error:
+        if not state_path.exists():
+            return {
+                "ready": False,
+                "returncode": PUBLICATION_NO_CANDIDATE_RETURN_CODE,
+                "reason": "no active staged publication candidate is recorded in site sync state",
+                "evidence": evidence,
+            }
+        return {
+            "ready": False,
+            "returncode": PUBLICATION_ERROR_RETURN_CODE,
+            "reason": state_error,
+            "evidence": evidence,
+        }
+    assert state is not None
+    if payload.get("date") != date:
+        return {
+            "ready": False,
+            "returncode": PUBLICATION_NO_CANDIDATE_RETURN_CODE,
+            "reason": "staged publication candidate is not date-aligned",
+            "evidence": evidence,
+        }
+    if state.get("staged_date") != date:
+        return {
+            "ready": False,
+            "returncode": PUBLICATION_NO_CANDIDATE_RETURN_CODE,
+            "reason": "site sync state does not select the requested staged candidate",
+            "evidence": evidence,
+        }
+    try:
+        selected_path = Path(str(state.get("staged_path") or "")).resolve()
+    except OSError:
+        selected_path = None
+    if selected_path != path.resolve():
+        return {
+            "ready": False,
+            "returncode": PUBLICATION_BLOCKED_RETURN_CODE,
+            "reason": "site sync state staged candidate path is not canonical",
+            "evidence": evidence,
+        }
+    # Older candidates predate the explicit status field. They remain eligible for
+    # the site authority's full hash/fingerprint re-attestation, while any explicit
+    # non-retryable status stays fail-closed here.
+    if state.get("staged_status") not in {None, "staged", "blocked"}:
+        return {
+            "ready": False,
+            "returncode": PUBLICATION_BLOCKED_RETURN_CODE,
+            "reason": "site sync state staged candidate is not retryable",
+            "evidence": evidence,
+        }
+    return {"ready": True, "returncode": 0, "reason": None, "evidence": evidence}
+
+
+def command_retry_staged_publication(date: str) -> int:
+    """Ask the site control plane to re-attest one already-staged candidate only."""
+    return run_command(
+        [
+            sys.executable,
+            str(BRIEFING_ROOT / "scripts" / "sync_briefing_site.py"),
+            "--retry-staged-candidate",
+            "--date",
+            date,
+        ]
+    )
+
+
+def _publication_stage_status(returncode: int | None, check: dict[str, Any]) -> str:
+    if check.get("errors"):
+        return "error"
+    if check.get("blockers"):
+        return "blocked"
+    return "passed" if returncode == 0 else "error"
+
+
+def _write_publication_orchestration_checkpoint(result: dict[str, Any]) -> None:
+    result["updated_at"] = utc_now()
+    atomic_write_json(publication_orchestration_path(str(result["date"])), result)
+
+
+def run_post_gate_publication(
+    date: str,
+    *,
+    initiated_by: str,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    """Run the closed-loop Phase-B publisher without rerunning research or trading.
+
+    This intentionally invokes only the independent evidence controls and the site
+    retry for an existing candidate.  It does not invoke ``sync``, report creation,
+    forecasting, paper-order generation, pricing, or portfolio valuation.
+    """
+    result: dict[str, Any] = {
+        "schema_version": PUBLICATION_ORCHESTRATION_SCHEMA_VERSION,
+        "date": date,
+        "started_at": utc_now(),
+        "finished_at": None,
+        "initiated_by": initiated_by,
+        "dry_run": dry_run,
+        "phase_a_reexecuted": False,
+        "forbidden_phase_a_operations": [
+            "report generation",
+            "forecast generation",
+            "paper order generation",
+            "market valuation",
+        ],
+        "status": "running",
+        "returncode": None,
+        "core_cycle": {},
+        "candidate": {},
+        "backup_bootstrap": {
+            "required": False,
+            "attempted": False,
+            "returncode": None,
+            "status": "not_evaluated",
+        },
+        "stages": [],
+        "publication_retry": {"attempted": False, "returncode": None},
+        "blocking_reasons": [],
+        "errors": [],
+    }
+    _write_publication_orchestration_checkpoint(result)
+
+    core = publication_core_cycle_readiness(date)
+    result["core_cycle"] = core
+    if core["errors"]:
+        result["status"] = "error"
+        result["returncode"] = PUBLICATION_ERROR_RETURN_CODE
+        result["errors"].extend(core["errors"])
+    elif core["blockers"]:
+        result["status"] = "blocked"
+        result["returncode"] = PUBLICATION_BLOCKED_RETURN_CODE
+        result["blocking_reasons"].extend(core["blockers"])
+    else:
+        candidate = publication_staged_candidate_readiness(date)
+        result["candidate"] = candidate
+        if candidate["ready"] is not True:
+            result["status"] = "no_candidate" if candidate["returncode"] == PUBLICATION_NO_CANDIDATE_RETURN_CODE else (
+                "blocked" if candidate["returncode"] == PUBLICATION_BLOCKED_RETURN_CODE else "error"
+            )
+            result["returncode"] = candidate["returncode"]
+            target = "blocking_reasons" if result["status"] in {"no_candidate", "blocked"} else "errors"
+            result[target].append(str(candidate["reason"]))
+        elif dry_run:
+            # A dry run must not synthesize alert, backup, or recovery evidence.
+            result["status"] = "dry_run"
+            result["returncode"] = 0
+        else:
+            bootstrap_preflight = publication_backup_bootstrap_readiness()
+            bootstrap = {
+                "required": bootstrap_preflight["ready"] is not True,
+                "attempted": False,
+                "returncode": None,
+                "status": "not_required" if bootstrap_preflight["ready"] is True else "pending",
+                "preflight": bootstrap_preflight,
+                "final_publication_evidence": False,
+            }
+            result["backup_bootstrap"] = bootstrap
+            if bootstrap["required"]:
+                bootstrap["attempted"] = True
+                try:
+                    bootstrap_returncode = int(
+                        command_backup(argparse.Namespace(date=date, json=False))
+                    )
+                    bootstrap_exception = None
+                except Exception as exc:
+                    bootstrap_returncode = None
+                    bootstrap_exception = type(exc).__name__
+                bootstrap["returncode"] = bootstrap_returncode
+                bootstrap["exception"] = bootstrap_exception
+                bootstrap["status"] = (
+                    "passed"
+                    if bootstrap_returncode == 0 and bootstrap_exception is None
+                    else "failed"
+                )
+                result["stages"].append(
+                    {
+                        "name": "backup_bootstrap",
+                        "returncode": bootstrap_returncode,
+                        "exception": bootstrap_exception,
+                        "status": bootstrap["status"],
+                        "final_publication_evidence": False,
+                    }
+                )
+                _write_publication_orchestration_checkpoint(result)
+
+            commands: list[tuple[str, Any, argparse.Namespace]] = [
+                (
+                    "improvements",
+                    command_improvements,
+                    argparse.Namespace(
+                        date=date,
+                        apply_safe=True,
+                        strict=True,
+                        status=False,
+                        json=False,
+                    ),
+                ),
+                (
+                    "self_healing",
+                    command_heal,
+                    argparse.Namespace(
+                        date=date,
+                        apply_safe=True,
+                        deep=True,
+                        strict=True,
+                        status=False,
+                        json=False,
+                    ),
+                ),
+                (
+                    "alerts",
+                    command_alerts,
+                    argparse.Namespace(
+                        date=date,
+                        process_due=False,
+                        alert_id=None,
+                        json=False,
+                        ack_by=None,
+                        retry=False,
+                        receipt_destination=None,
+                        receipt_id=None,
+                    ),
+                ),
+                (
+                    "backup",
+                    command_backup,
+                    argparse.Namespace(date=date, json=False),
+                ),
+            ]
+            for name, command, command_args in commands:
+                try:
+                    returncode = int(command(command_args))
+                    exception = None
+                except Exception as exc:
+                    returncode = None
+                    # Phase-B audits are retained with backups. Persist only the
+                    # exception class so an adapter cannot leak endpoint tokens or
+                    # other command text through a durable control artifact.
+                    exception = type(exc).__name__
+                stage = {
+                    "name": name,
+                    "returncode": returncode,
+                    "exception": exception,
+                    "status": "completed" if returncode == 0 else "failed",
+                }
+                result["stages"].append(stage)
+                _write_publication_orchestration_checkpoint(result)
+
+            artifact_gates = publication_gate_artifact_readiness(date)
+            result["artifact_gates"] = artifact_gates
+            stage_checks = artifact_gates["checks"]
+            command_error = False
+            for stage in result["stages"]:
+                if stage["name"] == "backup_bootstrap":
+                    # This archive only makes the disaster-recovery capability
+                    # observable to improvement verification.  It is never used
+                    # as the final publication gate; the later backup stage must
+                    # contain the exact final improvement/healing/alert bytes.
+                    continue
+                check = stage_checks[stage["name"]]
+                stage["gate"] = {
+                    "ready": check["ready"],
+                    "blockers": check["blockers"],
+                    "errors": check["errors"],
+                    "artifact": check["artifact"],
+                }
+                stage["status"] = _publication_stage_status(stage["returncode"], check)
+                if stage["exception"] is not None:
+                    stage["status"] = "error"
+                    command_error = True
+                    result["errors"].append(
+                        f"{stage['name']} control command raised {stage['exception'].split(':', 1)[0]}"
+                    )
+                elif stage["returncode"] == COMMAND_TIMEOUT_RETURN_CODE:
+                    stage["status"] = "error"
+                    command_error = True
+                    result["errors"].append(f"{stage['name']} control command timed out")
+                elif (
+                    stage["returncode"] != 0
+                    and stage["status"] == "blocked"
+                    and check["artifact"].get("date") != date
+                ):
+                    # A strict control may return 1 for a current, evidenced gate
+                    # block. It must not turn an unavailable/old artifact into a
+                    # misleading ordinary publication block.
+                    stage["status"] = "error"
+                    command_error = True
+                    result["errors"].append(
+                        f"{stage['name']} control command failed without a date-aligned artifact"
+                    )
+                # A command that reports failure despite producing a seemingly good
+                # artifact is never promoted. Its unknown failure is infrastructure,
+                # not a pass inferred from stale bytes.
+                if stage["returncode"] != 0 and stage["status"] != "blocked":
+                    command_error = True
+                    result["errors"].append(
+                        f"{stage['name']} control command failed with returncode {stage['returncode']}"
+                    )
+            result["blocking_reasons"].extend(artifact_gates["blockers"])
+            result["errors"].extend(artifact_gates["errors"])
+            if result["errors"] or command_error:
+                result["status"] = "error"
+                result["returncode"] = PUBLICATION_ERROR_RETURN_CODE
+            elif result["blocking_reasons"]:
+                result["status"] = "blocked"
+                result["returncode"] = PUBLICATION_BLOCKED_RETURN_CODE
+            else:
+                retry_returncode = command_retry_staged_publication(date)
+                result["publication_retry"] = {
+                    "attempted": True,
+                    "returncode": retry_returncode,
+                    "command": "retry_staged_candidate",
+                }
+                result["stages"].append(
+                    {
+                        "name": "retry_staged_candidate",
+                        "returncode": retry_returncode,
+                        "status": "passed" if retry_returncode == 0 else "blocked"
+                        if retry_returncode in {
+                            PUBLICATION_BLOCKED_RETURN_CODE,
+                            PUBLICATION_NO_CANDIDATE_RETURN_CODE,
+                        }
+                        else "error",
+                    }
+                )
+                if retry_returncode == 0:
+                    # The retry freezes or reuses a frozen payload. It never claims
+                    # that an external deployment has already gone live.
+                    result["status"] = "frozen_or_pending_deployment"
+                    result["returncode"] = 0
+                elif retry_returncode == PUBLICATION_BLOCKED_RETURN_CODE:
+                    result["status"] = "blocked"
+                    result["returncode"] = retry_returncode
+                    result["blocking_reasons"].append(
+                        "authoritative staged-candidate re-attestation is still blocking"
+                    )
+                elif retry_returncode == PUBLICATION_NO_CANDIDATE_RETURN_CODE:
+                    result["status"] = "no_candidate"
+                    result["returncode"] = retry_returncode
+                    result["blocking_reasons"].append(
+                        "authoritative staged-candidate retry found no valid candidate"
+                    )
+                else:
+                    result["status"] = "error"
+                    result["returncode"] = PUBLICATION_ERROR_RETURN_CODE
+                    result["errors"].append(
+                        f"authoritative staged-candidate retry failed with returncode {retry_returncode}"
+                    )
+
+    result["blocking_reasons"] = list(dict.fromkeys(result["blocking_reasons"]))
+    result["errors"] = list(dict.fromkeys(result["errors"]))
+    result["finished_at"] = utc_now()
+    result["audit_path"] = str(publication_orchestration_path(date))
+    _write_publication_orchestration_checkpoint(result)
+    return result
+
+
+def command_publish(args: argparse.Namespace) -> int:
+    """Run only Phase B against immutable Phase-A outputs and a staged candidate."""
+    try:
+        date = args.date or latest_report()[0]
+    except FileNotFoundError as exc:
+        print(str(exc), file=sys.stderr)
+        return PUBLICATION_ERROR_RETURN_CODE
+    try:
+        with cycle_lock(f"publish-{date}"):
+            result = run_post_gate_publication(
+                date,
+                initiated_by="atlas publish",
+                dry_run=bool(getattr(args, "dry_run", False)),
+            )
+    except RuntimeError as exc:
+        print(str(exc), file=sys.stderr)
+        return PUBLICATION_ERROR_RETURN_CODE
+    except Exception as exc:
+        print(
+            json.dumps(
+                {
+                    "status": "error",
+                    "date": date,
+                    "error": f"publication orchestration raised {type(exc).__name__}",
+                },
+                ensure_ascii=False,
+            ),
+            file=sys.stderr,
+        )
+        return PUBLICATION_ERROR_RETURN_CODE
+    print(json.dumps(result, ensure_ascii=False, indent=2))
+    return int(result["returncode"])
+
+
 def process_is_running(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -2655,6 +3740,12 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
     fingerprint_before = build_cycle_fingerprint(date)
     stages: list[dict[str, Any]] = []
     blocking: list[str] = []
+    # The CLI defaults to the automatic closed loop.  Programmatic legacy callers
+    # that construct an older Namespace without this field fail closed by skipping
+    # Phase B rather than unexpectedly creating alerts or external backups.
+    skip_publication = bool(getattr(args, "skip_publication", True))
+    publication_requested = bool(not args.dry_run and not skip_publication)
+    publication_audit = publication_orchestration_path(date)
 
     try:
         checks = doctor_checks()
@@ -2850,6 +3941,8 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         "skip_trading_core": bool(args.skip_trading_core),
         "force_site": bool(args.force_site),
         "full_tests": full_tests_requested,
+        "skip_publication": skip_publication,
+        "post_gate_publication_requested": publication_requested,
     }
     idempotency_key = stable_hash(
         {
@@ -2910,6 +4003,20 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
             "required_stages_passed": release_required_stages_passed,
         },
         "research_promotion_passed": research_promotion_passed,
+        "publication": {
+            "requested": publication_requested,
+            "status": (
+                "awaiting_post_audit_orchestration"
+                if publication_requested
+                else "not_requested_or_dry_run"
+            ),
+            "separate_audit_path": str(publication_audit),
+            "phase_a_reexecuted": False,
+            "contract": (
+                "Post-gate publication is recorded separately so the anchored core "
+                "cycle audit is never rewritten after backup and candidate binding."
+            ),
+        },
         "blocking_reasons": blocking,
         "stages": stages,
         "fingerprint_before": fingerprint_before,
@@ -3037,8 +4144,72 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
                 "operational_gate_passed": audit_payload["operational_gate_passed"],
                 "release_candidate_passed": audit_payload["release_candidate_passed"],
                 "blocking_reasons": audit_payload["blocking_reasons"],
+                "publication": {
+                    "requested": publication_requested,
+                    "status": audit_payload["publication"]["status"],
+                    "returncode": None,
+                    "audit_path": str(publication_audit),
+                    "phase_a_reexecuted": False,
+                },
             },
         )
+
+    publication_result: dict[str, Any] = {
+        "status": "not_requested",
+        "returncode": None,
+        "audit_path": str(publication_audit),
+        "phase_a_reexecuted": False,
+    }
+    if args.dry_run:
+        publication_result["status"] = "skipped_dry_run"
+    elif not publication_requested:
+        publication_result["status"] = "skipped_by_flag"
+    elif not history_committed:
+        publication_result["status"] = "not_attempted_core_audit_unavailable"
+        publication_result["returncode"] = PUBLICATION_ERROR_RETURN_CODE
+    elif not operational_gate_passed:
+        # Keep the core cycle result authoritative: Phase B cannot repair or hide
+        # a failed Phase A run, and it must not manufacture later control artifacts.
+        publication_result["status"] = "not_attempted_core_cycle_blocked"
+        publication_result["returncode"] = PUBLICATION_BLOCKED_RETURN_CODE
+    else:
+        try:
+            publication_result = run_post_gate_publication(
+                date,
+                initiated_by="atlas cycle",
+            )
+        except Exception as exc:
+            publication_result = {
+                "schema_version": PUBLICATION_ORCHESTRATION_SCHEMA_VERSION,
+                "date": date,
+                "initiated_by": "atlas cycle",
+                "phase_a_reexecuted": False,
+                "status": "error",
+                "returncode": PUBLICATION_ERROR_RETURN_CODE,
+                "blocking_reasons": [],
+                "errors": [f"publication orchestration raised {type(exc).__name__}"],
+                "audit_path": str(publication_audit),
+                "started_at": utc_now(),
+                "finished_at": utc_now(),
+            }
+            try:
+                atomic_write_json(publication_audit, publication_result)
+            except OSError:
+                pass
+
+    if history_committed:
+        state = read_json_file(CYCLE_STATE_PATH, default={})
+        if not isinstance(state, dict):
+            state = {}
+        state["publication"] = {
+            "requested": publication_requested,
+            "status": publication_result.get("status"),
+            "returncode": publication_result.get("returncode"),
+            "audit_path": publication_result.get("audit_path", str(publication_audit)),
+            "phase_a_reexecuted": False,
+            "updated_at": utc_now(),
+        }
+        atomic_write_json(CYCLE_STATE_PATH, state)
 
     summary = {
         "cycle_id": cycle_id,
@@ -3050,9 +4221,23 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         "run_audit": str(audit_json_path) if history_committed else None,
         "run_history": str(history_json_path) if history_committed else None,
         "idempotent_replay": idempotent_replay,
+        "publication": publication_result,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
-    return 0 if audit_payload["overall_passed"] else 1
+    core_returncode = 0 if audit_payload["overall_passed"] else 1
+    if core_returncode != 0:
+        return core_returncode
+    if publication_requested:
+        publication_returncode = publication_result.get("returncode")
+        if isinstance(publication_returncode, int) and not isinstance(
+            publication_returncode, bool
+        ):
+            return publication_returncode
+        # A requested Phase B without a concrete result is not a successful
+        # top-level cycle.  Fail closed so schedulers cannot mistake a missing
+        # publication verdict for a completed website hand-off.
+        return PUBLICATION_ERROR_RETURN_CODE
+    return 0
 
 
 def npm_command() -> str:
@@ -3184,6 +4369,22 @@ def build_parser() -> argparse.ArgumentParser:
     )
     alerts.set_defaults(handler=command_alerts)
 
+    publish = subparsers.add_parser(
+        "publish",
+        help="Run the post-gate Phase-B publication retry for an already staged candidate.",
+    )
+    publish.add_argument(
+        "--date",
+        type=valid_iso_date,
+        help="Publication date; defaults to the newest dated report.",
+    )
+    publish.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Verify the anchored Phase-A audit and staged candidate without creating gate evidence.",
+    )
+    publish.set_defaults(handler=command_publish)
+
     cycle = subparsers.add_parser("cycle", help="Run the gated ATLAS virtual trading/evolution cycle.")
     cycle.add_argument("--date", type=valid_iso_date, help="Cycle date; defaults to the newest dated report.")
     cycle.add_argument("--dry-run", action="store_true", help="Validate the cycle without writing cycle/ledger artifacts.")
@@ -3194,6 +4395,14 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--skip-site", action="store_true", help="Skip site tests inside the continuous test gate.")
     cycle.add_argument("--skip-trading-core", action="store_true", help="Skip trading-core tests inside the continuous test gate.")
     cycle.add_argument("--full-tests", action="store_true", help="Run the complete regression suite and record release-candidate evidence.")
+    cycle.add_argument(
+        "--skip-publication",
+        action="store_true",
+        help=(
+            "Do not run the post-audit Phase-B gate sequence and staged-candidate retry. "
+            "The default non-dry-run cycle performs it without rerunning Phase A."
+        ),
+    )
     cycle.set_defaults(handler=command_cycle)
 
     tests = subparsers.add_parser("test", help="Run the cross-project integration test suite.")

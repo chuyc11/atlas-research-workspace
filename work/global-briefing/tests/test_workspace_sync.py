@@ -54,6 +54,65 @@ def candidate_fingerprint(
     )
 
 
+def write_staged_candidate_fixture(
+    *,
+    output_root: Path,
+    candidate_root: Path,
+    report_date: str,
+    raw_report: bytes = b"staged report",
+) -> tuple[Path, Path, dict, dict, str]:
+    """Create a material-valid staged record without invoking Phase A."""
+    report_path = output_root / f"每日全球晨间简报-{report_date}.md"
+    report_path.write_bytes(raw_report)
+    content_hash = SITE_SYNC.site_input_hash(raw_report, report_date)
+    payload = {
+        "schemaVersion": SITE_SYNC.SITE_SCHEMA_VERSION,
+        "reportDate": report_date,
+        "contentHash": content_hash,
+        "fixture": "stored-candidate-payload",
+    }
+    fingerprint = candidate_fingerprint(report_date, raw_report, content_hash, payload)
+    candidate_path = candidate_root / f"atlas-publication-candidate-{report_date}.json"
+    candidate_path.parent.mkdir(parents=True, exist_ok=True)
+    candidate_path.write_text(
+        json.dumps(
+            {
+                "schema_version": SITE_SYNC.PUBLICATION_CANDIDATE_SCHEMA_VERSION,
+                "staged_at": datetime.now(timezone.utc).isoformat(),
+                "status": "staged",
+                "date": report_date,
+                "report": SITE_SYNC._evidence_path(report_path),
+                "candidate_fingerprint": fingerprint,
+                "readiness": {"ready": False, "reasons": ["awaiting gates"], "evidence": {}},
+                "payload": payload,
+            }
+        ),
+        encoding="utf-8",
+    )
+    return report_path, candidate_path, payload, fingerprint, content_hash
+
+
+def staged_candidate_state_fixture(
+    *,
+    report_date: str,
+    report_path: Path,
+    candidate_path: Path,
+    payload: dict,
+    fingerprint: dict,
+    content_hash: str,
+    status: str = "staged",
+) -> dict:
+    return {
+        "staged_sha": content_hash,
+        "staged_payload_sha": SITE_SYNC.payload_sha256(payload),
+        "staged_candidate_fingerprint": fingerprint["fingerprint_sha256"],
+        "staged_report": str(report_path),
+        "staged_date": report_date,
+        "staged_path": str(candidate_path),
+        "staged_status": status,
+    }
+
+
 def requires_runtime_report(report_date: str):
     report = ROOT / "outputs" / f"每日全球晨间简报-{report_date}.md"
     return unittest.skipUnless(
@@ -858,6 +917,587 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(site_data_after, '{"sentinel":"payload"}\n')
         self.assertEqual(site_manifest_after, '{"sentinel":"manifest"}\n')
 
+    def test_retry_staged_candidate_blocks_without_rebuilding_phase_a(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "outputs"
+            output_root.mkdir()
+            candidate_root = root / "publication_candidates"
+            report_date = "2026-07-18"
+            report_path, candidate_path, payload, fingerprint, content_hash = write_staged_candidate_fixture(
+                output_root=output_root,
+                candidate_root=candidate_root,
+                report_date=report_date,
+            )
+            state_path = root / "site-sync-state.json"
+            legacy_state = staged_candidate_state_fixture(
+                report_date=report_date,
+                report_path=report_path,
+                candidate_path=candidate_path,
+                payload=payload,
+                fingerprint=fingerprint,
+                content_hash=content_hash,
+            )
+            legacy_state.pop("staged_status")
+            state_path.write_text(
+                json.dumps(legacy_state),
+                encoding="utf-8",
+            )
+            site_data = root / "app" / "briefing.generated.json"
+            site_manifest = root / "app" / "publication.generated.json"
+            site_data.parent.mkdir()
+            site_data.write_text('{"sentinel":"payload"}\n', encoding="utf-8")
+            site_manifest.write_text('{"sentinel":"manifest"}\n', encoding="utf-8")
+            readiness = {
+                "ready": False,
+                "reasons": ["closed-loop gates remain blocked"],
+                "evidence": {"candidateFingerprint": fingerprint},
+            }
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "OUTPUTS", output_root),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "PUBLICATION_CANDIDATE_ROOT", candidate_root),
+                patch.object(SITE_SYNC, "PUBLICATION_RETRY_LOCK_ROOT", root / "retry-locks"),
+                patch.object(SITE_SYNC, "PUBLICATION_SNAPSHOT_ROOT", root / "snapshots"),
+                patch.object(SITE_SYNC, "site_dependency_source_errors", return_value=[]),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(SITE_SYNC, "current_repository_commits", return_value=TEST_REPOSITORY_COMMITS),
+                patch.object(SITE_SYNC, "publication_snapshot_readiness", return_value=readiness),
+                patch.object(
+                    SITE_SYNC,
+                    "build_payload",
+                    side_effect=AssertionError("retry must not rebuild Phase A payload"),
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["sync_briefing_site.py", "--retry-staged-candidate", "--date", report_date],
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), SITE_SYNC.RETRY_BLOCKED_EXIT_CODE)
+
+            result = json.loads(output.getvalue())
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            staged = json.loads(candidate_path.read_text(encoding="utf-8"))
+            site_data_after = site_data.read_text(encoding="utf-8")
+            site_manifest_after = site_manifest.read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertEqual(result["candidate_fingerprint"], fingerprint["fingerprint_sha256"])
+        self.assertEqual(site_data_after, '{"sentinel":"payload"}\n')
+        self.assertEqual(site_manifest_after, '{"sentinel":"manifest"}\n')
+        self.assertEqual(state["staged_status"], "blocked")
+        self.assertEqual(state["staged_sha"], content_hash)
+        self.assertEqual(state["staged_report"], str(report_path))
+        self.assertEqual(staged["payload"], payload)
+        self.assertEqual(staged["candidate_fingerprint"], fingerprint)
+        self.assertEqual(staged["retry"]["status"], "blocked")
+        self.assertEqual(staged["retry"]["attempt"], 1)
+
+    def test_retry_staged_candidate_freezes_stored_payload_once_and_clears_its_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "outputs"
+            output_root.mkdir()
+            candidate_root = root / "publication_candidates"
+            report_date = "2026-07-18"
+            report_path, candidate_path, payload, fingerprint, content_hash = write_staged_candidate_fixture(
+                output_root=output_root,
+                candidate_root=candidate_root,
+                report_date=report_date,
+            )
+            state_path = root / "site-sync-state.json"
+            state_path.write_text(
+                json.dumps(
+                    staged_candidate_state_fixture(
+                        report_date=report_date,
+                        report_path=report_path,
+                        candidate_path=candidate_path,
+                        payload=payload,
+                        fingerprint=fingerprint,
+                        content_hash=content_hash,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            site_data = root / "app" / "briefing.generated.json"
+            site_manifest = root / "app" / "publication.generated.json"
+            site_data.parent.mkdir()
+            readiness = {
+                "ready": True,
+                "reasons": [],
+                "evidence": {
+                    "candidateFingerprint": fingerprint,
+                    "candidateFingerprintSha256": fingerprint["fingerprint_sha256"],
+                    "candidateFormula": fingerprint["formula"],
+                    "gateArtifacts": {
+                        "cycle": {
+                            "candidateFingerprint": fingerprint["fingerprint_sha256"],
+                            "sha256": "9" * 64,
+                        }
+                    },
+                },
+            }
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "OUTPUTS", output_root),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "PUBLICATION_CANDIDATE_ROOT", candidate_root),
+                patch.object(SITE_SYNC, "PUBLICATION_RETRY_LOCK_ROOT", root / "retry-locks"),
+                patch.object(SITE_SYNC, "PUBLICATION_SNAPSHOT_ROOT", root / "snapshots"),
+                patch.object(SITE_SYNC, "site_dependency_source_errors", return_value=[]),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(SITE_SYNC, "current_repository_commits", return_value=TEST_REPOSITORY_COMMITS),
+                patch.object(SITE_SYNC, "publication_snapshot_readiness", return_value=readiness),
+                patch.object(
+                    SITE_SYNC,
+                    "build_payload",
+                    side_effect=AssertionError("retry must not rebuild Phase A payload"),
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["sync_briefing_site.py", "--retry-staged-candidate", "--date", report_date],
+                ),
+                redirect_stdout(StringIO()) as first_output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), 0)
+
+            first = json.loads(first_output.getvalue())
+            frozen_path = root / "snapshots" / f"atlas-publication-{report_date}.json"
+            frozen = json.loads(frozen_path.read_text(encoding="utf-8"))
+            state_after_first = json.loads(state_path.read_text(encoding="utf-8"))
+            written_payload = json.loads(site_data.read_text(encoding="utf-8"))
+            staged_after_first = json.loads(candidate_path.read_text(encoding="utf-8"))
+
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "OUTPUTS", output_root),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "PUBLICATION_CANDIDATE_ROOT", candidate_root),
+                patch.object(SITE_SYNC, "PUBLICATION_RETRY_LOCK_ROOT", root / "retry-locks"),
+                patch.object(SITE_SYNC, "PUBLICATION_SNAPSHOT_ROOT", root / "snapshots"),
+                patch.object(SITE_SYNC, "site_dependency_source_errors", return_value=[]),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(SITE_SYNC, "current_repository_commits", return_value=TEST_REPOSITORY_COMMITS),
+                patch.object(
+                    SITE_SYNC,
+                    "freeze_publication_snapshot",
+                    side_effect=AssertionError("an existing frozen snapshot must not be recreated"),
+                ),
+                patch.object(
+                    SITE_SYNC,
+                    "build_payload",
+                    side_effect=AssertionError("retry must not rebuild Phase A payload"),
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["sync_briefing_site.py", "--retry-staged-candidate", "--date", report_date],
+                ),
+                redirect_stdout(StringIO()) as second_output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), SITE_SYNC.RETRY_NO_CANDIDATE_EXIT_CODE)
+
+            second = json.loads(second_output.getvalue())
+            frozen_after_second = json.loads(frozen_path.read_text(encoding="utf-8"))
+            state_after_second = json.loads(state_path.read_text(encoding="utf-8"))
+            staged_after_second = json.loads(candidate_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(first["status"], "queued")
+        self.assertEqual(written_payload, payload)
+        self.assertEqual(SITE_SYNC.payload_sha256(written_payload), fingerprint["payload_sha256"])
+        self.assertEqual(frozen["payload"], payload)
+        self.assertEqual(frozen["candidate_fingerprint"], fingerprint)
+        self.assertEqual(frozen["revision"], 1)
+        self.assertEqual(state_after_first["pending_sha"], content_hash)
+        self.assertNotIn("staged_date", state_after_first)
+        self.assertEqual(staged_after_first["retry"]["status"], "pending")
+        self.assertEqual(second["status"], "no_candidate")
+        self.assertEqual(frozen_after_second["revision"], 1)
+        self.assertEqual(state_after_second["pending_sha"], content_hash)
+        self.assertNotIn("staged_date", state_after_second)
+        self.assertEqual(staged_after_second["retry"]["attempt"], 1)
+
+    def test_retry_staged_candidate_refuses_current_report_or_repository_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "outputs"
+            output_root.mkdir()
+            candidate_root = root / "publication_candidates"
+            report_date = "2026-07-18"
+            report_path, candidate_path, payload, fingerprint, content_hash = write_staged_candidate_fixture(
+                output_root=output_root,
+                candidate_root=candidate_root,
+                report_date=report_date,
+                raw_report=b"original report",
+            )
+            state_path = root / "site-sync-state.json"
+            state_path.write_text(
+                json.dumps(
+                    staged_candidate_state_fixture(
+                        report_date=report_date,
+                        report_path=report_path,
+                        candidate_path=candidate_path,
+                        payload=payload,
+                        fingerprint=fingerprint,
+                        content_hash=content_hash,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            site_data = root / "app" / "briefing.generated.json"
+            site_manifest = root / "app" / "publication.generated.json"
+            site_data.parent.mkdir()
+            site_data.write_text('{"sentinel":"payload"}\n', encoding="utf-8")
+            site_manifest.write_text('{"sentinel":"manifest"}\n', encoding="utf-8")
+            report_path.write_bytes(b"mutated report after candidate staging")
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "OUTPUTS", output_root),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "PUBLICATION_CANDIDATE_ROOT", candidate_root),
+                patch.object(SITE_SYNC, "PUBLICATION_RETRY_LOCK_ROOT", root / "retry-locks"),
+                patch.object(SITE_SYNC, "PUBLICATION_SNAPSHOT_ROOT", root / "snapshots"),
+                patch.object(SITE_SYNC, "site_dependency_source_errors", return_value=[]),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(SITE_SYNC, "current_repository_commits", return_value=TEST_REPOSITORY_COMMITS),
+                patch.object(
+                    SITE_SYNC,
+                    "build_payload",
+                    side_effect=AssertionError("retry must not rebuild Phase A payload"),
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["sync_briefing_site.py", "--retry-staged-candidate", "--date", report_date],
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), 2)
+
+            result = json.loads(output.getvalue())
+            staged = json.loads(candidate_path.read_text(encoding="utf-8"))
+            site_data_after = site_data.read_text(encoding="utf-8")
+            site_manifest_after = site_manifest.read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "error")
+        self.assertTrue(any("current report" in reason for reason in result["reasons"]))
+        self.assertEqual(staged["status"], "staged")
+        self.assertNotIn("retry", staged)
+        self.assertEqual(site_data_after, '{"sentinel":"payload"}\n')
+        self.assertEqual(site_manifest_after, '{"sentinel":"manifest"}\n')
+
+    def test_retry_staged_candidate_requires_matching_active_state_even_with_explicit_date(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "outputs"
+            output_root.mkdir()
+            candidate_root = root / "publication_candidates"
+            report_date = "2026-07-18"
+            report_path, candidate_path, payload, fingerprint, content_hash = write_staged_candidate_fixture(
+                output_root=output_root,
+                candidate_root=candidate_root,
+                report_date=report_date,
+            )
+            state = staged_candidate_state_fixture(
+                report_date=report_date,
+                report_path=report_path,
+                candidate_path=candidate_path,
+                payload=payload,
+                fingerprint=fingerprint,
+                content_hash=content_hash,
+            )
+            state["staged_path"] = str(root / "publication_candidates" / "other-candidate.json")
+            state_path = root / "site-sync-state.json"
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+            site_data = root / "app" / "briefing.generated.json"
+            site_manifest = root / "app" / "publication.generated.json"
+            site_data.parent.mkdir()
+            site_data.write_text('{"sentinel":"payload"}\n', encoding="utf-8")
+            site_manifest.write_text('{"sentinel":"manifest"}\n', encoding="utf-8")
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "OUTPUTS", output_root),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "PUBLICATION_CANDIDATE_ROOT", candidate_root),
+                patch.object(SITE_SYNC, "PUBLICATION_RETRY_LOCK_ROOT", root / "retry-locks"),
+                patch.object(SITE_SYNC, "site_dependency_source_errors", return_value=[]),
+                patch.object(SITE_SYNC, "publication_snapshot_readiness") as readiness,
+                patch.object(
+                    SITE_SYNC,
+                    "build_payload",
+                    side_effect=AssertionError("retry must not rebuild Phase A payload"),
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["sync_briefing_site.py", "--retry-staged-candidate", "--date", report_date],
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), SITE_SYNC.RETRY_BLOCKED_EXIT_CODE)
+
+            result = json.loads(output.getvalue())
+            staged = json.loads(candidate_path.read_text(encoding="utf-8"))
+            site_data_after = site_data.read_text(encoding="utf-8")
+            site_manifest_after = site_manifest.read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(any("candidate path" in reason for reason in result["reasons"]))
+        readiness.assert_not_called()
+        self.assertEqual(staged["status"], "staged")
+        self.assertNotIn("retry", staged)
+        self.assertEqual(site_data_after, '{"sentinel":"payload"}\n')
+        self.assertEqual(site_manifest_after, '{"sentinel":"manifest"}\n')
+
+    def test_retry_staged_candidate_fails_closed_on_an_existing_or_empty_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "outputs"
+            output_root.mkdir()
+            candidate_root = root / "publication_candidates"
+            lock_root = root / "retry-locks"
+            report_date = "2026-07-18"
+            report_path, candidate_path, payload, fingerprint, content_hash = write_staged_candidate_fixture(
+                output_root=output_root,
+                candidate_root=candidate_root,
+                report_date=report_date,
+            )
+            state_path = root / "site-sync-state.json"
+            state_path.write_text(
+                json.dumps(
+                    staged_candidate_state_fixture(
+                        report_date=report_date,
+                        report_path=report_path,
+                        candidate_path=candidate_path,
+                        payload=payload,
+                        fingerprint=fingerprint,
+                        content_hash=content_hash,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            lock_path = lock_root / f"atlas-publication-retry-{report_date}.lock"
+            lock_path.parent.mkdir()
+            lock_path.write_text("", encoding="utf-8")
+            site_data = root / "app" / "briefing.generated.json"
+            site_manifest = root / "app" / "publication.generated.json"
+            site_data.parent.mkdir()
+            site_data.write_text('{"sentinel":"payload"}\n', encoding="utf-8")
+            site_manifest.write_text('{"sentinel":"manifest"}\n', encoding="utf-8")
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "OUTPUTS", output_root),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "PUBLICATION_CANDIDATE_ROOT", candidate_root),
+                patch.object(SITE_SYNC, "PUBLICATION_RETRY_LOCK_ROOT", lock_root),
+                patch.object(SITE_SYNC, "site_dependency_source_errors", return_value=[]),
+                patch.object(SITE_SYNC, "publication_snapshot_readiness") as readiness,
+                patch.object(
+                    sys,
+                    "argv",
+                    ["sync_briefing_site.py", "--retry-staged-candidate", "--date", report_date],
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), SITE_SYNC.RETRY_BLOCKED_EXIT_CODE)
+
+            result = json.loads(output.getvalue())
+            staged = json.loads(candidate_path.read_text(encoding="utf-8"))
+            lock_contents = lock_path.read_text(encoding="utf-8")
+            site_data_after = site_data.read_text(encoding="utf-8")
+            site_manifest_after = site_manifest.read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "blocked")
+        self.assertTrue(any("retry lock already exists" in reason for reason in result["reasons"]))
+        readiness.assert_not_called()
+        self.assertEqual(staged["status"], "staged")
+        self.assertNotIn("retry", staged)
+        self.assertEqual(lock_contents, "")
+        self.assertEqual(site_data_after, '{"sentinel":"payload"}\n')
+        self.assertEqual(site_manifest_after, '{"sentinel":"manifest"}\n')
+
+    def test_retry_staged_candidate_refuses_repository_commit_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            output_root = root / "outputs"
+            output_root.mkdir()
+            candidate_root = root / "publication_candidates"
+            report_date = "2026-07-18"
+            report_path, candidate_path, payload, fingerprint, content_hash = write_staged_candidate_fixture(
+                output_root=output_root,
+                candidate_root=candidate_root,
+                report_date=report_date,
+            )
+            state_path = root / "site-sync-state.json"
+            state_path.write_text(
+                json.dumps(
+                    staged_candidate_state_fixture(
+                        report_date=report_date,
+                        report_path=report_path,
+                        candidate_path=candidate_path,
+                        payload=payload,
+                        fingerprint=fingerprint,
+                        content_hash=content_hash,
+                    )
+                ),
+                encoding="utf-8",
+            )
+            site_data = root / "app" / "briefing.generated.json"
+            site_manifest = root / "app" / "publication.generated.json"
+            site_data.parent.mkdir()
+            site_data.write_text('{"sentinel":"payload"}\n', encoding="utf-8")
+            site_manifest.write_text('{"sentinel":"manifest"}\n', encoding="utf-8")
+            changed_commits = {**TEST_REPOSITORY_COMMITS, "root": "4" * 40}
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "OUTPUTS", output_root),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "PUBLICATION_CANDIDATE_ROOT", candidate_root),
+                patch.object(SITE_SYNC, "PUBLICATION_RETRY_LOCK_ROOT", root / "retry-locks"),
+                patch.object(SITE_SYNC, "PUBLICATION_SNAPSHOT_ROOT", root / "snapshots"),
+                patch.object(SITE_SYNC, "site_dependency_source_errors", return_value=[]),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(SITE_SYNC, "current_repository_commits", return_value=changed_commits),
+                patch.object(
+                    SITE_SYNC,
+                    "build_payload",
+                    side_effect=AssertionError("retry must not rebuild Phase A payload"),
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["sync_briefing_site.py", "--retry-staged-candidate", "--date", report_date],
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), 2)
+
+            result = json.loads(output.getvalue())
+            staged = json.loads(candidate_path.read_text(encoding="utf-8"))
+            site_data_after = site_data.read_text(encoding="utf-8")
+            site_manifest_after = site_manifest.read_text(encoding="utf-8")
+
+        self.assertEqual(result["status"], "error")
+        self.assertTrue(any("repository commits" in reason for reason in result["reasons"]))
+        self.assertEqual(staged["status"], "staged")
+        self.assertNotIn("retry", staged)
+        self.assertEqual(site_data_after, '{"sentinel":"payload"}\n')
+        self.assertEqual(site_manifest_after, '{"sentinel":"manifest"}\n')
+
+    def test_pending_sync_returns_the_exact_two_file_deployment_allowlist_and_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state_path = root / "site-sync-state.json"
+            site_data = root / "app" / "briefing.generated.json"
+            site_manifest = root / "app" / "publication.generated.json"
+            site_data.parent.mkdir()
+            report_path = root / "每日全球晨间简报-2026-07-13.md"
+            raw_report = b"report"
+            report_path.write_bytes(raw_report)
+            content_hash = "6" * 64
+            payload = {
+                "schemaVersion": SITE_SYNC.SITE_SCHEMA_VERSION,
+                "reportDate": "2026-07-13",
+                "contentHash": content_hash,
+            }
+            candidate = candidate_fingerprint(
+                "2026-07-13", raw_report, content_hash, payload
+            )
+            snapshot = {
+                "schema_version": 2,
+                "date": "2026-07-13",
+                "revision": 1,
+                "report_sha256": SITE_SYNC.hashlib.sha256(raw_report).hexdigest(),
+                "content_hash": content_hash,
+                "payload_sha256": SITE_SYNC.payload_sha256(payload),
+                "candidate_fingerprint": candidate,
+                "prerequisites": {},
+                "payload": payload,
+            }
+            manifest = SITE_SYNC.build_publication_manifest(snapshot)
+            site_data.write_text(SITE_SYNC.serialized_payload(payload), encoding="utf-8")
+            site_manifest.write_text(
+                SITE_SYNC.serialized_payload(manifest), encoding="utf-8"
+            )
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "pending_sha": content_hash,
+                        "pending_payload_sha": SITE_SYNC.payload_sha256(payload),
+                        "pending_manifest_sha": SITE_SYNC.payload_sha256(manifest),
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with (
+                patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "SITE_DATA", site_data),
+                patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
+                patch.object(SITE_SYNC, "site_dependency_source_errors", return_value=[]),
+                patch.object(
+                    SITE_SYNC,
+                    "report_for_date",
+                    return_value=(report_path, "2026-07-13"),
+                ),
+                patch.object(SITE_SYNC, "site_input_hash", return_value=content_hash),
+                patch.object(SITE_SYNC, "build_payload", return_value=payload),
+                patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(
+                    SITE_SYNC,
+                    "current_repository_commits",
+                    return_value=TEST_REPOSITORY_COMMITS,
+                ),
+                patch.object(
+                    SITE_SYNC, "load_publication_snapshot", return_value=snapshot
+                ),
+                patch.object(
+                    sys,
+                    "argv",
+                    ["sync_briefing_site.py", "--date", "2026-07-13"],
+                ),
+                redirect_stdout(StringIO()) as output,
+            ):
+                self.assertEqual(SITE_SYNC.main(), 0)
+
+            result = json.loads(output.getvalue())
+            expected_hashes = [
+                SITE_SYNC.file_sha256(site_data),
+                SITE_SYNC.file_sha256(site_manifest),
+            ]
+            expected_workspace_paths = [
+                str(site_data.resolve()),
+                str(site_manifest.resolve()),
+            ]
+
+        self.assertEqual(result["status"], "pending")
+        self.assertEqual(
+            result["allowed_deployment_diff_paths"],
+            ["app/briefing.generated.json", "app/publication.generated.json"],
+        )
+        self.assertEqual(
+            [item["relative_path"] for item in result["generated_artifacts"]],
+            result["allowed_deployment_diff_paths"],
+        )
+        self.assertEqual(
+            [item["sha256"] for item in result["generated_artifacts"]],
+            expected_hashes,
+        )
+        self.assertEqual(
+            [item["workspace_path"] for item in result["generated_artifacts"]],
+            expected_workspace_paths,
+        )
+
     @requires_runtime_report("2026-07-12")
     def test_payload_identity_detects_telemetry_changes_without_changing_content_identity(self) -> None:
         report_path, report_date = SITE_SYNC.report_for_date("2026-07-12")
@@ -878,73 +1518,142 @@ class WorkspaceSyncTests(unittest.TestCase):
     def test_publication_snapshot_requires_all_date_aligned_closed_loop_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
+            report_date = "2026-07-13"
             cycle = root / "cycle.json"
             healing = root / "healing.json"
             improvements = root / "improvements.json"
             alerts = root / "alerts.json"
             backup = root / "backup.json"
-            quality = root / "research-quality-2026-07-13.json"
+            quality = root / f"research-quality-{report_date}.json"
+            report = root / f"每日全球晨间简报-{report_date}.md"
             raw_report = b"current report"
+            report.write_bytes(raw_report)
             content_hash = "8" * 64
             candidate = candidate_fingerprint(
-                "2026-07-13",
+                report_date,
                 raw_report,
                 content_hash,
-                {"reportDate": "2026-07-13", "contentHash": content_hash},
+                {"reportDate": report_date, "contentHash": content_hash},
             )
-            cycle.write_text(
-                json.dumps({
-                    "date": "2026-07-13",
-                    "overall_passed": True,
-                    "operational_gate_passed": True,
-                    "release_candidate_passed": True,
-                    "idempotent_replay": True,
-                    "execution_profile": {"full_tests": True},
-                    "stages": [
-                        {"name": "sync", "status": "passed"},
-                        {"name": "canonical_virtual_ledger_commit", "status": "passed"},
+            report_member = SITE_SYNC._evidence_path(report).replace("\\", "/")
+            cycle_payload = {
+                "date": report_date,
+                "finished_at": datetime.now(timezone.utc).isoformat(),
+                "overall_passed": True,
+                "operational_gate_passed": True,
+                # These software-release-only gates intentionally remain false.
+                "release_candidate_passed": False,
+                "idempotent_replay": False,
+                "execution_profile": {"full_tests": False, "skip_site": True},
+                "stages": [
+                    {"name": name, "status": "passed"}
+                    for name in SITE_SYNC.DAILY_PUBLICATION_REQUIRED_CYCLE_STAGES
+                ],
+                "ledger": {"write_performed": True, "content_hash": "4" * 64},
+                "boundary": {
+                    "canonical_write_performed": True,
+                    "idempotency_verified_by_repeated_fingerprint": False,
+                    "full_test_suite_executed": False,
+                },
+                "fingerprint_after": {
+                    "fingerprint": "5" * 64,
+                    "files": [
+                        {
+                            "path": report_member,
+                            "sha256": SITE_SYNC.hashlib.sha256(raw_report).hexdigest(),
+                            "bytes": len(raw_report),
+                        }
                     ],
-                    "ledger": {"write_performed": True},
-                    "boundary": {
-                        "canonical_write_performed": True,
-                        "idempotency_verified_by_repeated_fingerprint": True,
-                        "full_test_suite_executed": True,
-                    },
-                    "workspace_lock": {
-                        "release_reproducible": True,
-                        "repositories": [
-                            {"name": name, "commit": commit}
-                            for name, commit in TEST_REPOSITORY_COMMITS.items()
-                        ],
-                    },
-                }),
-                encoding="utf-8",
-            )
-            healing.write_text(
-                json.dumps({
-                    "date": "2026-07-13",
-                    "overall_status": "healthy",
-                    "deep": True,
-                    "strict": True,
-                    "counts": {"blocking": 0, "failed": 0, "unresolved": 0},
-                    "checks": [
-                        {"check_id": "briefing_tests", "executed": True, "passed": True},
-                        {"check_id": "site_quality", "executed": True, "passed": True},
+                },
+                "workspace_lock": {
+                    "release_reproducible": False,
+                    "repositories": [
+                        {"name": name, "commit": commit, "clean": False}
+                        for name, commit in TEST_REPOSITORY_COMMITS.items()
                     ],
-                }),
-                encoding="utf-8",
-            )
-            improvements.write_text(json.dumps({"date": "2026-07-13", "status": "degraded", "counts": {"blocking": 0}}), encoding="utf-8")
-            alerts.write_text(json.dumps({"date": "2026-07-13", "status": "healthy", "finding_count": 0}), encoding="utf-8")
+                },
+            }
+            healing_payload = {
+                "date": report_date,
+                "completed_at": datetime.now(timezone.utc).isoformat(),
+                "overall_status": "healthy",
+                "deep": True,
+                "strict": True,
+                "counts": {"blocking": 0, "failed": 0, "unresolved": 0},
+                "checks": [
+                    {"check_id": "briefing_tests", "executed": True, "passed": True},
+                    {"check_id": "site_quality", "executed": True, "passed": True},
+                ],
+            }
+            improvement_payload = {
+                "date": report_date,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "status": "degraded",
+                "counts": {"blocking": 0},
+            }
+            alerts_payload = {
+                "date": report_date,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
+                "status": "healthy",
+                "finding_count": 0,
+            }
             quality_payload = {
-                "date": "2026-07-13",
+                "date": report_date,
+                "generated_at": datetime.now(timezone.utc).isoformat(),
                 "report_sha256": SITE_SYNC.hashlib.sha256(raw_report).hexdigest(),
                 "operational_passed": True,
                 "report_audit": {"passed": True},
             }
-            quality.write_text(json.dumps(quality_payload), encoding="utf-8")
+            for path, payload in (
+                (cycle, cycle_payload),
+                (healing, healing_payload),
+                (improvements, improvement_payload),
+                (alerts, alerts_payload),
+                (quality, quality_payload),
+            ):
+                path.write_text(json.dumps(payload), encoding="utf-8")
+
+            authentication = {
+                "algorithm": "HMAC-SHA256",
+                "key_id": "1" * 16,
+                "value": "2" * 64,
+            }
+            archive = root / "external-backup.atlasdr"
+            archive.write_bytes(b"encrypted backup fixture")
+            manifest_path = archive.with_suffix(".manifest.json")
+            manifest_members = [report, cycle, healing, improvements, alerts, quality]
+            manifest_payload = {
+                "schema_version": 4,
+                "date": report_date,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "workspace": str(ROOT.resolve()),
+                "encrypted": True,
+                "encryption_algorithm": "AES-256-GCM",
+                "restore_scope": "configured_workspace_files_and_git_bundles",
+                "full_runtime_restore_expected": False,
+                "excluded_sensitive_file_patterns": [],
+                "previous_manifest_sha256": None,
+                "files": [
+                    {
+                        "path": SITE_SYNC._evidence_path(path).replace("\\", "/"),
+                        "size": path.stat().st_size,
+                        "sha256": SITE_SYNC.file_sha256(path),
+                        "kind": "workspace_file",
+                    }
+                    for path in manifest_members
+                ],
+                "metadata_authentication": authentication,
+            }
+            manifest_path.write_text(json.dumps(manifest_payload), encoding="utf-8")
             backup_payload = {
-                "date": "2026-07-13",
+                "schema_version": 4,
+                "date": report_date,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "archive": str(archive.resolve()),
+                "archive_sha256": SITE_SYNC.file_sha256(archive),
+                "manifest_sidecar": str(manifest_path.resolve()),
+                "manifest_sha256": SITE_SYNC.canonical_json_sha256(manifest_payload),
+                "verified": True,
                 "encrypted": True,
                 "encryption_algorithm": "AES-256-GCM",
                 "encrypted_container_authenticated": True,
@@ -953,49 +1662,60 @@ class WorkspaceSyncTests(unittest.TestCase):
                 "restore_scope": "configured_workspace_files_and_git_bundles",
                 "full_runtime_restore_verified": False,
                 "target_outside_workspace": True,
+                "metadata_authentication": authentication,
             }
             backup.write_text(json.dumps(backup_payload), encoding="utf-8")
             with (
                 patch.object(SITE_SYNC, "cycle_audit_path", return_value=cycle),
                 patch.object(SITE_SYNC, "DATA_DIR", root),
+                patch.object(SITE_SYNC, "OUTPUTS", root),
                 patch.object(SITE_SYNC, "ATLAS_SELF_HEALING_LATEST", healing),
                 patch.object(SITE_SYNC, "ATLAS_IMPROVEMENTS_LATEST", improvements),
                 patch.object(SITE_SYNC, "ATLAS_ALERTS_LATEST", alerts),
                 patch.object(SITE_SYNC, "ATLAS_BACKUPS_LATEST", backup),
             ):
                 ready = SITE_SYNC.publication_snapshot_readiness(
-                    "2026-07-13", candidate_fingerprint=candidate
+                    report_date, candidate_fingerprint=candidate
                 )
                 quality_payload["report_sha256"] = "0" * 64
                 quality.write_text(json.dumps(quality_payload), encoding="utf-8")
                 blocked_quality = SITE_SYNC.publication_snapshot_readiness(
-                    "2026-07-13", candidate_fingerprint=candidate
+                    report_date, candidate_fingerprint=candidate
                 )
                 quality_payload["report_sha256"] = SITE_SYNC.hashlib.sha256(raw_report).hexdigest()
                 quality.write_text(json.dumps(quality_payload), encoding="utf-8")
                 backup_payload["encrypted"] = False
                 backup.write_text(json.dumps(backup_payload), encoding="utf-8")
                 blocked_backup = SITE_SYNC.publication_snapshot_readiness(
-                    "2026-07-13", candidate_fingerprint=candidate
+                    report_date, candidate_fingerprint=candidate
                 )
                 backup_payload["encrypted"] = True
+                backup_payload["schema_version"] = 3
                 backup.write_text(json.dumps(backup_payload), encoding="utf-8")
-                healing_payload = json.loads(healing.read_text(encoding="utf-8"))
+                blocked_backup_schema = SITE_SYNC.publication_snapshot_readiness(
+                    report_date, candidate_fingerprint=candidate
+                )
+                backup_payload["schema_version"] = 4
+                backup.write_text(json.dumps(backup_payload), encoding="utf-8")
                 healing_payload["deep"] = False
                 healing.write_text(json.dumps(healing_payload), encoding="utf-8")
                 blocked = SITE_SYNC.publication_snapshot_readiness(
-                    "2026-07-13", candidate_fingerprint=candidate
+                    report_date, candidate_fingerprint=candidate
                 )
                 healing_payload["deep"] = True
                 healing.write_text(json.dumps(healing_payload), encoding="utf-8")
-                cycle_payload = json.loads(cycle.read_text(encoding="utf-8"))
-                cycle_payload["release_candidate_passed"] = False
+                cycle_payload["operational_gate_passed"] = False
                 cycle.write_text(json.dumps(cycle_payload), encoding="utf-8")
-                blocked_release = SITE_SYNC.publication_snapshot_readiness(
-                    "2026-07-13", candidate_fingerprint=candidate
+                blocked_operational = SITE_SYNC.publication_snapshot_readiness(
+                    report_date, candidate_fingerprint=candidate
                 )
 
         self.assertTrue(ready["ready"])
+        self.assertFalse(ready["evidence"]["cycle"]["releaseCandidatePassed"])
+        self.assertFalse(ready["evidence"]["cycle"]["idempotentReplay"])
+        self.assertFalse(ready["evidence"]["cycle"]["fullTestsExecuted"])
+        self.assertFalse(ready["evidence"]["cycle"]["workspaceReproducible"])
+        self.assertTrue(ready["evidence"]["dailyContentPublicationPassed"])
         self.assertEqual(ready["evidence"]["candidateFingerprint"], candidate)
         self.assertEqual(
             ready["evidence"]["candidateFormula"],
@@ -1012,10 +1732,12 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertTrue(any("current report SHA" in reason for reason in blocked_quality["reasons"]))
         self.assertFalse(blocked_backup["ready"])
         self.assertTrue(any("encrypted external backup" in reason for reason in blocked_backup["reasons"]))
+        self.assertFalse(blocked_backup_schema["ready"])
+        self.assertTrue(any("schema version 4" in reason for reason in blocked_backup_schema["reasons"]))
         self.assertFalse(blocked["ready"])
         self.assertTrue(any("deep self-healing" in reason for reason in blocked["reasons"]))
-        self.assertFalse(blocked_release["ready"])
-        self.assertTrue(any("release candidate" in reason for reason in blocked_release["reasons"]))
+        self.assertFalse(blocked_operational["ready"])
+        self.assertTrue(any("cycle has not passed" in reason for reason in blocked_operational["reasons"]))
 
     @requires_runtime_report("2026-07-12")
     def test_frozen_publication_snapshot_is_retry_stable_and_rejects_silent_report_drift(self) -> None:
