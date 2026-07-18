@@ -831,8 +831,11 @@ def reconstruct_portfolio_for_date(
                 "fx_to_base": rate,
             }
     latest_valuation = eligible_valuations[-1] if eligible_valuations else None
-    if latest_valuation and isinstance(latest_valuation.get("cash"), (int, float)):
-        cash = float(latest_valuation["cash"])
+    # A valuation snapshot can predate trades included in this replay.  It is
+    # safe to use its dated prices, but never its cash/equity totals: doing so
+    # would erase cash movements from later replayed trades while retaining the
+    # new positions.  Cash is therefore always derived from the complete
+    # transaction replay through ``report_date``.
     return {
         "account_id": config.get("account_id"),
         "mode": "paper_trading",
@@ -843,7 +846,8 @@ def reconstruct_portfolio_for_date(
         "last_prices": prices,
         "base_currency": config.get("base_currency"),
         "fx_rates_to_base": config.get("fx_rates_to_base", {}),
-        "as_of_date": str(latest_valuation.get("date") or report_date)[:10] if latest_valuation else report_date,
+        "as_of_date": report_date,
+        "_valuation_as_of_date": str(latest_valuation.get("date") or "")[:10] if latest_valuation else None,
         "_recorded_equity": (
             float(latest_valuation["equity"])
             if latest_valuation and isinstance(latest_valuation.get("equity"), (int, float))
@@ -911,16 +915,21 @@ def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any
                 "costBasis": round(cost_basis, 2),
                 "unrealizedPnl": round(pnl, 2),
                 "returnPct": round((pnl / cost_basis) * 100, 2) if cost_basis else None,
-                "priceDate": str(price_payload.get("date") or report_date),
+                # Do not invent the report date when the source did not
+                # provide dated price provenance.  A later public projection
+                # makes this absence explicit instead of presenting an
+                # undated cost fallback as a report-date mark.
+                "priceDate": str(price_payload.get("date") or "")[:10] or None,
                 "priceSource": compact(str(price_payload.get("source") or "本地最近标记"), 120),
             }
         )
     values.sort(key=lambda pair: pair[1], reverse=True)
     position_rows.sort(key=lambda row: float(row["marketValue"]), reverse=True)
+    # Historical reconstructions must remain internally arithmetically
+    # consistent: equity is the replayed cash plus the dated marked value of
+    # the replayed positions.  A prior valuation may be useful for prices but
+    # cannot replace this value because it can predate a replayed trade.
     equity = cash + sum(value for _, value in values)
-    recorded_equity = data.get("_recorded_equity")
-    if historical_reconstructed and isinstance(recorded_equity, (int, float)):
-        equity = float(recorded_equity)
     if historical_summary:
         equity = float(historical_summary.get("equity") or equity)
         historical_positions_value = float(historical_summary.get("positions_value") or 0)
@@ -928,6 +937,34 @@ def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any
     initial = float(data.get("initial_cash") or 100000)
     total_return = ((equity / initial) - 1) * 100 if initial else 0
     as_of = str(historical_summary.get("date") if historical_summary else data.get("as_of_date") or state_date or report_date)
+
+    def canonical_mark_date(value: Any) -> str | None:
+        candidate = str(value or "")[:10]
+        try:
+            return valid_iso_date(candidate)
+        except argparse.ArgumentTypeError:
+            return None
+
+    dated_marks = [
+        date_value
+        for row in position_rows
+        if (date_value := canonical_mark_date(row.get("priceDate"))) is not None
+    ]
+    if dated_marks:
+        # Mixed dated marks are conservatively represented by their oldest
+        # component.  This avoids implying that every position was marked at
+        # the date of the newest price in the basket.
+        valuation_as_of: str | None = min(dated_marks)
+    elif historical_summary:
+        valuation_as_of = canonical_mark_date(historical_summary.get("date"))
+    elif not position_rows:
+        # A cash-only account has no external price mark; its account date is
+        # an honest valuation date for the public total.
+        valuation_as_of = canonical_mark_date(as_of)
+    else:
+        valuation_as_of = None
+    valuation_is_stale = valuation_as_of is None or valuation_as_of != report_date
+
     prior_valuations = [
         row
         for row in valuations
@@ -937,12 +974,36 @@ def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any
     previous_equity = float(previous_valuation.get("equity") or 0) if previous_valuation else None
     period_pnl = equity - previous_equity if previous_equity is not None else None
     period_return_pct = (period_pnl / previous_equity) * 100 if previous_equity else None
-    allocations = [{"label": "现金", "pct": round(cash / equity * 100, 1) if equity else 0}]
-    for symbol, value in values[:2]:
-        allocations.append({"label": symbol, "pct": round(value / equity * 100, 1) if equity else 0})
-    used = sum(item["pct"] for item in allocations)
-    allocations.append({"label": "其他", "pct": round(max(0, 100 - used), 1)})
+    allocation_values = [("现金", cash), *values[:2]]
+    allocation_values.append(("其他", sum(value for _, value in values[2:])))
+    allocations = [
+        {"label": label, "pct": round(value / equity * 100, 1) if equity else 0.0}
+        for label, value in allocation_values
+    ]
+    # Percentage rounding can otherwise yield 99.9% or 100.1%.  Apply the
+    # small rounding residual to the largest real component so the public bar
+    # always reconciles to the same 100% allocation represented by equity.
+    if equity:
+        residual = round(100.0 - sum(float(item["pct"]) for item in allocations), 1)
+        if residual:
+            target_index = max(range(len(allocation_values)), key=lambda index: allocation_values[index][1])
+            allocations[target_index]["pct"] = round(float(allocations[target_index]["pct"]) + residual, 1)
     portfolio_base_currency = str(data.get("base_currency") or (historical_summary or {}).get("base_currency") or "")
+    limitations = (
+        ["历史持仓由截止报告日的虚拟成交逐笔重建，并优先采用日期对齐的估值价格快照，未使用未来持仓快照。"]
+        if historical_reconstructed and data.get("_valuation_snapshot_used")
+        else ["历史持仓由截止报告日的虚拟成交逐笔重建，未使用未来持仓快照。"]
+        if historical_reconstructed
+        else ["历史日期仅有账户估值汇总，未使用未来持仓快照。"]
+        if historical_summary
+        else []
+    )
+    if valuation_as_of is None:
+        limitations.append("持仓价格缺少可验证标记日期，不能将总权益视为报告日估值。")
+    elif valuation_is_stale:
+        limitations.append(
+            f"持仓价格标记最早截至 {valuation_as_of}，并非报告日 {report_date}；现金仍按报告日逐笔回放。"
+        )
     return {
         "name": f"{account} 虚拟组合",
         "value": f"{equity:,.2f}",
@@ -951,6 +1012,8 @@ def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any
         "allocations": allocations,
         "accountId": str(data.get("account_id") or ""),
         "asOf": as_of,
+        "valuationAsOf": valuation_as_of,
+        "valuationIsStale": valuation_is_stale,
         "baseCurrency": portfolio_base_currency,
         "initialCash": round(initial, 2),
         "cash": round(cash, 2),
@@ -964,15 +1027,7 @@ def portfolio(account: str, report_date: str, review: str = "") -> dict[str, Any
         "review": review or "本期维持虚拟研究账户，仅按最近可得价格完成标记。",
         "paperTradingOnly": data.get("mode") == "paper_trading",
         "detailAvailable": historical_summary is None,
-        "limitations": (
-            ["历史持仓由截止报告日的虚拟成交逐笔重建，并优先采用日期对齐的估值价格快照，未使用未来持仓快照。"]
-            if historical_reconstructed and data.get("_valuation_snapshot_used")
-            else ["历史持仓由截止报告日的虚拟成交逐笔重建，未使用未来持仓快照。"]
-            if historical_reconstructed
-            else ["历史日期仅有账户估值汇总，未使用未来持仓快照。"]
-            if historical_summary
-            else []
-        ),
+        "limitations": limitations,
     }
 
 
@@ -988,12 +1043,22 @@ def public_portfolio(value: dict[str, Any]) -> dict[str, Any]:
             asset_number += 1
             label = f"匿名资产 {asset_number}"
         allocations.append({"label": label, "pct": float(item.get("pct") or 0)})
+    raw_valuation_as_of = value.get("valuationAsOf")
+    valuation_as_of = str(raw_valuation_as_of).strip() if isinstance(raw_valuation_as_of, str) else None
+    raw_valuation_stale = value.get("valuationIsStale")
+    valuation_is_stale = (
+        raw_valuation_stale
+        if isinstance(raw_valuation_stale, bool)
+        else valuation_as_of is None or valuation_as_of != str(value.get("asOf") or "")
+    )
     return {
         "name": str(value.get("name") or "虚拟组合"),
         "value": str(value.get("value") or "0.00"),
         "return": str(value.get("return") or "N/A"),
         "returnPct": float(value.get("returnPct") or 0),
         "asOf": str(value.get("asOf") or ""),
+        "valuationAsOf": valuation_as_of,
+        "valuationIsStale": valuation_is_stale,
         "baseCurrency": str(value.get("baseCurrency") or ""),
         "cash": round(float(value.get("cash") or 0), 2),
         "cashPct": round(float(value.get("cashPct") or 0), 2),
@@ -1736,24 +1801,99 @@ def contains_private_absolute_path(value: Any) -> bool:
     return bool(re.search(r"(?:^|\s)[A-Za-z]:[\\/]|/(?:Users|home)/[^\s/]+/", value))
 
 
+def is_finite_number(value: Any) -> bool:
+    """Return true only for real JSON numbers, never booleans or NaN/Infinity."""
+    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(float(value))
+
+
+def has_nonempty_strings(value: Any, *, minimum: int = 0) -> bool:
+    return (
+        isinstance(value, list)
+        and len(value) >= minimum
+        and all(isinstance(item, str) and item.strip() for item in value)
+    )
+
+
 def validate_payload(payload: dict[str, Any]) -> list[str]:
     """Validate generated site data before it can replace the deployed payload."""
     errors: list[str] = []
+
+    def require_text(value: Any, field: str, *, minimum: int = 1) -> None:
+        if not isinstance(value, str) or len(value.strip()) < minimum:
+            errors.append(f"{field} must contain at least {minimum} character(s)")
+
+    def require_string_list(value: Any, field: str, *, minimum: int = 0) -> None:
+        if not has_nonempty_strings(value, minimum=minimum):
+            errors.append(f"{field} must be a list of at least {minimum} non-empty string(s)")
+
+    def require_finite(value: Any, field: str) -> None:
+        if not is_finite_number(value):
+            errors.append(f"{field} must be a finite number")
+
+    def require_source_list(value: Any, field: str, *, minimum: int = 0) -> None:
+        if not isinstance(value, list) or len(value) < minimum:
+            errors.append(f"{field} must contain at least {minimum} source(s)")
+            return
+        for index, source in enumerate(value, 1):
+            prefix = f"{field}[{index}]"
+            if not isinstance(source, dict):
+                errors.append(f"{prefix} must be an object")
+                continue
+            require_text(source.get("label"), f"{prefix}.label")
+            if not safe_public_href(source.get("href")):
+                errors.append(f"{prefix}.href must be an http(s) URL or local fragment")
+
     if payload.get("schemaVersion") != SITE_SCHEMA_VERSION:
         errors.append(f"schemaVersion must be {SITE_SCHEMA_VERSION}")
     try:
         valid_iso_date(str(payload.get("reportDate", "")))
     except argparse.ArgumentTypeError as exc:
         errors.append(str(exc))
+    for field in ("contentHash", "issue", "retrievedAt", "generatedAt"):
+        require_text(payload.get(field), field)
 
     hero = payload.get("hero")
     if not isinstance(hero, dict) or not isinstance(hero.get("headline"), list) or len(hero["headline"]) < 2:
         errors.append("hero.headline must contain at least two lines")
+    else:
+        require_string_list(hero.get("headline"), "hero.headline", minimum=2)
+        for field in ("eyebrow", "dek", "editorNote"):
+            require_text(hero.get(field), f"hero.{field}")
 
     metrics = payload.get("metrics")
     risk_temperature = metrics.get("riskTemperature") if isinstance(metrics, dict) else None
-    if not isinstance(risk_temperature, int) or not 0 <= risk_temperature <= 100:
+    if not isinstance(risk_temperature, int) or isinstance(risk_temperature, bool) or not 0 <= risk_temperature <= 100:
         errors.append("metrics.riskTemperature must be an integer from 0 to 100")
+    if not isinstance(metrics, dict):
+        errors.append("metrics must be an object")
+    else:
+        require_text(metrics.get("posture"), "metrics.posture")
+        signal_count = metrics.get("signalCount")
+        if not isinstance(signal_count, int) or isinstance(signal_count, bool) or signal_count < 0:
+            errors.append("metrics.signalCount must be a non-negative integer")
+        reading_minutes = metrics.get("readingMinutes")
+        if not isinstance(reading_minutes, int) or isinstance(reading_minutes, bool) or reading_minutes <= 0:
+            errors.append("metrics.readingMinutes must be a positive integer")
+        risk_model = metrics.get("riskModel")
+        if not isinstance(risk_model, dict):
+            errors.append("metrics.riskModel must be an object")
+        else:
+            require_text(risk_model.get("formula"), "metrics.riskModel.formula")
+        source_health = metrics.get("sourceHealth")
+        if not isinstance(source_health, dict):
+            errors.append("metrics.sourceHealth must be an object")
+        else:
+            for field in (
+                "score",
+                "rssErrorCount",
+                "rssFallbackCount",
+                "rssFresh24hCount",
+                "rssItemCount",
+                "rssSourceCoveragePct",
+                "chinaFallbackItemCount",
+                "chinaItemCount",
+            ):
+                require_finite(source_health.get(field), f"metrics.sourceHealth.{field}")
 
     events = payload.get("events")
     if not isinstance(events, list) or not events:
@@ -1776,17 +1916,28 @@ def validate_payload(payload: dict[str, Any]) -> list[str]:
                 value = event.get(field)
                 if not isinstance(value, str) or len(value.strip()) < minimum:
                     errors.append(f"{prefix}.{field} must contain at least {minimum} characters")
+            for field in ("cardTitle", "category", "horizon", "confidence", "analysis"):
+                require_text(event.get(field), f"{prefix}.{field}")
+            if not isinstance(event.get("predictionId"), str):
+                errors.append(f"{prefix}.predictionId must be a string")
             if not safe_public_href(event.get("href")):
                 errors.append(f"{prefix}.href must be an http(s) URL or local fragment")
             for field in ("facts", "drivers", "verificationSignals"):
-                value = event.get(field)
-                if not isinstance(value, list) or not value or not all(isinstance(item, str) and item.strip() for item in value):
-                    errors.append(f"{prefix}.{field} must contain non-empty strings")
-            event_sources = event.get("sources")
-            if not isinstance(event_sources, list) or not event_sources:
-                errors.append(f"{prefix}.sources must not be empty")
-            elif any(not isinstance(item, dict) or not safe_public_href(item.get("href")) for item in event_sources):
-                errors.append(f"{prefix}.sources contain an invalid URL")
+                require_string_list(event.get(field), f"{prefix}.{field}", minimum=1)
+            for field in ("beneficiaries", "pressures"):
+                require_string_list(event.get(field), f"{prefix}.{field}")
+            instruments = event.get("instruments")
+            if not isinstance(instruments, list):
+                errors.append(f"{prefix}.instruments must be a list")
+            else:
+                for instrument_index, instrument in enumerate(instruments, 1):
+                    instrument_prefix = f"{prefix}.instruments[{instrument_index}]"
+                    if not isinstance(instrument, dict):
+                        errors.append(f"{instrument_prefix} must be an object")
+                        continue
+                    for field in ("symbol", "thesis", "risk"):
+                        require_text(instrument.get(field), f"{instrument_prefix}.{field}")
+            require_source_list(event.get("sources"), f"{prefix}.sources", minimum=1)
 
     scenarios = payload.get("scenarios")
     if not isinstance(scenarios, list) or not scenarios:
@@ -1806,19 +1957,55 @@ def validate_payload(payload: dict[str, Any]) -> list[str]:
             signals = scenario.get("verificationSignals")
             if not isinstance(signals, list) or not signals:
                 errors.append(f"{prefix}.verificationSignals must not be empty")
-            source_refs = scenario.get("sourceRefs")
-            if not isinstance(source_refs, list) or not source_refs:
-                errors.append(f"{prefix}.sourceRefs must not be empty")
-            elif any(not isinstance(item, dict) or not safe_public_href(item.get("href")) for item in source_refs):
-                errors.append(f"{prefix}.sourceRefs contain an invalid URL")
+            for field in ("horizon", "scenario", "chance", "watch"):
+                require_text(scenario.get(field), f"{prefix}.{field}")
+            for field in ("drivers", "beneficiaries", "pressures"):
+                require_string_list(scenario.get(field), f"{prefix}.{field}")
+            require_string_list(scenario.get("verificationSignals"), f"{prefix}.verificationSignals", minimum=1)
+            instruments = scenario.get("instruments")
+            if not isinstance(instruments, list):
+                errors.append(f"{prefix}.instruments must be a list")
+            else:
+                for instrument_index, instrument in enumerate(instruments, 1):
+                    instrument_prefix = f"{prefix}.instruments[{instrument_index}]"
+                    if not isinstance(instrument, dict):
+                        errors.append(f"{instrument_prefix} must be an object")
+                        continue
+                    for field in ("symbol", "thesis", "risk"):
+                        require_text(instrument.get(field), f"{instrument_prefix}.{field}")
+            require_source_list(scenario.get("sourceRefs"), f"{prefix}.sourceRefs", minimum=1)
+
+    markets = payload.get("markets")
+    if not isinstance(markets, dict):
+        errors.append("markets must be an object")
+    else:
+        for market_key in ("us", "china"):
+            market = markets.get(market_key)
+            prefix = f"markets.{market_key}"
+            if not isinstance(market, dict):
+                errors.append(f"{prefix} must be an object")
+                continue
+            for field in ("label", "asOf", "freshness", "note"):
+                require_text(market.get(field), f"{prefix}.{field}")
+            if not isinstance(market.get("isStale"), bool):
+                errors.append(f"{prefix}.isStale must be a boolean")
+            items = market.get("items")
+            if not isinstance(items, list):
+                errors.append(f"{prefix}.items must be a list")
+                continue
+            for item_index, item in enumerate(items, 1):
+                item_prefix = f"{prefix}.items[{item_index}]"
+                if not isinstance(item, dict):
+                    errors.append(f"{item_prefix} must be an object")
+                    continue
+                for field in ("label", "change", "direction"):
+                    require_text(item.get(field), f"{item_prefix}.{field}")
+
+    risks = payload.get("risks")
+    require_string_list(risks, "risks", minimum=1)
     watchlist = payload.get("watchlist")
-    if not isinstance(watchlist, list) or not watchlist:
-        errors.append("watchlist must contain at least one item")
-    sources = payload.get("sources")
-    if not isinstance(sources, list) or not sources:
-        errors.append("sources must contain at least one source")
-    elif any(not isinstance(item, dict) or not safe_public_href(item.get("href")) for item in sources):
-        errors.append("sources contain an invalid URL")
+    require_string_list(watchlist, "watchlist", minimum=1)
+    require_source_list(payload.get("sources"), "sources", minimum=1)
     portfolios = payload.get("portfolios")
     if not isinstance(portfolios, dict):
         errors.append("portfolios must be an object")
@@ -1834,19 +2021,60 @@ def validate_payload(payload: dict[str, Any]) -> list[str]:
                 errors.append(f"portfolios.{account} must use the public-data projection")
             for numeric_field in ("cash", "cashPct", "equity", "returnPct"):
                 numeric_value = portfolio_payload.get(numeric_field)
-                if not isinstance(numeric_value, (int, float)) or not math.isfinite(float(numeric_value)):
-                    errors.append(f"portfolios.{account}.{numeric_field} must be a finite number")
+                require_finite(numeric_value, f"portfolios.{account}.{numeric_field}")
             for optional_numeric_field in ("periodPnl", "periodReturnPct"):
                 optional_value = portfolio_payload.get(optional_numeric_field)
-                if optional_value is not None and (
-                    not isinstance(optional_value, (int, float))
-                    or not math.isfinite(float(optional_value))
-                ):
+                if optional_value is not None and not is_finite_number(optional_value):
                     errors.append(f"portfolios.{account}.{optional_numeric_field} must be a finite number or null")
-            if not isinstance(portfolio_payload.get("baseCurrency"), str) or not portfolio_payload.get("baseCurrency"):
-                errors.append(f"portfolios.{account}.baseCurrency must be present")
-            if not isinstance(portfolio_payload.get("asOf"), str) or not portfolio_payload.get("asOf"):
-                errors.append(f"portfolios.{account}.asOf must be present")
+            for field in ("name", "value", "return", "baseCurrency", "asOf", "review"):
+                require_text(portfolio_payload.get(field), f"portfolios.{account}.{field}")
+            valuation_as_of = portfolio_payload.get("valuationAsOf")
+            valuation_is_stale = portfolio_payload.get("valuationIsStale")
+            if valuation_as_of is not None:
+                if not isinstance(valuation_as_of, str):
+                    errors.append(f"portfolios.{account}.valuationAsOf must be an ISO date or null")
+                else:
+                    try:
+                        canonical_valuation_date = valid_iso_date(valuation_as_of)
+                    except argparse.ArgumentTypeError:
+                        errors.append(f"portfolios.{account}.valuationAsOf must be an ISO date or null")
+                    else:
+                        if canonical_valuation_date > str(payload.get("reportDate") or ""):
+                            errors.append(f"portfolios.{account}.valuationAsOf cannot be after reportDate")
+                        if canonical_valuation_date != str(payload.get("reportDate") or "") and valuation_is_stale is not True:
+                            errors.append(
+                                f"portfolios.{account}.valuationIsStale must flag a non-report-date valuation"
+                            )
+            if not isinstance(valuation_is_stale, bool):
+                errors.append(f"portfolios.{account}.valuationIsStale must be a boolean")
+            elif valuation_as_of is None and valuation_is_stale is not True:
+                errors.append(f"portfolios.{account}.valuationIsStale must flag an undated valuation")
+            allocations = portfolio_payload.get("allocations")
+            if not isinstance(allocations, list) or not allocations:
+                errors.append(f"portfolios.{account}.allocations must not be empty")
+            else:
+                allocation_total = 0.0
+                for allocation_index, allocation in enumerate(allocations, 1):
+                    allocation_prefix = f"portfolios.{account}.allocations[{allocation_index}]"
+                    if not isinstance(allocation, dict):
+                        errors.append(f"{allocation_prefix} must be an object")
+                        continue
+                    require_text(allocation.get("label"), f"{allocation_prefix}.label")
+                    percent = allocation.get("pct")
+                    if not is_finite_number(percent) or not 0 <= float(percent) <= 100:
+                        errors.append(f"{allocation_prefix}.pct must be a finite percentage from 0 to 100")
+                    else:
+                        allocation_total += float(percent)
+                if abs(allocation_total - 100.0) > 0.11:
+                    errors.append(f"portfolios.{account}.allocations must total 100%")
+            limitations = portfolio_payload.get("limitations")
+            require_string_list(limitations, f"portfolios.{account}.limitations", minimum=1)
+            cash = portfolio_payload.get("cash")
+            equity = portfolio_payload.get("equity")
+            cash_pct = portfolio_payload.get("cashPct")
+            if is_finite_number(cash) and is_finite_number(equity) and is_finite_number(cash_pct) and float(equity) > 0:
+                if abs((float(cash) / float(equity) * 100.0) - float(cash_pct)) > 0.02:
+                    errors.append(f"portfolios.{account}.cashPct must reconcile to cash/equity")
             forbidden_portfolio_fields = {"accountId", "positions", "realizedPnl", "initialCash", "previousEquity"}
             if forbidden_portfolio_fields.intersection(portfolio_payload):
                 errors.append(f"portfolios.{account} contains restricted account fields")
@@ -1854,6 +2082,42 @@ def validate_payload(payload: dict[str, Any]) -> list[str]:
     if not isinstance(system, dict):
         errors.append("system must be an object")
     else:
+        for field in ("operationalGatePassed", "releaseCandidatePassed", "researchPromotionPassed"):
+            if not isinstance(system.get(field), bool):
+                errors.append(f"system.{field} must be a boolean")
+        stages = system.get("stages")
+        if not isinstance(stages, list):
+            errors.append("system.stages must be a list")
+        else:
+            for index, stage in enumerate(stages, 1):
+                prefix = f"system.stages[{index}]"
+                if not isinstance(stage, dict):
+                    errors.append(f"{prefix} must be an object")
+                    continue
+                require_text(stage.get("name"), f"{prefix}.name")
+                require_text(stage.get("status"), f"{prefix}.status")
+        ledger = system.get("ledger")
+        if not isinstance(ledger, dict) or not isinstance(ledger.get("auditPassed"), bool):
+            errors.append("system.ledger.auditPassed must be a boolean")
+        replay = system.get("replay")
+        if not isinstance(replay, dict):
+            errors.append("system.replay must be an object")
+        else:
+            for field in ("executionSafetyPassed", "strategyEvidencePassed"):
+                if not isinstance(replay.get(field), bool):
+                    errors.append(f"system.replay.{field} must be a boolean")
+        shadow = system.get("shadow")
+        if not isinstance(shadow, dict):
+            errors.append("system.shadow must be an object")
+        else:
+            require_text(shadow.get("recommendedState"), "system.shadow.recommendedState")
+            require_text(shadow.get("evidenceStatus"), "system.shadow.evidenceStatus")
+        for section in ("selfHealing", "improvements"):
+            value = system.get(section)
+            if not isinstance(value, dict):
+                errors.append(f"system.{section} must be an object")
+            else:
+                require_text(value.get("status"), f"system.{section}.status")
         boundary = system.get("boundary")
         if not isinstance(boundary, dict) or boundary.get("paperTradingOnly") is not True or boundary.get("realBrokerOrdersAllowed") is not False:
             errors.append("system boundary must remain paper-only and forbid real broker orders")
@@ -1863,9 +2127,29 @@ def validate_payload(payload: dict[str, Any]) -> list[str]:
     if not isinstance(evolution, dict) or evolution.get("mode") != "gated_self_evolution":
         errors.append("evolution must contain the gated self-evolution state")
     else:
+        require_text(evolution.get("state"), "evolution.state")
         evolution_boundary = evolution.get("boundary")
         if not isinstance(evolution_boundary, dict) or evolution_boundary.get("auto_promote_strategy") is not False or evolution_boundary.get("real_broker_orders_allowed") is not False:
             errors.append("evolution boundary must forbid automatic promotion and real broker orders")
+        integrity = evolution.get("integrity")
+        if not isinstance(integrity, dict):
+            errors.append("evolution.integrity must be an object")
+        else:
+            for field in (
+                "early_closed_without_terminal_evidence",
+                "overdue_unreviewed_prediction_ids",
+            ):
+                require_string_list(integrity.get(field), f"evolution.integrity.{field}")
+        active_rules = evolution.get("active_rules")
+        if not isinstance(active_rules, list):
+            errors.append("evolution.active_rules must be a list")
+        else:
+            for index, rule in enumerate(active_rules, 1):
+                prefix = f"evolution.active_rules[{index}]"
+                if not isinstance(rule, dict):
+                    errors.append(f"{prefix} must be an object")
+                    continue
+                require_text(rule.get("instruction"), f"{prefix}.instruction")
     report_quality = payload.get("reportQuality")
     if not isinstance(report_quality, dict) or report_quality.get("passed") is not True:
         quality_errors = report_quality.get("errors", []) if isinstance(report_quality, dict) else []

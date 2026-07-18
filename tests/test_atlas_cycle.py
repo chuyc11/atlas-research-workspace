@@ -4,6 +4,8 @@ import argparse
 import contextlib
 import io
 import json
+import os
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -34,6 +36,17 @@ class AtlasCycleTests(unittest.TestCase):
         self.outputs = self.root / "outputs"
         self.runtime = self.root / "work" / "shared" / "atlas"
         self.ledger_root = self.runtime / "virtual_execution"
+        self.trust_root = self.root.parent / f"{self.root.name}-external-trust"
+        self.environment_patcher = patch.dict(
+            os.environ,
+            {
+                atlas.TRUST_ANCHOR_ROOT_ENV: str(self.trust_root),
+                atlas.TRUST_ANCHOR_HMAC_KEY_ENV: "test-only-external-anchor-key",
+                atlas.TRUST_ANCHOR_NAMESPACE_ENV: "atlas-cycle-test",
+            },
+            clear=False,
+        )
+        self.environment_patcher.start()
         self.patcher = patch.multiple(
             atlas,
             ROOT=self.root,
@@ -54,7 +67,9 @@ class AtlasCycleTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.patcher.stop()
+        self.environment_patcher.stop()
         self.tmp.cleanup()
+        shutil.rmtree(self.trust_root, ignore_errors=True)
 
     def _seed_sources(self) -> None:
         trade = {
@@ -335,6 +350,153 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertTrue(failed["audit"]["continuity"]["mutated_locators"])
         self.assertEqual(ledger_path.read_bytes(), first_bytes)
 
+    def test_valid_new_source_event_can_append_to_an_authenticated_ledger(self) -> None:
+        first = atlas.build_virtual_execution_ledger(write_files=True)
+        trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
+        original = json.loads(trades_path.read_text(encoding="utf-8").splitlines()[0])
+        appended = {
+            **original,
+            "date": "2026-07-11",
+            "gross_value": 5,
+            "price": 5,
+            "quantity": 1,
+            "symbol": "APPEND",
+            "timestamp": "2026-07-11T09:30:00",
+        }
+        write_jsonl(trades_path, [original, appended])
+        portfolio_path = self.briefing / "data" / "paper_portfolio_us.json"
+        portfolio = json.loads(portfolio_path.read_text(encoding="utf-8"))
+        portfolio["cash"] = 99975
+        portfolio["positions"]["NASDAQ:APPEND"] = {
+            "exchange": "NASDAQ",
+            "symbol": "APPEND",
+            "quantity": 1,
+        }
+        write_json(portfolio_path, portfolio)
+
+        preview = atlas.build_virtual_execution_ledger(write_files=False)
+        second = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertTrue(first["audit"]["overall_passed"])
+        self.assertTrue(preview["audit"]["overall_passed"])
+        self.assertEqual(preview["audit"]["continuity"]["added_event_count"], 1)
+        self.assertTrue(second["audit"]["overall_passed"])
+        self.assertTrue(second["write_performed"])
+        self.assertEqual(second["event_count"], first["event_count"] + 1)
+
+    def test_missing_external_anchor_fails_closed_without_recreating_it(self) -> None:
+        first = atlas.build_virtual_execution_ledger(write_files=True)
+        anchor_path = Path(first["anchor_path"])
+        ledger_path = Path(first["ledger_path"])
+        ledger_bytes = ledger_path.read_bytes()
+        anchor_path.unlink()
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        self.assertFalse(anchor_path.exists())
+        self.assertEqual(ledger_path.read_bytes(), ledger_bytes)
+        self.assertIn(
+            "canonical ledger exists without an externally authenticated trust anchor",
+            failed["audit"]["blocking_reasons"],
+        )
+
+    def test_deleting_mutable_runtime_cannot_reset_external_authenticated_baseline(self) -> None:
+        first = atlas.build_virtual_execution_ledger(write_files=True)
+        anchor_path = Path(first["anchor_path"])
+        self.assertTrue(anchor_path.exists())
+        trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
+        altered = json.loads(trades_path.read_text(encoding="utf-8").splitlines()[0])
+        altered["price"] = 12
+        altered["gross_value"] = 24
+        write_jsonl(trades_path, [altered])
+        shutil.rmtree(self.runtime)
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        self.assertTrue(anchor_path.exists())
+        self.assertIn(
+            "canonical ledger is missing while persistent baseline evidence exists",
+            failed["audit"]["blocking_reasons"],
+        )
+
+    def test_external_anchor_hmac_rejects_a_rehashed_forgery(self) -> None:
+        first = atlas.build_virtual_execution_ledger(write_files=True)
+        anchor_path = Path(first["anchor_path"])
+        anchor = json.loads(anchor_path.read_text(encoding="utf-8"))
+        anchor["event_count"] = 0
+        anchor["anchor_sha256"] = atlas.ledger_anchor_hash(anchor)
+        write_json(anchor_path, anchor)
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertIn("canonical ledger anchor HMAC signature mismatch", failed["audit"]["blocking_reasons"])
+
+    def test_missing_anchor_key_fails_closed_before_any_ledger_write(self) -> None:
+        with patch.dict(os.environ, {atlas.TRUST_ANCHOR_HMAC_KEY_ENV: ""}, clear=False):
+            failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        self.assertIn(
+            f"canonical ledger cannot be verified: {atlas.TRUST_ANCHOR_HMAC_KEY_ENV} is not configured",
+            failed["audit"]["blocking_reasons"],
+        )
+        self.assertFalse(atlas.VIRTUAL_LEDGER_PATH.exists())
+
+    def test_workspace_local_trust_anchor_root_is_rejected(self) -> None:
+        with patch.dict(os.environ, {atlas.TRUST_ANCHOR_ROOT_ENV: str(self.root)}, clear=False):
+            failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        self.assertIn(
+            "external trust-anchor root must not be inside the workspace",
+            failed["audit"]["blocking_reasons"],
+        )
+        self.assertFalse(atlas.VIRTUAL_LEDGER_PATH.exists())
+
+    def test_canonical_ledger_deletion_or_emptying_fails_closed_against_external_anchor(self) -> None:
+        first = atlas.build_virtual_execution_ledger(write_files=True)
+        ledger_path = Path(first["ledger_path"])
+        anchor_path = Path(first["anchor_path"])
+        self.assertTrue(anchor_path.exists())
+
+        ledger_path.unlink()
+        deleted = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(deleted["audit"]["overall_passed"])
+        self.assertFalse(deleted["write_performed"])
+        self.assertIn(
+            "canonical ledger is missing while persistent baseline evidence exists",
+            deleted["audit"]["blocking_reasons"],
+        )
+        self.assertTrue(anchor_path.exists())
+
+        # Removing the whole mutable ledger directory must still leave the anchor
+        # behind and prevent reconstruction from potentially altered sources.
+        shutil.rmtree(self.ledger_root)
+        missing_directory = atlas.build_virtual_execution_ledger(write_files=True)
+        self.assertFalse(missing_directory["audit"]["overall_passed"])
+        self.assertFalse(missing_directory["write_performed"])
+        self.assertTrue(anchor_path.exists())
+
+    def test_canonical_ledger_emptying_fails_closed_against_anchor_hash(self) -> None:
+        first = atlas.build_virtual_execution_ledger(write_files=True)
+        ledger_path = Path(first["ledger_path"])
+        ledger_path.write_text("", encoding="utf-8")
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertFalse(failed["write_performed"])
+        reasons = "\n".join(failed["audit"]["blocking_reasons"])
+        self.assertIn("canonical ledger anchor file hash mismatch", reasons)
+
     def test_account_position_mismatch_fails_closed(self) -> None:
         portfolio_path = self.briefing / "data" / "paper_portfolio_us.json"
         portfolio = json.loads(portfolio_path.read_text(encoding="utf-8"))
@@ -435,12 +597,220 @@ class AtlasCycleTests(unittest.TestCase):
         payload = {"run_id": "RUN-1", "audit_chain": {"schema_version": 1, "sequence": 1, "previous_audit_sha256": None}}
         payload["audit_chain"]["entry_sha256"] = atlas.audit_record_hash(payload)
         write_json(history / "RUN-1.json", payload)
+        genesis = atlas.audit_cycle_history(history, allow_unanchored_genesis=True)
+        self.assertTrue(genesis["passed"])
+        atlas.write_cycle_history_anchor(history, genesis)
         self.assertTrue(atlas.audit_cycle_history(history)["passed"])
         payload["run_id"] = "TAMPERED"
         write_json(history / "RUN-1.json", payload)
         result = atlas.audit_cycle_history(history)
         self.assertFalse(result["passed"])
         self.assertIn("entry hash mismatch", result["errors"][0])
+
+    def test_run_audit_anchor_detects_tail_truncation_and_pre_genesis_legacy_insert(self) -> None:
+        history = self.runtime / "run_audits" / "history" / "2026-07-10"
+        first = {"run_id": "RUN-1", "audit_chain": {"schema_version": 1, "sequence": 1, "previous_audit_sha256": None}}
+        first["audit_chain"]["entry_sha256"] = atlas.audit_record_hash(first)
+        write_json(history / "RUN-1.json", first)
+        atlas.write_cycle_history_anchor(
+            history,
+            atlas.audit_cycle_history(history, allow_unanchored_genesis=True),
+        )
+
+        (history / "RUN-1.json").unlink()
+        truncated = atlas.audit_cycle_history(history)
+        self.assertFalse(truncated["passed"])
+        self.assertIn("manifest differs from its external anchor", "\n".join(truncated["errors"]))
+
+        write_json(history / "RUN-1.json", first)
+        write_json(history / "0000-forged-legacy.json", {"run_id": "FORGED-LEGACY"})
+        inserted = atlas.audit_cycle_history(history)
+        self.assertFalse(inserted["passed"])
+        inserted_errors = "\n".join(inserted["errors"])
+        self.assertIn("manifest differs from its external anchor", inserted_errors)
+        self.assertIn("legacy run audit records", inserted_errors)
+
+    def test_run_audit_anchor_allows_only_verified_append_then_reanchors(self) -> None:
+        history = self.runtime / "run_audits" / "history" / "2026-07-10"
+        first = {"run_id": "RUN-1", "audit_chain": {"schema_version": 1, "sequence": 1, "previous_audit_sha256": None}}
+        first["audit_chain"]["entry_sha256"] = atlas.audit_record_hash(first)
+        write_json(history / "RUN-1.json", first)
+        atlas.write_cycle_history_anchor(
+            history,
+            atlas.audit_cycle_history(history, allow_unanchored_genesis=True),
+        )
+
+        second = {
+            "run_id": "RUN-2",
+            "audit_chain": {
+                "schema_version": 1,
+                "sequence": 2,
+                "previous_audit_sha256": first["audit_chain"]["entry_sha256"],
+            },
+        }
+        second["audit_chain"]["entry_sha256"] = atlas.audit_record_hash(second)
+        write_json(history / "RUN-2.json", second)
+        pending = atlas.audit_cycle_history(history, allow_anchor_append=True)
+        self.assertTrue(pending["passed"])
+        atlas.write_cycle_history_anchor(history, pending)
+        self.assertTrue(atlas.audit_cycle_history(history)["passed"])
+
+    def test_history_nonfinite_json_fails_closed_without_raising(self) -> None:
+        history = self.runtime / "run_audits" / "history" / "2026-07-10"
+        history.mkdir(parents=True, exist_ok=True)
+        (history / "BROKEN.json").write_text('{"value": NaN}\n', encoding="utf-8")
+
+        result = atlas.audit_cycle_history(history)
+
+        self.assertFalse(result["passed"])
+        self.assertTrue(any("unreadable audit JSON" in error for error in result["errors"]))
+
+    def test_history_anchor_write_failure_rolls_back_new_record_and_retry_succeeds(self) -> None:
+        args = argparse.Namespace(
+            date="2026-07-10",
+            dry_run=False,
+            force=False,
+            force_site=False,
+            skip_sync=False,
+            skip_tests=False,
+            skip_site=True,
+            skip_trading_core=True,
+        )
+        replay_shadow = {
+            "overall_passed": True,
+            "replay": {"passed": True},
+            "shadow_promotion_gate": {"passed": True, "payload": {"auto_applied": False}},
+        }
+        history = self.runtime / "run_audits" / "history" / "2026-07-10"
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                patch.object(atlas, "doctor_checks", return_value=[atlas.Check("Python", "ok", "3.12")])
+            )
+            stack.enter_context(patch.object(atlas, "command_sync", return_value=0))
+            stack.enter_context(
+                patch.object(atlas, "run_replay_shadow_validation", return_value=replay_shadow)
+            )
+            stack.enter_context(patch.object(atlas, "command_test", return_value=0))
+            stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
+            stack.enter_context(contextlib.redirect_stderr(io.StringIO()))
+            stack.enter_context(
+                patch.object(atlas, "write_cycle_history_anchor", side_effect=OSError("disk full"))
+            )
+            self.assertEqual(atlas.command_cycle(args), 2)
+
+        self.assertEqual(list(history.glob("*.json")) if history.exists() else [], [])
+        self.assertTrue(atlas.audit_cycle_history(history)["passed"])
+
+        with (
+            patch.object(atlas, "doctor_checks", return_value=[atlas.Check("Python", "ok", "3.12")]),
+            patch.object(atlas, "command_sync", return_value=0),
+            patch.object(atlas, "run_replay_shadow_validation", return_value=replay_shadow),
+            patch.object(atlas, "command_test", return_value=0),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(atlas.command_cycle(args), 0)
+        self.assertTrue(atlas.audit_cycle_history(history)["passed"])
+
+    def test_cycle_lock_refuses_empty_or_malformed_owner_record(self) -> None:
+        lock_path = self.runtime / "cycle.lock"
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path.write_text("", encoding="utf-8")
+
+        with self.assertRaisesRegex(RuntimeError, "unreadable; refusing unsafe takeover"):
+            with atlas.cycle_lock("2026-07-10"):
+                self.fail("invalid lock must not be taken over")
+
+        self.assertEqual(lock_path.read_text(encoding="utf-8"), "")
+
+    def test_cycle_lock_never_takes_over_a_live_owner_even_when_old(self) -> None:
+        lock_path = self.runtime / "cycle.lock"
+        write_json(
+            lock_path,
+            {
+                "pid": os.getpid(),
+                "date": "2026-07-10",
+                "started_at": "2000-01-01T00:00:00Z",
+                "token": "live-owner",
+            },
+        )
+
+        with patch.object(atlas, "process_is_running", return_value=True):
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                with atlas.cycle_lock("2026-07-10"):
+                    self.fail("live lock must not be taken over")
+
+        self.assertEqual(json.loads(lock_path.read_text(encoding="utf-8"))["token"], "live-owner")
+
+    def test_cycle_lock_reclaims_only_a_verified_dead_owner(self) -> None:
+        lock_path = self.runtime / "cycle.lock"
+        write_json(
+            lock_path,
+            {
+                "pid": 999999,
+                "date": "2026-07-10",
+                "started_at": "2000-01-01T00:00:00Z",
+                "token": "dead-owner",
+            },
+        )
+
+        with patch.object(atlas, "process_is_running", return_value=False):
+            with atlas.cycle_lock("2026-07-10"):
+                acquired = json.loads(lock_path.read_text(encoding="utf-8"))
+                self.assertNotEqual(acquired["token"], "dead-owner")
+                self.assertEqual(acquired["pid"], os.getpid())
+
+        self.assertFalse(lock_path.exists())
+
+    def test_cycle_lock_guard_blocks_dead_metadata_takeover_during_contention(self) -> None:
+        """A contender must not unlink a stale-looking record while the OS guard is held."""
+        lock_path = self.runtime / "cycle.lock"
+        write_json(
+            lock_path,
+            {
+                "pid": 999999,
+                "date": "2026-07-10",
+                "started_at": "2000-01-01T00:00:00Z",
+                "token": "dead-looking-owner",
+            },
+        )
+
+        # A held guard is authoritative even when the diagnostic pid is dead.
+        # This models the race where another process has already taken over a
+        # stale record but has not yet replaced its JSON metadata.
+        with patch.object(atlas, "acquire_cycle_lock_guard", return_value=None), patch.object(
+            atlas, "process_is_running", return_value=False
+        ):
+            with self.assertRaisesRegex(RuntimeError, "already running"):
+                with atlas.cycle_lock("2026-07-10"):
+                    self.fail("contending cycle must not start")
+
+        self.assertEqual(json.loads(lock_path.read_text(encoding="utf-8"))["token"], "dead-looking-owner")
+
+    def test_cycle_lock_releases_advisory_guard_after_owner_exits(self) -> None:
+        lock_path = self.runtime / "cycle.lock"
+        guard_path = atlas.cycle_lock_guard_path(lock_path)
+
+        with atlas.cycle_lock("2026-07-10"):
+            self.assertTrue(lock_path.exists())
+            self.assertIsNone(atlas.acquire_cycle_lock_guard(guard_path))
+
+        descriptor = atlas.acquire_cycle_lock_guard(guard_path)
+        self.assertIsNotNone(descriptor)
+        if descriptor is not None:
+            atlas.release_cycle_lock_guard(descriptor)
+
+    def test_subprocess_helpers_enforce_timeout_and_return_failure(self) -> None:
+        timeout_error = subprocess.TimeoutExpired(["blocked"], timeout=0.01)
+        with patch.object(atlas.subprocess, "run", side_effect=timeout_error) as run:
+            with contextlib.redirect_stderr(io.StringIO()) as stderr:
+                self.assertEqual(atlas.run_command(["blocked"], quiet=True, timeout=0.01), 124)
+            self.assertIn("timed out", stderr.getvalue())
+            self.assertEqual(run.call_args.kwargs["timeout"], 0.01)
+
+        with patch.object(atlas.subprocess, "run", side_effect=timeout_error):
+            result = atlas.capture_command(["blocked"], timeout=0.01)
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("timed out", result.stderr)
 
     def test_sync_failure_writes_audit_but_never_writes_canonical_ledger(self) -> None:
         args = argparse.Namespace(
@@ -731,6 +1101,30 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertIn("--apply-safe", command)
         self.assertIn("--strict", command)
         self.assertIn("--json", command)
+
+    def test_alert_due_processor_routes_without_a_date(self) -> None:
+        args = atlas.build_parser().parse_args(["alerts", "--process-due", "--json"])
+
+        with patch.object(atlas, "run_command", return_value=0) as run:
+            self.assertEqual(atlas.command_alerts(args), 0)
+
+        command = run.call_args.args[0]
+        self.assertIn("alert_dispatch.py", command[1])
+        self.assertIn("--process-due", command)
+        self.assertNotIn("--date", command)
+        self.assertIn("--json", command)
+
+    def test_alert_command_routes_an_immutable_alert_revision_id(self) -> None:
+        args = atlas.build_parser().parse_args(
+            ["alerts", "--date", "2026-07-10", "--alert-id", "alert-2026-07-10-deadbeef", "--retry"]
+        )
+
+        with patch.object(atlas, "run_command", return_value=0) as run:
+            self.assertEqual(atlas.command_alerts(args), 0)
+
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("--alert-id") + 1], "alert-2026-07-10-deadbeef")
+        self.assertIn("--retry", command)
 
     def test_full_test_mode_runs_unfiltered_trading_core_suite(self) -> None:
         args = argparse.Namespace(skip_site=True, skip_trading_core=False, full=True)

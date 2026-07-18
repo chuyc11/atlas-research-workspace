@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
+import hmac
 import importlib.util
 import json
 import math
@@ -15,7 +17,7 @@ import subprocess
 import sys
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
-from datetime import UTC, date as Date, datetime, timedelta
+from datetime import UTC, date as Date, datetime
 from pathlib import Path
 from typing import Any, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -41,6 +43,13 @@ REPLAY_EVALUATION_PATTERN = re.compile(
 LEDGER_ID = "atlas-virtual-execution-ledger-v1"
 LEDGER_SCHEMA_VERSION = 1
 GIT_REMOTE_PROBE_TIMEOUT_SECONDS = 5
+COMMAND_TIMEOUT_SECONDS = 30 * 60
+COMMAND_TIMEOUT_RETURN_CODE = 124
+HISTORY_ANCHOR_SCHEMA_VERSION = 1
+LEDGER_ANCHOR_SCHEMA_VERSION = 1
+TRUST_ANCHOR_ROOT_ENV = "ATLAS_TRUST_ANCHOR_ROOT"
+TRUST_ANCHOR_HMAC_KEY_ENV = "ATLAS_TRUST_ANCHOR_HMAC_KEY"
+TRUST_ANCHOR_NAMESPACE_ENV = "ATLAS_TRUST_ANCHOR_NAMESPACE"
 MINIMUM_NODE_VERSION = (22, 15, 0)
 RELEASE_REQUIRED_STAGES = (
     "doctor",
@@ -129,17 +138,24 @@ def run_command(
     cwd: Path = ROOT,
     trading_core: bool = False,
     quiet: bool = False,
+    timeout: float | None = COMMAND_TIMEOUT_SECONDS,
 ) -> int:
     if not quiet:
         print(f"\n> {' '.join(command)}", flush=True)
-    completed = subprocess.run(
-        list(command),
-        cwd=cwd,
-        env=command_env(trading_core=trading_core),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-    )
+    try:
+        completed = subprocess.run(
+            list(command),
+            cwd=cwd,
+            env=command_env(trading_core=trading_core),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        limit = f"{timeout:g} seconds" if timeout is not None else "the configured timeout"
+        print(f"command timed out after {limit}", file=sys.stderr)
+        return COMMAND_TIMEOUT_RETURN_CODE
     return completed.returncode
 
 
@@ -148,18 +164,27 @@ def capture_command(
     *,
     cwd: Path = ROOT,
     trading_core: bool = False,
-    timeout: float | None = None,
+    timeout: float | None = COMMAND_TIMEOUT_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        list(command),
-        cwd=cwd,
-        env=command_env(trading_core=trading_core),
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        capture_output=True,
-        timeout=timeout,
-    )
+    try:
+        return subprocess.run(
+            list(command),
+            cwd=cwd,
+            env=command_env(trading_core=trading_core),
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        limit = f"{timeout:g} seconds" if timeout is not None else "the configured timeout"
+        return subprocess.CompletedProcess(
+            list(command),
+            COMMAND_TIMEOUT_RETURN_CODE,
+            stdout="",
+            stderr=f"command timed out after {limit}",
+        )
 
 
 def probe_git_remotes(
@@ -183,6 +208,7 @@ def probe_git_remotes(
                 for line in result.stdout.splitlines()
                 if len(line.split()) >= 2 and re.fullmatch(r"[0-9a-fA-F]{40}", line.split()[0])
             }
+            timed_out = result.returncode == COMMAND_TIMEOUT_RETURN_CODE
             head_advertised = bool(head_commit and head_commit in advertised_commits)
             fetchable = result.returncode == 0 and head_advertised
             probes.append(
@@ -192,7 +218,9 @@ def probe_git_remotes(
                     "head_advertised": head_advertised,
                     "returncode": result.returncode,
                     "detail": (
-                        "head_advertised"
+                        "probe_timeout"
+                        if timed_out
+                        else "head_advertised"
                         if fetchable
                         else "head_not_advertised"
                         if result.returncode == 0
@@ -382,6 +410,107 @@ def stable_hash(payload: Any) -> str:
     return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
 
 
+def configured_trust_anchor_root() -> tuple[Path | None, str | None]:
+    """Return the protected anchor root, rejecting workspace-local storage.
+
+    The mutable workspace and its runtime directory are deliberately not a trust
+    boundary.  Operators may set ``ATLAS_TRUST_ANCHOR_ROOT`` to a protected
+    volume, WORM mount, or separately administered sync target.  The default is
+    outside the workspace so deleting ``work/shared/atlas`` cannot reset trust.
+    Filesystem permissions and retention for that root remain an operator
+    responsibility; the HMAC below makes an altered checkpoint detectable when
+    its key is kept outside the workspace.
+    """
+    configured = os.environ.get(TRUST_ANCHOR_ROOT_ENV)
+    candidate = Path(configured).expanduser() if configured else Path.home() / ".atlas-trust"
+    try:
+        resolved = candidate.resolve()
+        workspace = ROOT.resolve()
+        runtime = ATLAS_RUNTIME_ROOT.resolve()
+    except OSError as exc:
+        return None, f"cannot resolve external trust-anchor root: {type(exc).__name__}: {exc}"
+    for forbidden, description in ((workspace, "workspace"), (runtime, "mutable runtime")):
+        try:
+            resolved.relative_to(forbidden)
+        except ValueError:
+            continue
+        return None, f"external trust-anchor root must not be inside the {description}"
+    return resolved, None
+
+
+def trust_anchor_path(kind: str, subject: str) -> Path:
+    """Return a deterministic path in the externally protected trust root."""
+    root, error = configured_trust_anchor_root()
+    if root is None:
+        raise RuntimeError(error or "external trust-anchor root is unavailable")
+    namespace = str(os.environ.get(TRUST_ANCHOR_NAMESPACE_ENV) or "").strip()
+    if not namespace:
+        raise RuntimeError(
+            f"{TRUST_ANCHOR_NAMESPACE_ENV} is required to select a stable external trust anchor"
+        )
+    identity = stable_hash(
+        {
+            "namespace": namespace,
+            "kind": kind,
+            "subject": subject,
+        }
+    )[:24]
+    return root / "anchors" / f"{kind}-{identity}.json"
+
+
+def trust_anchor_hmac_key() -> bytes | None:
+    """Read, but never persist, the external trust-anchor signing key."""
+    raw = os.environ.get(TRUST_ANCHOR_HMAC_KEY_ENV)
+    if raw is None or not raw.strip():
+        return None
+    return raw.encode("utf-8")
+
+
+def trust_anchor_key_id(key: bytes) -> str:
+    """Expose a non-secret key identifier to make unintended rotation visible."""
+    return hashlib.sha256(key).hexdigest()[:16]
+
+
+def trust_anchor_signature(payload: dict[str, Any], key: bytes) -> str:
+    normalized = dict(payload)
+    normalized.pop("hmac_sha256", None)
+    return hmac.new(key, stable_json(normalized).encode("utf-8"), hashlib.sha256).hexdigest()
+
+
+def sign_trust_anchor(payload: dict[str, Any]) -> dict[str, Any]:
+    """Authenticate an anchor with an externally supplied HMAC key."""
+    key = trust_anchor_hmac_key()
+    if key is None:
+        raise RuntimeError(
+            f"{TRUST_ANCHOR_HMAC_KEY_ENV} is required to create an external trust anchor"
+        )
+    signed = dict(payload)
+    signed["hmac_algorithm"] = "HMAC-SHA256"
+    signed["hmac_key_id"] = trust_anchor_key_id(key)
+    signed["hmac_sha256"] = trust_anchor_signature(signed, key)
+    return signed
+
+
+def trust_anchor_authentication_errors(payload: dict[str, Any], *, label: str) -> list[str]:
+    """Return fail-closed verification errors for an external anchor."""
+    root, root_error = configured_trust_anchor_root()
+    if root is None:
+        return [root_error or "external trust-anchor root is unavailable"]
+    key = trust_anchor_hmac_key()
+    if key is None:
+        return [f"{label} cannot be verified: {TRUST_ANCHOR_HMAC_KEY_ENV} is not configured"]
+    if payload.get("hmac_algorithm") != "HMAC-SHA256":
+        return [f"{label} has an unsupported or missing HMAC algorithm"]
+    if payload.get("hmac_key_id") != trust_anchor_key_id(key):
+        return [f"{label} HMAC key identifier mismatch"]
+    signature = payload.get("hmac_sha256")
+    if not isinstance(signature, str) or not hmac.compare_digest(
+        signature, trust_anchor_signature(payload, key)
+    ):
+        return [f"{label} HMAC signature mismatch"]
+    return []
+
+
 def relative_path(path: Path) -> str:
     try:
         return str(path.resolve().relative_to(ROOT.resolve()))
@@ -455,16 +584,88 @@ def audit_record_hash(payload: dict[str, Any]) -> str:
     return stable_hash(normalized)
 
 
-def audit_cycle_history(history_root: Path) -> dict[str, Any]:
+def cycle_history_anchor_path(history_root: Path) -> Path:
+    """Return a signed checkpoint outside the workspace's mutable runtime."""
+    history_key = stable_hash({"history_root": relative_path(history_root)})[:24]
+    return trust_anchor_path("run-audit-history", f"{history_root.name}-{history_key}")
+
+
+def history_file_manifest(history_root: Path) -> list[dict[str, str]]:
+    """Hash every JSON record so inserts, removals, and reordering are observable."""
+    return [
+        {"name": path.name, "sha256": file_sha256(path)}
+        for path in sorted(history_root.glob("*.json"))
+    ] if history_root.exists() else []
+
+
+def history_anchor_hash(payload: dict[str, Any]) -> str:
+    normalized = dict(payload)
+    normalized.pop("anchor_sha256", None)
+    normalized.pop("hmac_algorithm", None)
+    normalized.pop("hmac_key_id", None)
+    normalized.pop("hmac_sha256", None)
+    return stable_hash(normalized)
+
+
+def build_cycle_history_anchor(history_root: Path, integrity: dict[str, Any]) -> dict[str, Any]:
+    """Create an append-only checkpoint for a verified run-audit history."""
+    manifest = history_file_manifest(history_root)
+    if not integrity.get("passed"):
+        raise ValueError("cannot anchor an invalid run-audit history")
+    if integrity.get("legacy_record_count"):
+        raise ValueError("cannot anchor legacy run-audit records without an explicit migration")
+    payload: dict[str, Any] = {
+        "schema_version": HISTORY_ANCHOR_SCHEMA_VERSION,
+        "history_root": relative_path(history_root),
+        "entries": manifest,
+        "entry_count": len(manifest),
+        "chained_record_count": integrity.get("chained_record_count", 0),
+        "legacy_record_count": integrity.get("legacy_record_count", 0),
+        "first_audit_sha256": integrity.get("first_audit_sha256"),
+        "last_audit_sha256": integrity.get("last_audit_sha256"),
+        "last_sequence": integrity.get("next_sequence", 1) - 1,
+    }
+    payload["anchor_sha256"] = history_anchor_hash(payload)
+    return sign_trust_anchor(payload)
+
+
+def write_cycle_history_anchor(history_root: Path, integrity: dict[str, Any]) -> dict[str, Any]:
+    payload = build_cycle_history_anchor(history_root, integrity)
+    atomic_write_json(cycle_history_anchor_path(history_root), payload)
+    return payload
+
+
+def audit_cycle_history(
+    history_root: Path,
+    *,
+    allow_unanchored_genesis: bool = False,
+    allow_anchor_append: bool = False,
+) -> dict[str, Any]:
+    """Verify the hash chain against a checkpoint outside its mutable directory.
+
+    A chain alone cannot detect truncation: deleting its tail simply leaves a valid
+    prefix.  The external checkpoint commits the exact file manifest and last hash.
+    Normal reads fail closed on an unexpected unanchored record or append; the two
+    opt-in modes are only used inside the write transaction before replacing the
+    checkpoint.
+    """
     errors: list[str] = []
+    trust_root, trust_root_error = configured_trust_anchor_root()
+    if trust_root is None:
+        errors.append(trust_root_error or "external trust-anchor root is unavailable")
+    if trust_anchor_hmac_key() is None:
+        errors.append(
+            f"run audit history cannot be verified: {TRUST_ANCHOR_HMAC_KEY_ENV} is not configured"
+        )
     legacy_record_count = 0
     chained_record_count = 0
     previous_hash: str | None = None
     previous_sequence = 0
+    first_hash: str | None = None
     for path in sorted(history_root.glob("*.json")) if history_root.exists() else []:
         try:
             payload = read_json_file(path)
-        except (OSError, json.JSONDecodeError) as exc:
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
             errors.append(f"{path.name}: unreadable audit JSON: {exc}")
             continue
         chain = payload.get("audit_chain") if isinstance(payload, dict) else None
@@ -482,15 +683,90 @@ def audit_cycle_history(history_root: Path) -> dict[str, Any]:
             errors.append(f"{path.name}: expected sequence {expected_sequence}, got {chain.get('sequence')}")
         if chain.get("previous_audit_sha256") != previous_hash:
             errors.append(f"{path.name}: previous audit hash mismatch")
+        if first_hash is None:
+            first_hash = actual_hash
         previous_hash = actual_hash
         previous_sequence = expected_sequence
+    try:
+        manifest = history_file_manifest(history_root)
+    except OSError as exc:
+        errors.append(f"cannot read run audit history manifest: {type(exc).__name__}: {exc}")
+        manifest = []
+
+    try:
+        anchor_path: Path | None = cycle_history_anchor_path(history_root)
+    except RuntimeError as exc:
+        errors.append(str(exc))
+        anchor_path = None
+    anchor_present = bool(anchor_path and anchor_path.exists())
+    anchor: dict[str, Any] | None = None
+    if anchor_present:
+        try:
+            loaded_anchor = read_json_file(anchor_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"cannot read run audit history anchor: {type(exc).__name__}: {exc}")
+        else:
+            if not isinstance(loaded_anchor, dict):
+                errors.append("run audit history anchor must be a JSON object")
+            else:
+                anchor = loaded_anchor
+                if anchor.get("schema_version") != HISTORY_ANCHOR_SCHEMA_VERSION:
+                    errors.append("unsupported run audit history anchor schema")
+                if anchor.get("history_root") != relative_path(history_root):
+                    errors.append("run audit history anchor points to a different history root")
+                if anchor.get("anchor_sha256") != history_anchor_hash(anchor):
+                    errors.append("run audit history anchor hash mismatch")
+                errors.extend(
+                    trust_anchor_authentication_errors(anchor, label="run audit history anchor")
+                )
+                anchor_entries = anchor.get("entries")
+                if not isinstance(anchor_entries, list):
+                    errors.append("run audit history anchor entries are invalid")
+                    anchor_entries = []
+                expected_entry_count = anchor.get("entry_count")
+                if expected_entry_count != len(anchor_entries):
+                    errors.append("run audit history anchor entry count is inconsistent")
+                if anchor_entries != manifest:
+                    append_is_valid = bool(
+                        allow_anchor_append
+                        and len(manifest) > len(anchor_entries)
+                        and manifest[: len(anchor_entries)] == anchor_entries
+                    )
+                    if not append_is_valid:
+                        errors.append("run audit history manifest differs from its external anchor")
+                if not allow_anchor_append or len(manifest) <= len(anchor_entries):
+                    if anchor.get("chained_record_count") != chained_record_count:
+                        errors.append("run audit history chained record count differs from anchor")
+                    if anchor.get("legacy_record_count") != legacy_record_count:
+                        errors.append("run audit history legacy record count differs from anchor")
+                    if anchor.get("first_audit_sha256") != first_hash:
+                        errors.append("run audit history first hash differs from anchor")
+                    if anchor.get("last_audit_sha256") != previous_hash:
+                        errors.append("run audit history tail hash differs from anchor")
+                    if anchor.get("last_sequence") != previous_sequence:
+                        errors.append("run audit history tail sequence differs from anchor")
+    elif manifest:
+        valid_genesis = bool(
+            allow_unanchored_genesis
+            and legacy_record_count == 0
+            and chained_record_count == 1
+            and previous_sequence == 1
+        )
+        if not valid_genesis:
+            errors.append("run audit history has records but no external anchor; explicit migration is required")
+
+    if legacy_record_count:
+        errors.append("legacy run audit records are not accepted in an anchored hash chain")
     return {
         "passed": not errors,
         "errors": errors,
         "legacy_record_count": legacy_record_count,
         "chained_record_count": chained_record_count,
+        "first_audit_sha256": first_hash,
         "last_audit_sha256": previous_hash,
         "next_sequence": previous_sequence + 1,
+        "anchor_path": str(anchor_path) if anchor_path is not None else None,
+        "anchor_present": anchor_present,
     }
 
 
@@ -929,9 +1205,128 @@ def event_source_locator(event: dict[str, Any]) -> tuple[str, str, int]:
     )
 
 
-def audit_ledger_continuity(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Fail closed when a previously committed source row disappears or mutates."""
+def virtual_ledger_anchor_path() -> Path:
+    """Store the canonical-ledger checkpoint outside the mutable workspace."""
+    return trust_anchor_path("virtual-execution-ledger", LEDGER_ID)
+
+
+def ledger_anchor_hash(payload: dict[str, Any]) -> str:
+    normalized = dict(payload)
+    normalized.pop("anchor_sha256", None)
+    normalized.pop("hmac_algorithm", None)
+    normalized.pop("hmac_key_id", None)
+    normalized.pop("hmac_sha256", None)
+    return stable_hash(normalized)
+
+
+def build_virtual_ledger_anchor(
+    events: Sequence[dict[str, Any]],
+    account_state: dict[str, Any],
+    state_payload: dict[str, Any],
+) -> dict[str, Any]:
+    """Build a cross-directory baseline for the committed canonical ledger."""
     if not VIRTUAL_LEDGER_PATH.exists():
+        raise FileNotFoundError(f"cannot anchor missing canonical ledger: {VIRTUAL_LEDGER_PATH}")
+    payload: dict[str, Any] = {
+        "schema_version": LEDGER_ANCHOR_SCHEMA_VERSION,
+        "ledger_id": LEDGER_ID,
+        "canonical_ledger_path": relative_path(VIRTUAL_LEDGER_PATH),
+        "canonical_ledger_sha256": file_sha256(VIRTUAL_LEDGER_PATH),
+        "event_hash": stable_hash(list(events)),
+        "account_hash": stable_hash(account_state),
+        "content_hash": stable_hash({"events": list(events), "accounts": account_state}),
+        "event_count": len(events),
+        "state_content_hash": state_payload.get("content_hash"),
+    }
+    payload["anchor_sha256"] = ledger_anchor_hash(payload)
+    return sign_trust_anchor(payload)
+
+
+def audit_ledger_continuity(
+    events: Sequence[dict[str, Any]],
+    account_state: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Fail closed when a committed ledger or its historical source is altered.
+
+    The state file and the external anchor make a removed or truncated canonical
+    JSONL observable instead of treating it as a first-run bootstrap.
+    """
+    blocking: list[str] = []
+    current_events = list(events)
+    state_present = VIRTUAL_LEDGER_STATE_PATH.exists()
+    audit_present = VIRTUAL_LEDGER_AUDIT_PATH.exists()
+    trust_root, trust_root_error = configured_trust_anchor_root()
+    if trust_root is None:
+        blocking.append(trust_root_error or "external trust-anchor root is unavailable")
+    if trust_anchor_hmac_key() is None:
+        blocking.append(
+            f"canonical ledger cannot be verified: {TRUST_ANCHOR_HMAC_KEY_ENV} is not configured"
+        )
+    try:
+        anchor_path: Path | None = virtual_ledger_anchor_path()
+    except RuntimeError as exc:
+        blocking.append(str(exc))
+        anchor_path = None
+    anchor_present = bool(anchor_path and anchor_path.exists())
+    try:
+        cycle_state = read_json_file(CYCLE_STATE_PATH, default={}) if CYCLE_STATE_PATH.exists() else {}
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        cycle_state = {}
+        blocking.append(f"cannot verify cycle state ledger evidence: {type(exc).__name__}: {exc}")
+    cycle_state_has_ledger = bool(
+        isinstance(cycle_state, dict)
+        and cycle_state.get("canonical_ledger_write_performed") is True
+        and (
+            cycle_state.get("ledger_content_hash")
+            or cycle_state.get("ledger_anchor_sha256")
+        )
+    )
+    baseline_evidence_present = (
+        VIRTUAL_LEDGER_PATH.exists()
+        or state_present
+        or audit_present
+        or anchor_present
+        or cycle_state_has_ledger
+    )
+
+    state: dict[str, Any] | None = None
+    if state_present:
+        try:
+            loaded_state = read_json_file(VIRTUAL_LEDGER_STATE_PATH)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            blocking.append(f"cannot verify canonical ledger state: {type(exc).__name__}: {exc}")
+        else:
+            if not isinstance(loaded_state, dict):
+                blocking.append("canonical ledger state must be a JSON object")
+            else:
+                state = loaded_state
+
+    anchor: dict[str, Any] | None = None
+    if anchor_present:
+        try:
+            loaded_anchor = read_json_file(anchor_path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            blocking.append(f"cannot verify canonical ledger anchor: {type(exc).__name__}: {exc}")
+        else:
+            if not isinstance(loaded_anchor, dict):
+                blocking.append("canonical ledger anchor must be a JSON object")
+            else:
+                anchor = loaded_anchor
+                if anchor.get("schema_version") != LEDGER_ANCHOR_SCHEMA_VERSION:
+                    blocking.append("unsupported canonical ledger anchor schema")
+                if anchor.get("anchor_sha256") != ledger_anchor_hash(anchor):
+                    blocking.append("canonical ledger anchor hash mismatch")
+                if anchor.get("ledger_id") != LEDGER_ID:
+                    blocking.append("canonical ledger anchor ledger_id mismatch")
+                if anchor.get("canonical_ledger_path") != relative_path(VIRTUAL_LEDGER_PATH):
+                    blocking.append("canonical ledger anchor path mismatch")
+                blocking.extend(
+                    trust_anchor_authentication_errors(anchor, label="canonical ledger anchor")
+                )
+
+    if not VIRTUAL_LEDGER_PATH.exists():
+        if baseline_evidence_present:
+            blocking.append("canonical ledger is missing while persistent baseline evidence exists")
         return {
             "previous_ledger_present": False,
             "previous_event_count": 0,
@@ -939,11 +1334,16 @@ def audit_ledger_continuity(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "added_event_count": len(events),
             "mutated_locators": [],
             "deleted_locators": [],
-            "blocking_reasons": [],
+            "state_present": state_present,
+            "anchor_present": anchor_present,
+            "anchor_path": relative_path(anchor_path) if anchor_path is not None else None,
+            "baseline_verified": False,
+            "blocking_reasons": blocking,
         }
     try:
         previous_events = read_jsonl_file(VIRTUAL_LEDGER_PATH)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
+        blocking.append(f"cannot verify previous canonical ledger: {type(exc).__name__}: {exc}")
         return {
             "previous_ledger_present": True,
             "previous_event_count": None,
@@ -951,10 +1351,58 @@ def audit_ledger_continuity(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "added_event_count": 0,
             "mutated_locators": [],
             "deleted_locators": [],
-            "blocking_reasons": [f"cannot verify previous canonical ledger: {type(exc).__name__}: {exc}"],
+            "state_present": state_present,
+            "anchor_present": anchor_present,
+            "anchor_path": relative_path(anchor_path) if anchor_path is not None else None,
+            "baseline_verified": False,
+            "blocking_reasons": blocking,
         }
+    if not state:
+        blocking.append("canonical ledger exists without a verifiable state baseline")
+    if not anchor:
+        blocking.append("canonical ledger exists without an externally authenticated trust anchor")
+    previous_hash = stable_hash(previous_events)
+    previous_ledger_sha256 = file_sha256(VIRTUAL_LEDGER_PATH)
+    state_accounts: dict[str, Any] | None = None
+    if state:
+        if state.get("ledger_id") != LEDGER_ID:
+            blocking.append("canonical ledger state ledger_id mismatch")
+        if state.get("event_count") != len(previous_events):
+            blocking.append("canonical ledger state event count mismatch")
+        if state.get("event_hash") != previous_hash:
+            blocking.append("canonical ledger state event hash mismatch")
+        if state.get("canonical_ledger_sha256") != previous_ledger_sha256:
+            blocking.append("canonical ledger state file hash mismatch")
+        raw_state_accounts = state.get("accounts")
+        if not isinstance(raw_state_accounts, dict):
+            blocking.append("canonical ledger state accounts are invalid")
+        else:
+            state_accounts = raw_state_accounts
+            state_content_hash = stable_hash(
+                {"events": previous_events, "accounts": state_accounts}
+            )
+            if state.get("content_hash") != state_content_hash:
+                blocking.append("canonical ledger state content hash mismatch")
+    if anchor:
+        if anchor.get("event_count") != len(previous_events):
+            blocking.append("canonical ledger anchor event count mismatch")
+        if anchor.get("canonical_ledger_sha256") != previous_ledger_sha256:
+            blocking.append("canonical ledger anchor file hash mismatch")
+        if anchor.get("event_hash") != previous_hash:
+            blocking.append("canonical ledger anchor event hash mismatch")
+        if state is not None and state_accounts is not None:
+            if anchor.get("state_content_hash") != state.get("content_hash"):
+                blocking.append("canonical ledger anchor state content hash mismatch")
+            if anchor.get("content_hash") != state.get("content_hash"):
+                blocking.append("canonical ledger anchor content hash mismatch")
+            if anchor.get("account_hash") != stable_hash(state_accounts):
+                blocking.append("canonical ledger anchor account hash mismatch")
     previous_by_locator = {event_source_locator(event): event for event in previous_events}
     current_by_locator = {event_source_locator(event): event for event in events}
+    if len(previous_by_locator) != len(previous_events):
+        blocking.append("previous canonical ledger has duplicate source locators")
+    if len(current_by_locator) != len(current_events):
+        blocking.append("current virtual sources have duplicate source locators")
     deleted = sorted(set(previous_by_locator) - set(current_by_locator))
     mutated = sorted(
         locator
@@ -962,7 +1410,7 @@ def audit_ledger_continuity(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
         if previous_by_locator[locator].get("source_hash") != current_by_locator[locator].get("source_hash")
         or previous_by_locator[locator].get("ledger_event_id") != current_by_locator[locator].get("ledger_event_id")
     )
-    blocking = [f"previous canonical event source deleted: {locator}" for locator in deleted]
+    blocking.extend(f"previous canonical event source deleted: {locator}" for locator in deleted)
     blocking.extend(f"previous canonical event source mutated: {locator}" for locator in mutated)
     preserved = len(set(previous_by_locator) & set(current_by_locator)) - len(mutated)
     return {
@@ -972,6 +1420,10 @@ def audit_ledger_continuity(events: Sequence[dict[str, Any]]) -> dict[str, Any]:
         "added_event_count": len(set(current_by_locator) - set(previous_by_locator)),
         "mutated_locators": [list(locator) for locator in mutated],
         "deleted_locators": [list(locator) for locator in deleted],
+        "state_present": state_present,
+        "anchor_present": anchor_present,
+        "anchor_path": relative_path(anchor_path) if anchor_path is not None else None,
+        "baseline_verified": bool(state and anchor and not blocking),
         "blocking_reasons": blocking,
     }
 
@@ -1180,7 +1632,7 @@ def audit_virtual_execution_ledger(
                 blocking.append(f"account snapshot was not loaded: {expectation.get('path')}")
     reconciliation = reconcile_virtual_accounts(events, account_state)
     blocking.extend(reconciliation["blocking_reasons"])
-    continuity = audit_ledger_continuity(events)
+    continuity = audit_ledger_continuity(events, account_state)
     blocking.extend(continuity["blocking_reasons"])
     audit_content = {
         "ledger_id": LEDGER_ID,
@@ -1220,7 +1672,8 @@ def audit_virtual_execution_ledger(
             "real_broker_orders_allowed": False,
             "external_broker_connection": False,
             "live_trading": False,
-            "historical_source_mutation_fails_closed": True,
+            "historical_source_mutation_fails_closed": continuity["baseline_verified"],
+            "canonical_ledger_anchor_verified": continuity["baseline_verified"],
             "account_snapshots_reconciled": reconciliation["passed"],
         },
     }
@@ -1351,6 +1804,13 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
     generated_at = utc_now()
     if isinstance(previous_state, dict) and previous_state.get("content_hash") == content_hash:
         generated_at = str(previous_state.get("generated_at") or generated_at)
+    try:
+        anchor_path: Path | None = virtual_ledger_anchor_path()
+    except RuntimeError:
+        # The continuity audit below records the configuration error as a
+        # fail-closed result.  Do not turn a missing trust configuration into an
+        # uncaught exception for callers that need machine-readable diagnostics.
+        anchor_path = None
     state_payload = {
         "ledger_id": LEDGER_ID,
         "schema_version": LEDGER_SCHEMA_VERSION,
@@ -1359,6 +1819,8 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         "canonical_ledger_path": relative_path(VIRTUAL_LEDGER_PATH),
         "accounts": account_state,
         "event_count": len(events),
+        "event_hash": stable_hash(events),
+        "anchor_path": relative_path(anchor_path) if anchor_path is not None else None,
     }
     audit = audit_virtual_execution_ledger(
         events,
@@ -1368,9 +1830,15 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         source_errors=source_errors,
     )
     write_performed = bool(write_files and audit["overall_passed"])
+    ledger_anchor: dict[str, Any] | None = None
     if write_performed:
         atomic_write_jsonl(VIRTUAL_LEDGER_PATH, events)
+        state_payload["canonical_ledger_sha256"] = file_sha256(VIRTUAL_LEDGER_PATH)
         atomic_write_json(VIRTUAL_LEDGER_STATE_PATH, state_payload)
+        ledger_anchor = build_virtual_ledger_anchor(events, account_state, state_payload)
+        if anchor_path is None:
+            raise RuntimeError("cannot write canonical ledger without an external trust anchor path")
+        atomic_write_json(anchor_path, ledger_anchor)
         # Re-audit against the just-established canonical baseline so the first
         # successful write and every idempotent replay produce identical audit bytes.
         audit = audit_virtual_execution_ledger(
@@ -1396,6 +1864,8 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         "write_performed": write_performed,
         "events": events,
         "state": state_payload,
+        "anchor_path": str(anchor_path) if anchor_path is not None else None,
+        "anchor_sha256": ledger_anchor.get("anchor_sha256") if ledger_anchor else None,
         "audit": audit,
     }
 
@@ -1588,6 +2058,28 @@ def doctor_checks() -> list[Check]:
             "Python",
             "ok" if sys.version_info >= (3, 11) else "error",
             f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        )
+    )
+
+    trust_root, trust_root_error = configured_trust_anchor_root()
+    namespace = str(os.environ.get(TRUST_ANCHOR_NAMESPACE_ENV) or "").strip()
+    trust_key_configured = trust_anchor_hmac_key() is not None
+    trust_ready = bool(trust_root is not None and namespace and trust_key_configured)
+    trust_detail = (
+        f"root={trust_root}; namespace={namespace}; HMAC key=configured"
+        if trust_ready
+        else trust_root_error
+        or (
+            f"{TRUST_ANCHOR_NAMESPACE_ENV} is not configured"
+            if not namespace
+            else f"{TRUST_ANCHOR_HMAC_KEY_ENV} is not configured"
+        )
+    )
+    checks.append(
+        Check(
+            "external signed trust anchor",
+            "ok" if trust_ready else "error",
+            trust_detail,
         )
     )
 
@@ -1867,7 +2359,20 @@ def command_backup(args: argparse.Namespace) -> int:
 
 
 def command_alerts(args: argparse.Namespace) -> int:
-    command = [sys.executable, str(BRIEFING_ROOT / "scripts" / "alert_dispatch.py"), "--date", args.date]
+    process_due = bool(getattr(args, "process_due", False))
+    date = getattr(args, "date", None)
+    alert_id = getattr(args, "alert_id", None)
+    if not process_due and not date:
+        print("atlas alerts requires --date unless --process-due is used", file=sys.stderr)
+        return 2
+
+    command = [sys.executable, str(BRIEFING_ROOT / "scripts" / "alert_dispatch.py")]
+    if process_due:
+        command.append("--process-due")
+    else:
+        command.extend(["--date", date])
+    if alert_id:
+        command.extend(["--alert-id", alert_id])
     if args.json:
         command.append("--json")
     if args.ack_by:
@@ -1900,44 +2405,205 @@ def process_is_running(pid: int) -> bool:
     return True
 
 
+def parse_cycle_lock_payload(lock_path: Path) -> dict[str, Any]:
+    """Read a lock owner record without treating incomplete data as stale."""
+    try:
+        payload = read_json_file(lock_path)
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"ATLAS cycle lock is unreadable; refusing unsafe takeover: {type(exc).__name__}: {exc}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("ATLAS cycle lock is invalid; refusing unsafe takeover")
+    raw_pid = payload.get("pid")
+    token = payload.get("token")
+    started_at = payload.get("started_at")
+    if isinstance(raw_pid, bool) or not isinstance(raw_pid, int) or raw_pid <= 0:
+        raise RuntimeError("ATLAS cycle lock has an invalid owner pid; refusing unsafe takeover")
+    if not isinstance(token, str) or not token:
+        raise RuntimeError("ATLAS cycle lock has no owner token; refusing unsafe takeover")
+    if not isinstance(started_at, str):
+        raise RuntimeError("ATLAS cycle lock has no start time; refusing unsafe takeover")
+    try:
+        parsed_started_at = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise RuntimeError("ATLAS cycle lock has an invalid start time; refusing unsafe takeover") from exc
+    if parsed_started_at.tzinfo is None:
+        raise RuntimeError("ATLAS cycle lock start time lacks a timezone; refusing unsafe takeover")
+    return payload
+
+
+def publish_cycle_lock(
+    lock_path: Path,
+    payload: dict[str, Any],
+    *,
+    replace_existing: bool = False,
+) -> bool:
+    """Atomically publish a fully written lock by linking a flushed temporary file.
+
+    Unlike create-then-write, another cycle can never observe an empty or partially
+    written owner record.  Replacement is allowed only after the caller holds the
+    advisory guard for this lock, so stale diagnostic metadata cannot create a
+    check-then-unlink acquisition race.
+    """
+    encoded = (json.dumps(payload, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+    temporary = lock_path.with_name(
+        f".{lock_path.name}.{os.getpid()}.{payload['token'][:16]}.tmp"
+    )
+    try:
+        descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        try:
+            written = 0
+            while written < len(encoded):
+                written += os.write(descriptor, encoded[written:])
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        if replace_existing:
+            os.replace(temporary, lock_path)
+        else:
+            try:
+                os.link(temporary, lock_path)
+            except FileExistsError:
+                return False
+    except OSError as exc:
+        raise RuntimeError(f"unable to atomically publish ATLAS cycle lock: {exc}") from exc
+    finally:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
+    return True
+
+
+def cycle_lock_guard_path(lock_path: Path) -> Path:
+    """Return the persistent OS-level guard path for a cycle owner record."""
+    return lock_path.with_name(f"{lock_path.name}.guard")
+
+
+def _is_advisory_lock_contention(exc: OSError) -> bool:
+    """Whether an advisory-lock failure means another process owns the guard."""
+    return exc.errno in {errno.EACCES, errno.EAGAIN} or getattr(exc, "winerror", None) in {
+        32,  # ERROR_SHARING_VIOLATION
+        33,  # ERROR_LOCK_VIOLATION
+    }
+
+
+def acquire_cycle_lock_guard(guard_path: Path) -> int | None:
+    """Acquire an OS-held, non-blocking exclusive guard for a cycle.
+
+    The returned descriptor must remain open for the entire critical section.  A
+    ``None`` result is an ordinary contention result; all other failures fail
+    closed.  Keeping the authoritative lock separate from JSON owner metadata
+    means a crashed writer's stale record can be safely replaced only after the
+    operating system has released its lock.
+    """
+    guard_path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    try:
+        descriptor = os.open(guard_path, flags, 0o600)
+    except OSError as exc:
+        raise RuntimeError(f"unable to open ATLAS cycle lock guard: {exc}") from exc
+
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            # msvcrt.locking locks a byte range, so ensure byte zero exists.
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        if _is_advisory_lock_contention(exc):
+            return None
+        raise RuntimeError(f"unable to acquire ATLAS cycle lock guard: {exc}") from exc
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    return descriptor
+
+
+def release_cycle_lock_guard(descriptor: int) -> None:
+    """Release an advisory cycle guard and close its descriptor."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+
+
 @contextmanager
 def cycle_lock(date: str):
     lock_path = ATLAS_RUNTIME_ROOT / "cycle.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    token = stable_hash({"pid": os.getpid(), "date": date, "started_at": utc_now()})
-    payload = {"pid": os.getpid(), "date": date, "started_at": utc_now(), "token": token}
-    for _attempt in range(2):
+    guard_descriptor = acquire_cycle_lock_guard(cycle_lock_guard_path(lock_path))
+    if guard_descriptor is None:
+        # The OS lock, rather than a pid which could have been reused, is the
+        # authority.  Metadata is best-effort diagnostic information only.
         try:
-            descriptor = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
-            try:
-                existing = read_json_file(lock_path, default={})
-            except (OSError, ValueError):
-                existing = {}
-            existing_pid = int(existing.get("pid", 0)) if isinstance(existing, dict) else 0
-            try:
-                started_at = datetime.fromisoformat(str(existing.get("started_at", "")).replace("Z", "+00:00"))
-                if started_at.tzinfo is None:
-                    started_at = started_at.replace(tzinfo=UTC)
-            except (TypeError, ValueError):
-                started_at = datetime.now(UTC) - timedelta(days=2)
-            stale = not process_is_running(existing_pid) or datetime.now(UTC) - started_at > timedelta(hours=24)
-            if stale:
-                lock_path.unlink(missing_ok=True)
-                continue
-            raise RuntimeError(f"ATLAS cycle already running: {existing}") from exc
-        else:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(payload, handle, ensure_ascii=False, sort_keys=True)
-            break
-    else:
-        raise RuntimeError(f"Unable to acquire ATLAS cycle lock: {lock_path}")
+            existing = parse_cycle_lock_payload(lock_path)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                "ATLAS cycle already running; advisory lock guard is held and owner metadata "
+                f"cannot be read safely: {exc}"
+            ) from exc
+        raise RuntimeError(f"ATLAS cycle already running: {existing}")
+
+    started_at = utc_now()
+    token = hashlib.sha256(os.urandom(32)).hexdigest()
+    payload = {"pid": os.getpid(), "date": date, "started_at": started_at, "token": token}
     try:
+        replace_existing = lock_path.exists()
+        if replace_existing:
+            existing = parse_cycle_lock_payload(lock_path)
+            existing_pid = int(existing["pid"])
+            if process_is_running(existing_pid):
+                raise RuntimeError(f"ATLAS cycle already running: {existing}")
+        if not publish_cycle_lock(lock_path, payload, replace_existing=replace_existing):
+            # Nothing using the current protocol can publish while this process
+            # owns the guard.  Treat an unexpected owner record as unsafe rather
+            # than deleting it and risking overlap with an older process.
+            raise RuntimeError(
+                "ATLAS cycle lock owner record appeared while the advisory guard was held; "
+                "refusing unsafe takeover"
+            )
         yield
     finally:
-        existing = read_json_file(lock_path, default={})
+        try:
+            existing = read_json_file(lock_path, default={})
+        except (OSError, ValueError, json.JSONDecodeError):
+            existing = {}
         if isinstance(existing, dict) and existing.get("token") == token:
-            lock_path.unlink(missing_ok=True)
+            try:
+                lock_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        release_cycle_lock_guard(guard_descriptor)
 
 
 def command_cycle(args: argparse.Namespace) -> int:
@@ -2105,6 +2771,11 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
     history_integrity_before = audit_cycle_history(history_root)
     if not history_integrity_before["passed"]:
         blocking.extend(f"run audit history integrity: {error}" for error in history_integrity_before["errors"])
+    # Never append to a chain that has not first been verified.  This is also
+    # the recovery boundary after an interrupted prior write: an operator must
+    # restore its externally authenticated checkpoint rather than burying the
+    # problem under another record.
+    history_write_allowed = bool(not args.dry_run and history_integrity_before["passed"])
 
     ledger_write_allowed = bool(
         not args.dry_run
@@ -2227,6 +2898,8 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
             "event_count": ledger_result["event_count"],
             "account_count": ledger_result["account_count"],
             "content_hash": ledger_result.get("content_hash"),
+            "anchor_path": ledger_result.get("anchor_path"),
+            "anchor_sha256": ledger_result.get("anchor_sha256"),
             "write_requested": ledger_result.get("write_requested", False),
             "write_performed": ledger_result.get("write_performed", False),
         },
@@ -2249,8 +2922,8 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
             "replay_and_shadow_validation": replay_shadow["overall_passed"],
             "targeted_integration_test_gate": tests_rc == 0,
             "full_test_suite_executed": full_tests_requested and tests_rc == 0,
-            "run_audit_written": not args.dry_run,
-            "immutable_run_history": history_integrity_before["passed"] and not args.dry_run,
+            "run_audit_written": history_write_allowed,
+            "immutable_run_history": history_write_allowed,
             "real_broker_orders_allowed": False,
         },
         "history_integrity_before": history_integrity_before,
@@ -2267,11 +2940,55 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
     audit_md_path = RUN_AUDIT_ROOT / f"ATLAS_CYCLE_RUN_AUDIT-{date}.md"
     history_json_path = history_root / f"{run_id}.json"
     history_md_path = history_root / f"{run_id}.md"
-    if not args.dry_run:
-        atomic_write_json(history_json_path, audit_payload)
-        history_integrity_after = audit_cycle_history(history_root)
-        if not history_integrity_after["passed"]:
-            raise RuntimeError("run audit history verification failed: " + "; ".join(history_integrity_after["errors"]))
+    history_committed = False
+    if history_write_allowed:
+        record_sha256: str | None = None
+        anchor_committed = False
+        try:
+            atomic_write_json(history_json_path, audit_payload)
+            record_sha256 = file_sha256(history_json_path)
+            history_integrity_after = audit_cycle_history(
+                history_root,
+                allow_unanchored_genesis=(
+                    not history_integrity_before["anchor_present"]
+                    and history_integrity_before["chained_record_count"] == 0
+                    and history_integrity_before["legacy_record_count"] == 0
+                ),
+                allow_anchor_append=history_integrity_before["anchor_present"],
+            )
+            if not history_integrity_after["passed"]:
+                raise RuntimeError(
+                    "run audit history verification failed: "
+                    + "; ".join(history_integrity_after["errors"])
+                )
+            write_cycle_history_anchor(history_root, history_integrity_after)
+            anchor_committed = True
+            history_integrity_after = audit_cycle_history(history_root)
+            if not history_integrity_after["passed"]:
+                raise RuntimeError(
+                    "run audit history anchor verification failed: "
+                    + "; ".join(history_integrity_after["errors"])
+                )
+            history_committed = True
+        except Exception as exc:
+            # An anchor write that fails before its atomic replace must not leave
+            # a valid-looking but unanchored tail.  Remove only the exact record
+            # we created; if it changed concurrently, preserve it and fail closed.
+            try:
+                if (
+                    not anchor_committed
+                    and record_sha256
+                    and history_json_path.exists()
+                    and file_sha256(history_json_path) == record_sha256
+                ):
+                    history_json_path.unlink()
+            except OSError:
+                pass
+            raise RuntimeError(
+                f"run audit history checkpoint transaction failed: {type(exc).__name__}: {exc}"
+            ) from exc
+
+    if history_committed:
         atomic_write_text(history_md_path, build_cycle_audit_markdown(audit_payload))
         atomic_write_json(audit_json_path, audit_payload)
         atomic_write_text(audit_md_path, build_cycle_audit_markdown(audit_payload))
@@ -2285,6 +3002,8 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
                 "execution_profile": execution_profile,
                 "fingerprint": fingerprint_after["fingerprint"],
                 "ledger_content_hash": ledger_result.get("content_hash"),
+                "ledger_anchor_sha256": ledger_result.get("anchor_sha256"),
+                "canonical_ledger_write_performed": ledger_result.get("write_performed") is True,
                 "workspace_lock_content_sha256": workspace_lock_content_sha256,
                 "last_audit_json": str(audit_json_path),
                 "last_audit_markdown": str(audit_md_path),
@@ -2305,8 +3024,8 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         "blocking_reasons": blocking,
         "ledger_path": ledger_result["ledger_path"],
         "event_count": ledger_result["event_count"],
-        "run_audit": None if args.dry_run else str(audit_json_path),
-        "run_history": None if args.dry_run else str(history_json_path),
+        "run_audit": str(audit_json_path) if history_committed else None,
+        "run_history": str(history_json_path) if history_committed else None,
         "idempotent_replay": idempotent_replay,
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
@@ -2374,7 +3093,9 @@ def command_build_site(_args: argparse.Namespace) -> int:
 
 
 def command_serve(_args: argparse.Namespace) -> int:
-    return run_command([npm_command(), "run", "dev"], cwd=SITE_ROOT)
+    # Development servers are intentionally long-lived; the cycle timeout is
+    # for gated batch subprocesses, not an interactive serve session.
+    return run_command([npm_command(), "run", "dev"], cwd=SITE_ROOT, timeout=None)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -2420,7 +3141,11 @@ def build_parser() -> argparse.ArgumentParser:
     backup.set_defaults(handler=command_backup)
 
     alerts = subparsers.add_parser("alerts", help="Prepare the audited Codex task-inbox alert payload.")
-    alerts.add_argument("--date", type=valid_iso_date, required=True)
+    alerts.add_argument("--date", type=valid_iso_date)
+    alerts.add_argument(
+        "--alert-id",
+        help="Target a specific immutable alert revision for acknowledgement, receipt, or retry operations.",
+    )
     alerts.add_argument("--json", action="store_true")
     alerts.add_argument("--ack-by", help="Record who acknowledged the date-aligned alert payload.")
     alerts.add_argument("--retry", action="store_true", help="Prepare the next delivery attempt or escalate.")
@@ -2429,6 +3154,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Configured destination that returned a durable delivery receipt.",
     )
     alerts.add_argument("--receipt-id", help="Provider or connector receipt identifier.")
+    alerts.add_argument(
+        "--process-due",
+        action="store_true",
+        help="Consume persisted alert retry and acknowledgement deadlines without generating a new alert.",
+    )
     alerts.set_defaults(handler=command_alerts)
 
     cycle = subparsers.add_parser("cycle", help="Run the gated ATLAS virtual trading/evolution cycle.")

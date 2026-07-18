@@ -80,6 +80,46 @@ class WorkspaceSyncTests(unittest.TestCase):
             ["official release"],
         )
 
+    def test_validate_payload_rejects_page_crashing_market_risk_and_evolution_shapes(self) -> None:
+        payload = json.loads(
+            (ROOT / "src" / "app" / "briefing.generated.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(SITE_SYNC.validate_payload(payload), [])
+
+        payload["markets"]["us"]["items"] = {"not": "an array"}
+        payload["risks"] = ["", 7]
+        payload["evolution"]["integrity"] = {
+            "early_closed_without_terminal_evidence": "not an array",
+            "overdue_unreviewed_prediction_ids": [],
+        }
+
+        errors = SITE_SYNC.validate_payload(payload)
+
+        self.assertIn("markets.us.items must be a list", errors)
+        self.assertIn("risks must be a list of at least 1 non-empty string(s)", errors)
+        self.assertIn(
+            "evolution.integrity.early_closed_without_terminal_evidence must be a list of at least 0 non-empty string(s)",
+            errors,
+        )
+        self.assertNotIn("evolution.integrity.overdue_unreviewed_prediction_ids must be a list of at least 0 non-empty string(s)", errors)
+
+    def test_validate_payload_requires_explicit_stale_or_undated_valuation_provenance(self) -> None:
+        payload = json.loads(
+            (ROOT / "src" / "app" / "briefing.generated.json").read_text(encoding="utf-8")
+        )
+        payload["portfolios"]["us"]["valuationAsOf"] = "2026-07-15"
+        payload["portfolios"]["us"]["valuationIsStale"] = False
+        payload["portfolios"]["china"]["valuationAsOf"] = None
+        payload["portfolios"]["china"]["valuationIsStale"] = False
+
+        errors = SITE_SYNC.validate_payload(payload)
+
+        self.assertIn(
+            "portfolios.us.valuationIsStale must flag a non-report-date valuation",
+            errors,
+        )
+        self.assertIn("portfolios.china.valuationIsStale must flag an undated valuation", errors)
+
     def test_site_dependency_preflight_rejects_nonofficial_registry(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             lockfile = Path(temporary) / "package-lock.json"
@@ -1178,6 +1218,73 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(china["baseCurrency"], "CNY")
         self.assertTrue(any("逐笔重建" in item for item in us["limitations"]))
 
+    def test_historical_portfolio_replay_never_overwrites_later_trade_cash_with_old_valuation(self) -> None:
+        """A prior valuation may supply prices, but cannot erase replayed cash flows."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data_dir = root / "data"
+            data_dir.mkdir()
+            config_path = root / "paper_trading.json"
+            config_path.write_text(
+                json.dumps(
+                    {
+                        "accounts": {
+                            "US": {
+                                "account_id": "us-test",
+                                "initial_cash": 100000,
+                                "base_currency": "USD",
+                                "trades_file": "data/us.jsonl",
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (data_dir / "paper_portfolio_us.json").write_text(
+                json.dumps({"mode": "paper_trading", "as_of_date": "2026-06-30"}),
+                encoding="utf-8",
+            )
+            (data_dir / "us.jsonl").write_text(
+                json.dumps(
+                    {
+                        "date": "2026-06-18",
+                        "action": "BUY",
+                        "symbol": "AAPL",
+                        "exchange": "NASDAQ",
+                        "currency": "USD",
+                        "quantity": 1,
+                        "price": 5000,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            # This snapshot is older than the replayed purchase and therefore
+            # must not restore cash to 100,000 while retaining the AAPL position.
+            (data_dir / "paper_valuations_us.jsonl").write_text(
+                json.dumps({"date": "2026-06-14", "cash": 100000, "equity": 100000, "price_snapshot": []})
+                + "\n",
+                encoding="utf-8",
+            )
+            with (
+                patch.object(SITE_SYNC, "ROOT", root),
+                patch.object(SITE_SYNC, "DATA_DIR", data_dir),
+                patch.object(SITE_SYNC, "PAPER_CONFIG_PATH", config_path),
+            ):
+                reconstructed = SITE_SYNC.portfolio("US", "2026-06-20")
+
+        self.assertEqual(reconstructed["asOf"], "2026-06-20")
+        self.assertEqual(reconstructed["valuationAsOf"], "2026-06-18")
+        self.assertTrue(reconstructed["valuationIsStale"])
+        self.assertEqual(reconstructed["cash"], 95000)
+        self.assertEqual(reconstructed["equity"], 100000)
+        self.assertEqual(reconstructed["cashPct"], 95)
+        self.assertEqual(
+            {item["label"]: item["pct"] for item in reconstructed["allocations"]},
+            {"现金": 95.0, "AAPL": 5.0, "其他": 0.0},
+        )
+        self.assertEqual(sum(item["pct"] for item in reconstructed["allocations"]), 100.0)
+
     def test_public_portfolio_exposes_account_totals_but_not_ledger_details(self) -> None:
         public = SITE_SYNC.public_portfolio(
             {
@@ -1186,6 +1293,8 @@ class WorkspaceSyncTests(unittest.TestCase):
                 "return": "-0.99%",
                 "returnPct": -0.99,
                 "asOf": "2026-07-16",
+                "valuationAsOf": "2026-07-15",
+                "valuationIsStale": True,
                 "baseCurrency": "USD",
                 "cash": 30000.0,
                 "cashPct": 30.3,
@@ -1209,6 +1318,8 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(public["cash"], 30000.0)
         self.assertEqual(public["periodPnl"], -340.16)
         self.assertEqual(public["baseCurrency"], "USD")
+        self.assertEqual(public["valuationAsOf"], "2026-07-15")
+        self.assertTrue(public["valuationIsStale"])
         self.assertEqual(public["allocations"][1]["label"], "匿名资产 1")
         for field in ("accountId", "positions", "realizedPnl", "initialCash", "previousEquity"):
             self.assertNotIn(field, public)

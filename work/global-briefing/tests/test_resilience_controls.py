@@ -7,6 +7,7 @@ import tempfile
 import unittest
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -655,6 +656,347 @@ class ResilienceControlTests(unittest.TestCase):
                 set(health["destinations"]),
                 {"codex_task_inbox", "on_call_webhook"},
             )
+
+    def test_due_alert_processor_consumes_retry_backoff_then_escalates(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            config = root / "config.json"
+            runtime = root / "runtime"
+            write_json(
+                config,
+                {
+                    "external_alerting": {
+                        "enabled": True,
+                        "destinations": ["codex_task_inbox"],
+                        "ack_required_severities": [],
+                        "retry_limit": 2,
+                        "retry_backoff_minutes": [5, 15],
+                    }
+                },
+            )
+            write_json(
+                runtime / "improvements" / "latest.json",
+                {
+                    "actions": [
+                        {
+                            "action_id": "A1",
+                            "status": "open",
+                            "spec": {"severity": "medium", "title": "delivery health"},
+                        }
+                    ]
+                },
+            )
+            started = datetime(2026, 7, 12, 8, 0, tzinfo=UTC)
+            created = ALERTS.build_alert(
+                "2026-07-12",
+                root=root,
+                config_path=config,
+                runtime_root=runtime,
+                now=started,
+            )
+
+            self.assertEqual(created["retry_due_at"], "2026-07-12T08:05:00Z")
+            self.assertEqual(
+                ALERTS.process_due_alerts(runtime_root=runtime, now=started + timedelta(minutes=4)),
+                [],
+            )
+            retried = ALERTS.process_due_alerts(runtime_root=runtime, now=started + timedelta(minutes=5))
+            after_retry = json.loads(
+                (runtime / "alerts" / "alert-2026-07-12.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(retried[0]["delivery_state"], "pending")
+            self.assertEqual(len(after_retry["delivery_attempts"]), 2)
+            self.assertEqual(after_retry["delivery_attempts"][-1]["reason"], "automatic_retry_after_backoff")
+            self.assertEqual(after_retry["retry_due_at"], "2026-07-12T08:20:00Z")
+
+            escalated = ALERTS.process_due_alerts(runtime_root=runtime, now=started + timedelta(minutes=20))
+            after_escalation = json.loads(
+                (runtime / "alerts" / "latest.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(escalated[0]["delivery_state"], "escalation_required")
+            self.assertEqual(after_escalation["delivery_state"], "escalation_required")
+            self.assertEqual(after_escalation["escalation"]["reason"], "delivery_retry_limit_exhausted")
+            self.assertIsNone(after_escalation["retry_due_at"])
+
+    def test_due_alert_processor_escalates_unacknowledged_high_severity_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            config = root / "config.json"
+            runtime = root / "runtime"
+            write_json(
+                config,
+                {
+                    "external_alerting": {
+                        "enabled": True,
+                        "destinations": ["codex_task_inbox"],
+                        "ack_timeout_minutes": 10,
+                        "retry_limit": 5,
+                        "retry_backoff_minutes": [5, 15, 60],
+                    }
+                },
+            )
+            write_json(
+                runtime / "improvements" / "latest.json",
+                {
+                    "actions": [
+                        {
+                            "action_id": "A1",
+                            "status": "overdue",
+                            "spec": {"severity": "high", "title": "acknowledgement health"},
+                        }
+                    ]
+                },
+            )
+            started = datetime(2026, 7, 12, 8, 0, tzinfo=UTC)
+            created = ALERTS.build_alert(
+                "2026-07-12",
+                root=root,
+                config_path=config,
+                runtime_root=runtime,
+                now=started,
+            )
+
+            self.assertTrue(created["requires_acknowledgement"])
+            self.assertEqual(created["escalation_due_at"], "2026-07-12T08:10:00Z")
+            processed = ALERTS.process_due_alerts(runtime_root=runtime, now=started + timedelta(minutes=10))
+            persisted = json.loads(
+                (runtime / "alerts" / "alert-2026-07-12.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(processed[0]["delivery_state"], "escalation_required")
+            self.assertEqual(persisted["escalation"]["reason"], "acknowledgement_overdue")
+            self.assertEqual(persisted["escalation"]["triggered_at"], "2026-07-12T08:10:00Z")
+
+    def test_changed_same_day_alert_preserves_escalated_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            config = root / "config.json"
+            runtime = root / "runtime"
+            write_json(
+                config,
+                {
+                    "external_alerting": {
+                        "enabled": True,
+                        "destinations": ["codex_task_inbox"],
+                        "ack_timeout_minutes": 10,
+                    }
+                },
+            )
+            write_json(
+                runtime / "improvements" / "latest.json",
+                {
+                    "actions": [
+                        {
+                            "action_id": "A1",
+                            "status": "overdue",
+                            "spec": {"severity": "high", "title": "first finding"},
+                        }
+                    ]
+                },
+            )
+            started = datetime(2026, 7, 12, 8, 0, tzinfo=UTC)
+            first = ALERTS.build_alert(
+                "2026-07-12",
+                root=root,
+                config_path=config,
+                runtime_root=runtime,
+                now=started,
+            )
+            ALERTS.process_due_alerts(runtime_root=runtime, now=started + timedelta(minutes=10))
+
+            write_json(
+                runtime / "improvements" / "latest.json",
+                {
+                    "actions": [
+                        {
+                            "action_id": "A2",
+                            "status": "overdue",
+                            "spec": {"severity": "high", "title": "changed finding"},
+                        }
+                    ]
+                },
+            )
+            revised = ALERTS.build_alert(
+                "2026-07-12",
+                root=root,
+                config_path=config,
+                runtime_root=runtime,
+                now=started + timedelta(minutes=11),
+            )
+
+            self.assertNotEqual(revised["alert_id"], first["alert_id"])
+            self.assertEqual(revised["revision"], 2)
+            self.assertEqual(revised["supersedes_alert_id"], first["alert_id"])
+            first_record = runtime / "alerts" / "records" / f"{first['alert_id']}.json"
+            persisted_first = json.loads(first_record.read_text(encoding="utf-8"))
+            self.assertEqual(persisted_first["delivery_state"], "escalation_required")
+
+            # The optional revision selector must update only the historical
+            # record; the same-day compatibility/latest pointers stay revised.
+            historical = ALERTS.record_delivery_receipt(
+                "2026-07-12",
+                "codex_task_inbox",
+                "receipt-for-first-revision",
+                runtime_root=runtime,
+                alert_id=first["alert_id"],
+            )
+            self.assertEqual(historical["delivery_state"], "escalation_required")
+            self.assertIn("codex_task_inbox", historical["delivery_receipts"])
+            self.assertEqual(
+                json.loads((runtime / "alerts" / "alert-2026-07-12.json").read_text(encoding="utf-8"))["alert_id"],
+                revised["alert_id"],
+            )
+            self.assertEqual(
+                json.loads((runtime / "alerts" / "latest.json").read_text(encoding="utf-8"))["alert_id"],
+                revised["alert_id"],
+            )
+            with self.assertRaisesRegex(ValueError, "requires human escalation"):
+                ALERTS.retry_alert(
+                    "2026-07-12",
+                    runtime_root=runtime,
+                    alert_id=first["alert_id"],
+                )
+            audited_first = json.loads(first_record.read_text(encoding="utf-8"))
+            self.assertEqual(audited_first["delivery_state"], "escalation_required")
+            self.assertIn("codex_task_inbox", audited_first["delivery_receipts"])
+
+    def test_due_alert_processor_recovers_missing_pending_handoff_without_claiming_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            config = root / "config.json"
+            runtime = root / "runtime"
+            write_json(
+                config,
+                {
+                    "external_alerting": {
+                        "enabled": True,
+                        "destinations": ["codex_task_inbox"],
+                        "ack_required_severities": [],
+                        "retry_backoff_minutes": [5],
+                    }
+                },
+            )
+            write_json(
+                runtime / "improvements" / "latest.json",
+                {
+                    "actions": [
+                        {
+                            "action_id": "A1",
+                            "status": "open",
+                            "spec": {"severity": "medium", "title": "delivery recovery"},
+                        }
+                    ]
+                },
+            )
+            started = datetime(2026, 7, 12, 8, 0, tzinfo=UTC)
+            created = ALERTS.build_alert(
+                "2026-07-12",
+                root=root,
+                config_path=config,
+                runtime_root=runtime,
+                now=started,
+            )
+            path = runtime / "alerts" / "alert-2026-07-12.json"
+            incomplete = json.loads(path.read_text(encoding="utf-8"))
+            incomplete["delivery_attempts"] = []
+            incomplete["delivery_receipts"] = {}
+            incomplete["delivery_state"] = "pending"
+            incomplete["retry_due_at"] = None
+            write_json(path, incomplete)
+            write_json(runtime / "alerts" / "latest.json", incomplete)
+
+            processed = ALERTS.process_due_alerts(runtime_root=runtime, now=started + timedelta(minutes=1))
+            recovered = json.loads(path.read_text(encoding="utf-8"))
+
+            self.assertEqual(processed[0]["alert_id"], created["alert_id"])
+            self.assertEqual(recovered["delivery_state"], "pending")
+            self.assertEqual(recovered["delivery_receipts"], {})
+            self.assertEqual(len(recovered["delivery_attempts"]), 1)
+            self.assertEqual(recovered["delivery_attempts"][0]["status"], "pending_handoff")
+            self.assertEqual(recovered["delivery_attempts"][0]["reason"], "recovered_missing_delivery_attempt")
+            self.assertEqual(recovered["retry_due_at"], "2026-07-12T08:06:00Z")
+
+    def test_manual_retry_cannot_downgrade_a_durable_escalation(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            config = root / "config.json"
+            runtime = root / "runtime"
+            write_json(
+                config,
+                {"external_alerting": {"enabled": True, "destinations": ["codex_task_inbox"]}},
+            )
+            write_json(
+                runtime / "improvements" / "latest.json",
+                {
+                    "actions": [
+                        {
+                            "action_id": "A1",
+                            "status": "open",
+                            "spec": {"severity": "medium", "title": "escalation integrity"},
+                        }
+                    ]
+                },
+            )
+            payload = ALERTS.build_alert("2026-07-12", root=root, config_path=config, runtime_root=runtime)
+            ALERTS.mark_escalation(
+                payload,
+                now=datetime(2026, 7, 12, 8, 0, tzinfo=UTC),
+                reason="delivery_retry_limit_exhausted",
+            )
+            path = runtime / "alerts" / "alert-2026-07-12.json"
+            write_json(path, payload)
+            write_json(runtime / "alerts" / "latest.json", payload)
+
+            with self.assertRaisesRegex(ValueError, "requires human escalation"):
+                ALERTS.retry_alert("2026-07-12", runtime_root=runtime)
+
+            persisted = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(persisted["delivery_state"], "escalation_required")
+            self.assertEqual(persisted["escalation"]["reason"], "delivery_retry_limit_exhausted")
+
+    def test_manual_retry_consumes_an_expired_ack_deadline_before_retrying(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            config = root / "config.json"
+            runtime = root / "runtime"
+            write_json(
+                config,
+                {
+                    "external_alerting": {
+                        "enabled": True,
+                        "destinations": ["codex_task_inbox"],
+                        "ack_timeout_minutes": 10,
+                    }
+                },
+            )
+            write_json(
+                runtime / "improvements" / "latest.json",
+                {
+                    "actions": [
+                        {
+                            "action_id": "A1",
+                            "status": "overdue",
+                            "spec": {"severity": "high", "title": "expired acknowledgement"},
+                        }
+                    ]
+                },
+            )
+            started = datetime(2026, 7, 12, 8, 0, tzinfo=UTC)
+            ALERTS.build_alert(
+                "2026-07-12", root=root, config_path=config, runtime_root=runtime, now=started
+            )
+
+            with patch.object(ALERTS, "utc_now", return_value=started + timedelta(minutes=10)):
+                with self.assertRaisesRegex(ValueError, "requires human escalation"):
+                    ALERTS.retry_alert("2026-07-12", runtime_root=runtime)
+
+            persisted = json.loads(
+                (runtime / "alerts" / "alert-2026-07-12.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(persisted["delivery_state"], "escalation_required")
+            self.assertEqual(persisted["escalation"]["reason"], "acknowledgement_overdue")
 
     def test_concurrent_alert_receipts_do_not_lose_an_update(self) -> None:
         with tempfile.TemporaryDirectory() as workspace:

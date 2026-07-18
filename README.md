@@ -104,6 +104,16 @@ python atlas.py cycle --date 2026-07-10 --dry-run
 python atlas.py cycle --date 2026-07-10 --full-tests
 ```
 
+在首次运行前，必须把账本与运行历史的信任锚放在工作区之外的受保护位置，并从密钥管理器注入 HMAC 密钥；密钥绝不能写入仓库或 runtime：
+
+```powershell
+$env:ATLAS_TRUST_ANCHOR_ROOT = "D:\ATLAS-Trust"  # 不得位于本工作区或 work/shared/atlas
+$env:ATLAS_TRUST_ANCHOR_NAMESPACE = "atlas-production"  # 稳定、不可随工作区迁移而改变
+$env:ATLAS_TRUST_ANCHOR_HMAC_KEY = "<由密钥管理器注入的高熵密钥>"
+```
+
+首个成功 cycle 会在该外部根目录创建已签名 checkpoint。之后若 canonical ledger、历史尾部或外部锚被删除、替换或无法通过 HMAC 验证，cycle 会 fail-closed；不能通过删除 `work/shared/atlas` 重建基线。外部根目录应使用独立访问控制和保留策略（生产建议 WORM / 远端受保护存储），因为同一高权限主体若同时删除工作区、外部锚和密钥，任何本地文件方案都无法提供独立的篡改证据。
+
 cycle 的稳定产物：
 
 - 规范化虚拟执行账本：`work/shared/atlas/virtual_execution/atlas_virtual_execution_ledger.jsonl`
@@ -193,6 +203,7 @@ atlas doctor
 - 根 CI 固定 GitHub Action 提交，执行 Ruff、Bandit、秘密扫描、Python 依赖审计、60% 覆盖率及 Python 3.11/3.12 矩阵。组合工作区 checkout 对私有子仓要求仓库 secret `ATLAS_SUBMODULE_TOKEN`；缺失时明确失败，不会降级成缺子仓的假绿。
 - 灾备写入 `D:/ATLAS-Backups`，要求与工作区不同卷；生产配置强制使用 AES-256-GCM。32 字节密钥以 Base64 放入密钥管理器提供的 `ATLAS_BACKUP_ENCRYPTION_KEY` 环境变量，不得写入仓库。schema 4 快照使用分用途 HMAC 认证 manifest sidecar 与 latest 索引，前序介质必须先通过 AEAD、逐文件哈希以及 Git `bundle verify → mirror clone → fsck` 才能接链；明文 staging 仅位于受保护的备份目标并可靠清理。旧 schema 2 `latest.json` 必须由运维显式归档后建立新的加密 genesis，系统不会静默信任迁移。该证据不宣称操作系统凭据等完整运行时已恢复。
 - 高/严重改进项需要确认；告警具备稳定 ID、重试上限、确认超时和升级状态。仅生成路由文件不算送达，每个目的地必须记录不可变回执后才能确认：`python atlas.py alerts --date YYYY-MM-DD --receipt-destination DESTINATION --receipt-id RECEIPT_ID`。真实 connector 回执还会更新独立、带新鲜度约束的 `channel_health.json`，使健康日能力验收保持幂等；需确认告警只有到 `acknowledged` 才通过。Slack 连接器未返回回执时不得宣称已送达。
+- 由计划任务至少每 5 分钟执行 `python atlas.py alerts --process-due --json`，消费已持久化的 retry/ack deadline。它只创建 `pending_handoff` 或 `escalation_required` 状态，绝不伪造 connector 的送达回执；已升级告警必须由人工处置，不能通过 retry 降级。
 
 预测系统的分层设计、契约示例和晋升标准见 [RESEARCH_ARCHITECTURE.md](RESEARCH_ARCHITECTURE.md)。
 
