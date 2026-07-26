@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -300,6 +302,45 @@ class SelfHealingTests(unittest.TestCase):
         issue = next(iter(json.loads(self.engine.state_path.read_text(encoding="utf-8"))["issues"].values()))
         self.assertEqual(issue["last_repair_status"], "failed")
 
+    def test_verified_repair_exposes_effective_status_without_rewriting_observed_evidence(self) -> None:
+        state_path = self.root / "work" / "global-briefing" / "data" / "site-sync-state.json"
+        write_json(
+            state_path,
+            {
+                "pending_sha": "same",
+                "last_deployed_sha": "same",
+            },
+        )
+        finding = self.engine.result(
+            "site_state_consistency",
+            False,
+            state_path,
+            "stale pending marker",
+            fixer="normalize_site_state",
+        )
+        with (
+            patch.object(self.engine, "detect", return_value=[finding]),
+            patch.object(self.engine, "verify_finding", return_value=True),
+        ):
+            returncode, report = self.engine.run(
+                "2026-07-12", apply_safe=True, deep=False, strict=False
+            )
+
+        self.assertEqual(returncode, 0)
+        self.assertEqual(report["evidence_observed_at"], report["finished_at"])
+        self.assertFalse(report["checks"][0]["passed"])
+        self.assertTrue(report["checks"][0]["effective_passed"])
+        self.assertEqual(report["checks"][0]["effective_status"], "repaired")
+        self.assertEqual(report["counts"]["passed"], 1)
+
+        status = MODULE.status_view(report, read_at="2026-07-12T12:00:00Z")
+        self.assertEqual(status["status_view"]["read_at"], "2026-07-12T12:00:00Z")
+        self.assertEqual(
+            status["status_view"]["evidence_observed_at"],
+            report["finished_at"],
+        )
+        self.assertTrue(status["status_view"]["historical_snapshot"])
+
     def test_circuit_breaker_stops_repeated_repairs(self) -> None:
         finding = self.engine.result(
             "site_state_consistency",
@@ -313,6 +354,24 @@ class SelfHealingTests(unittest.TestCase):
 
         self.assertFalse(eligible)
         self.assertIn("maximum repair attempts", reason)
+
+    def test_independent_deep_checks_start_concurrently_and_keep_stable_order(self) -> None:
+        site_started = threading.Event()
+        briefing_observed_site = []
+
+        def runner(command, *, cwd, timeout):
+            if command[0] == sys.executable:
+                briefing_observed_site.append(site_started.wait(timeout=0.5))
+            else:
+                site_started.set()
+            return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+        self.engine.runner = runner
+        results = self.engine.probe_deep()
+
+        self.assertEqual(briefing_observed_site, [True])
+        self.assertEqual([item.check_id for item in results], ["briefing_tests", "site_quality"])
+        self.assertTrue(all(item.passed for item in results))
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ import os
 import shutil
 import subprocess
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, date as Date, datetime, timedelta
@@ -113,6 +114,21 @@ def latest_report_date() -> str:
     if not candidates:
         raise FileNotFoundError("no dated global briefing report exists")
     return max(candidates)
+
+
+def status_view(payload: dict[str, Any], *, read_at: str | None = None) -> dict[str, Any]:
+    """Annotate a persisted run snapshot without pretending it is a live probe."""
+    view = dict(payload)
+    evidence_observed_at = str(
+        payload.get("evidence_observed_at") or payload.get("finished_at") or ""
+    )
+    view["status_view"] = {
+        "read_at": read_at or utc_now(),
+        "evidence_observed_at": evidence_observed_at or None,
+        "historical_snapshot": True,
+        "scope": str(payload.get("evidence_scope") or "self_healing_run_snapshot"),
+    }
+    return view
 
 
 @dataclass
@@ -589,32 +605,46 @@ class SelfHealingEngine:
         )
 
     def probe_deep(self) -> list[ProbeResult]:
-        results: list[ProbeResult] = []
+        probes: list[Callable[[], ProbeResult]] = []
         deep_config = self.policy.get("deep_checks", {})
         if deep_config.get("briefing_tests", True):
-            completed = self.runner(
-                [sys.executable, "-m", "unittest", "discover", str(self.briefing_root / "tests"), "-p", "test_*.py"],
-                cwd=self.root,
-                timeout=300,
-            )
-            results.append(self.result(
-                "briefing_tests",
-                completed.returncode == 0,
-                self.briefing_root / "tests",
-                "briefing test suite passed" if completed.returncode == 0 else "briefing test suite failed",
-                evidence={"returncode": completed.returncode, "stdout_tail": completed.stdout[-2000:], "stderr_tail": completed.stderr[-2000:]},
-            ))
+            def probe_briefing_tests() -> ProbeResult:
+                completed = self.runner(
+                    [sys.executable, "-m", "unittest", "discover", str(self.briefing_root / "tests"), "-p", "test_*.py"],
+                    cwd=self.root,
+                    timeout=300,
+                )
+                return self.result(
+                    "briefing_tests",
+                    completed.returncode == 0,
+                    self.briefing_root / "tests",
+                    "briefing test suite passed" if completed.returncode == 0 else "briefing test suite failed",
+                    evidence={"returncode": completed.returncode, "stdout_tail": completed.stdout[-2000:], "stderr_tail": completed.stderr[-2000:]},
+                )
+
+            probes.append(probe_briefing_tests)
         if deep_config.get("site_quality", True):
-            npm = "npm.cmd" if os.name == "nt" else "npm"
-            completed = self.runner([npm, "run", "quality"], cwd=self.site_root, timeout=420)
-            results.append(self.result(
-                "site_quality",
-                completed.returncode == 0,
-                self.site_root,
-                "site quality suite passed" if completed.returncode == 0 else "site quality suite failed",
-                evidence={"returncode": completed.returncode, "stdout_tail": completed.stdout[-3000:], "stderr_tail": completed.stderr[-3000:]},
-            ))
-        return results
+            def probe_site_quality() -> ProbeResult:
+                npm = "npm.cmd" if os.name == "nt" else "npm"
+                completed = self.runner([npm, "run", "quality"], cwd=self.site_root, timeout=420)
+                return self.result(
+                    "site_quality",
+                    completed.returncode == 0,
+                    self.site_root,
+                    "site quality suite passed" if completed.returncode == 0 else "site quality suite failed",
+                    evidence={"returncode": completed.returncode, "stdout_tail": completed.stdout[-3000:], "stderr_tail": completed.stderr[-3000:]},
+                )
+
+            probes.append(probe_site_quality)
+        if len(probes) < 2:
+            return [probe() for probe in probes]
+        # Deep checks are evidence-only and operate in separate component roots.
+        # Keep repair/mutation phases serial, while reducing the daily gate's
+        # critical path. Results are consumed in declaration order for stable
+        # report identities regardless of completion order.
+        with ThreadPoolExecutor(max_workers=len(probes), thread_name_prefix="atlas-deep") as pool:
+            futures = [pool.submit(probe) for probe in probes]
+            return [future.result() for future in futures]
 
     def detect(self, date: str, *, deep: bool) -> list[ProbeResult]:
         results = [self.probe_report(date)]
@@ -873,6 +903,7 @@ class SelfHealingEngine:
                 repair_records.append({
                     "issue_id": issue["issue_id"],
                     "check_id": finding.check_id,
+                    "fingerprint": finding.fingerprint,
                     "fixer": finding.fixer,
                     "status": issue["last_repair_status"],
                     "detail": repair.detail,
@@ -891,17 +922,42 @@ class SelfHealingEngine:
         detected_failures = sum(not item.passed for item in results)
         verified_repairs = sum(item["status"] == "verified" for item in repair_records)
         remaining_failures = max(0, detected_failures - verified_repairs)
+        verified_fingerprints = {
+            str(item.get("fingerprint") or "")
+            for item in repair_records
+            if item.get("status") == "verified"
+        }
+        checks: list[dict[str, Any]] = []
+        for item in results:
+            effective_passed = item.passed or item.fingerprint in verified_fingerprints
+            checks.append(
+                asdict(item)
+                | {
+                    "fingerprint": item.fingerprint,
+                    "effective_passed": effective_passed,
+                    "effective_status": (
+                        "passed"
+                        if item.passed
+                        else "repaired"
+                        if effective_passed
+                        else "failed"
+                    ),
+                }
+            )
+        finished_at = utc_now()
         report = {
             "schema_version": 1,
             "run_id": run_id,
             "date": date,
             "started_at": started_at,
-            "finished_at": utc_now(),
+            "finished_at": finished_at,
+            "evidence_observed_at": finished_at,
+            "evidence_scope": "self_healing_run_snapshot",
             "mode": "apply_safe" if apply_safe else "detect_only",
             "deep": deep,
             "strict": strict,
             "overall_status": "blocked" if blocking else "degraded" if unresolved else "healthy",
-            "checks": [asdict(item) | {"fingerprint": item.fingerprint} for item in results],
+            "checks": checks,
             "repairs": repair_records,
             "counts": {
                 "checks": len(results),
@@ -1004,7 +1060,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         engine = SelfHealingEngine()
         if args.status:
             payload = read_json(engine.latest_path, {})
-            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            print(json.dumps(status_view(payload), ensure_ascii=False, indent=2, sort_keys=True))
             return 0 if payload else 2
         date = args.date or latest_report_date()
         with self_healing_lock(engine):
