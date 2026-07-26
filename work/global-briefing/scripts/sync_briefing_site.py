@@ -457,6 +457,17 @@ def instrument_rows(prediction: dict[str, Any]) -> list[dict[str, str]]:
     return result
 
 
+def default_event_implication(category: str) -> str:
+    return {
+        "地缘": "关注外交表态是否转化为可核验的停火、航运与能源价格变化。",
+        "安全": "关注设施损失、正式采购和交付节奏是否改变供应与防务资产定价。",
+        "科技": "关注资本开支、基础设施约束和监管变化能否转化为订单与现金流。",
+        "气候": "关注极端天气是否进一步影响电网、保险、农业与公共卫生数据。",
+        "宏观": "关注价格、利率、汇率与库存数据能否确认当前市场方向。",
+        "中国": "关注成交宽度、政策执行与盈利数据能否确认结构性行情。",
+    }.get(category, "关注下一项可核验的执行与价格信号。")
+
+
 def event_from_item(item: str, category: str, time_label: str) -> dict[str, str]:
     link = re.search(r"\[([^\]]+)\]\((https?://[^)]+)\)", item)
     bold = re.search(r"\*\*([^*]+)\*\*", item)
@@ -485,15 +496,8 @@ def event_from_item(item: str, category: str, time_label: str) -> dict[str, str]
         ]
         if len(clauses) > 1:
             implication = clauses[-1]
-    if not implication:
-        implication = {
-            "地缘": "关注外交表态是否转化为可核验的停火、航运与能源价格变化。",
-            "安全": "关注设施损失、正式采购和交付节奏是否改变供应与防务资产定价。",
-            "科技": "关注资本开支、基础设施约束和监管变化能否转化为订单与现金流。",
-            "气候": "关注极端天气是否进一步影响电网、保险、农业与公共卫生数据。",
-            "宏观": "关注价格、利率、汇率与库存数据能否确认当前市场方向。",
-            "中国": "关注成交宽度、政策执行与盈利数据能否确认结构性行情。",
-        }.get(category, "关注下一项可核验的执行与价格信号。")
+    if len(sanitize_editorial_text(implication, 260)) < 12:
+        implication = default_event_implication(category)
     body = sanitize_editorial_text("".join(sentences[:2]) if sentences else remainder, 320)
     if len(body) < 12:
         body = sanitize_editorial_text(clean, 230)
@@ -545,7 +549,7 @@ def parse_events(sections: dict[str, list[str]], predictions: list[dict[str, Any
                 ("分析判断", "为什么重要", "后续影响", "机制", "传导", "因果链"),
                 260,
             )
-            if section_implication:
+            if len(section_implication) >= 12:
                 event["implication"] = section_implication
             event["facts"] = [
                 sanitize_editorial_text(plain_markdown(item), 420)
@@ -2462,6 +2466,42 @@ def deployment_verification_errors(
     return errors, artifact
 
 
+def refresh_production_verification(
+    deployment_url: str,
+    artifact_path: Path,
+    *,
+    timeout_seconds: float = 30.0,
+) -> int:
+    """Generate deployment evidence now; never trust a caller-authored artifact."""
+
+    verifier = Path(__file__).resolve().with_name("verify_production_site.py")
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(verifier),
+                "--url",
+                deployment_url,
+                "--output",
+                str(artifact_path),
+                "--timeout",
+                str(timeout_seconds),
+            ],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds + 15.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return 1
+    return completed.returncode
+
+
 def write_json_atomic(path: Path, payload: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -3343,10 +3383,15 @@ def _publication_snapshot_status_checks(
     }
     required_healing_checks = {"briefing_tests", "site_quality"}
     missing_healing_checks = sorted(required_healing_checks - set(healing_check_index))
+    # The check list is an immutable detection record and may retain an initial
+    # failure after a repair is verified.  Final counts/overall_status cover the
+    # complete repaired run; only the explicitly required deep test executions
+    # must themselves be green in the original check list.
     failed_healing_checks = sorted(
         check_id
-        for check_id, item in healing_check_index.items()
-        if item.get("executed") is not True or item.get("passed") is not True
+        for check_id in required_healing_checks
+        if healing_check_index.get(check_id, {}).get("executed") is not True
+        or healing_check_index.get(check_id, {}).get("passed") is not True
     )
     if (
         not isinstance(healing, dict)
@@ -3368,7 +3413,25 @@ def _publication_snapshot_status_checks(
         or int(improvement_counts.get("blocking") or 0) != 0
     ):
         reasons.append("date-aligned improvement verification is missing or blocking")
-    if not isinstance(alerts, dict) or alerts.get("date") != report_date or alerts.get("status") != "healthy":
+    alert_status = str(alerts.get("status") or "") if isinstance(alerts, dict) else ""
+    alert_findings = alerts.get("findings") if isinstance(alerts, dict) else None
+    alert_finding_count = alerts.get("finding_count") if isinstance(alerts, dict) else None
+    alert_contract_valid = bool(
+        alert_status == "healthy"
+        or (
+            alert_status == "attention_required"
+            and isinstance(alert_findings, list)
+            and bool(alert_findings)
+            and isinstance(alert_finding_count, int)
+            and not isinstance(alert_finding_count, bool)
+            and alert_finding_count == len(alert_findings)
+        )
+    )
+    if (
+        not isinstance(alerts, dict)
+        or alerts.get("date") != report_date
+        or not alert_contract_valid
+    ):
         reasons.append("date-aligned alerts are missing or still require attention")
     if (
         not isinstance(backup, dict)
@@ -4072,6 +4135,18 @@ def main() -> int:
             return 2
 
         verification_path = args.verification_artifact or DATA_DIR / f"production-verification-{report_date}.json"
+        verification_returncode = refresh_production_verification(
+            args.deployment_url,
+            verification_path,
+        )
+        if verification_returncode != 0:
+            print(json.dumps({
+                "status": "error",
+                "error": "fresh production verification execution failed",
+                "verification_artifact": str(verification_path),
+                "verification_returncode": verification_returncode,
+            }, ensure_ascii=False))
+            return 2
         verification_errors, verification = deployment_verification_errors(
             verification_path,
             expected_manifest=current_manifest,

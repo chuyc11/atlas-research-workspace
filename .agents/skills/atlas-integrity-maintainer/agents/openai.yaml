@@ -1,0 +1,4 @@
+interface:
+  display_name: "ATLAS Integrity Maintainer"
+  short_description: "Audit and repair ATLAS integrity and release controls"
+  default_prompt: "Use $atlas-integrity-maintainer to audit and safely repair ATLAS integrity, evidence, and release gates."

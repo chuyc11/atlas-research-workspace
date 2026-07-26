@@ -76,7 +76,7 @@ Before saving a new briefing, create JSON prediction records with:
 - Date and horizon.
 - Scenario or claim.
 - Trigger.
-- Probability as low/medium/high or project-compatible value.
+- Numeric probability strictly between 0 and 1 under the current v2 contract. Treat legacy labels as historical input only; never create a new labeled probability.
 - Beneficiary and pressured themes.
 - Verification/falsification signals.
 - Linked market observations or virtual-paper decisions when applicable.

@@ -1,13 +1,13 @@
 ---
 name: global-briefing-runbook
-description: Run the file-backed Chinese daily global morning briefing workflow for this project. Use when generating, repairing, or auditing the daily briefing, weekly/monthly summaries, prediction records, source collection, or paper-trading update under work/global-briefing.
+description: Generate, repair, or audit the Phase-A file-backed Chinese global briefing artifacts under work/global-briefing, including source collection, dated reports, prediction records, China mapping, paper-trading updates, and weekly/monthly reviews. Use for briefing research and economic-record preparation; use atlas-daily-operator for the full cross-project cycle and atlas-site-publisher for website deployment.
 ---
 
 # Global Briefing Runbook
 
 ## Scope
 
-Use this skill as the project-specific orchestrator for `work/global-briefing`. Keep the output file-first: save durable Markdown/JSON artifacts, then reply briefly in chat.
+Use this skill as the Phase-A orchestrator for `work/global-briefing`. Keep the output file-first: save durable Markdown/JSON artifacts, then hand off to `$atlas-daily-operator` for cross-project controls.
 
 ## Required Context
 
@@ -24,6 +24,12 @@ Read these files before a full run:
 - Prior paper-trading state through `paper_trading.py previous`
 
 Use `skills.json` as the authoritative routing table. Load only the skills that add evidence, quality control, or market interpretation for the current run.
+
+## Run Date And Resume
+
+Resolve one `RUN_DATE` from `settings.json.timezone` before any command. Never switch to a UTC calendar date or pass a literal placeholder.
+
+Treat an existing dated report or same-day ledger entry as a resume. Inspect prediction, order, and valuation identities before mutation. Once cross-project publication has started, do not use this skill to regenerate Phase A.
 
 ## Daily Workflow
 
@@ -99,11 +105,25 @@ Mark each primary thesis with `### 核心主线：...`. Coverage sections may be
 
 ## Predictions And Storage
 
-Before writing the report, save structured prediction records:
+Prepare a complete temporary report draft and prediction JSON before any ledger mutation. Run the read-only preflight first:
+
+```powershell
+python work\global-briefing\scripts\briefing_store.py validate-records --date YYYY-MM-DD --input TEMP_PREDICTIONS_JSON
+```
+
+Only after it succeeds, append structured prediction records:
 
 ```powershell
 python work\global-briefing\scripts\briefing_store.py record --date YYYY-MM-DD --input TEMP_PREDICTIONS_JSON
 ```
+
+Confirm every intended original/review is present exactly once, then run the non-mutating operational report gate before paper orders or marks:
+
+```powershell
+python work\global-briefing\scripts\research_quality.py --date YYYY-MM-DD --report TEMP_REPORT_MD --predictions work\global-briefing\data\predictions.jsonl --dry-run
+```
+
+If either preflight fails, save a clearly marked partial report when useful; do not append incomplete predictions, apply orders, mark valuations, or enter publication.
 
 For predictions dated 2026-07-12 or later, use the v2 pre-registration contract in
 `work/global-briefing/config/prediction.schema.json`. Probability must be numeric
@@ -140,37 +160,7 @@ python work\global-briefing\scripts\briefing_store.py write --date YYYY-MM-DD --
 python atlas.py quality --date YYYY-MM-DD
 ```
 
-After the dated report and unified cycle are complete, run the closed-loop
-retrospective-action verification and self-healing gates before website deployment:
-
-```powershell
-python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict
-python atlas.py heal --date YYYY-MM-DD --apply-safe --deep --strict
-```
-
-`atlas.py improvements` converts every active retrospective recommendation into
-a durable action with a stable id, owner domain, due date, acceptance rule,
-evidence, and status. The next eligible run must verify it. A failed previously
-verified rule becomes `regressed`; an unverified rule becomes `overdue` after its
-deadline. Do not mark an action complete from prose alone.
-
-The self-healing policy is defined in
-`work/global-briefing/config/self_healing.json`. It may automatically repair
-only allowlisted low-risk derived artifacts. It must register, but never
-automatically change, source code, research conclusions, probabilities,
-paper-trading orders, production access, or deployments. Every attempted repair
-requires a pre-change snapshot, post-change verification, audit record, circuit
-breaker, and rollback on verification failure. A remaining critical issue blocks
-deployment; a high or medium issue must be disclosed and routed for review.
-
-After the final alert and verified external backup artifacts exist, the normal site
-sync freezes `work/shared/atlas/publication_snapshots/atlas-publication-YYYY-MM-DD.json`.
-The snapshot contains the exact validated site payload plus date-aligned cycle,
-self-healing, improvement, alert, and recovery evidence. Deployment retries must reuse
-that payload byte-for-byte and must not rerun Phase A. A report, prediction, or telemetry
-change after freezing fails closed; create a same-day revision only with
-`--refresh-publication-snapshot` after rerunning every prerequisite gate. The prior
-revision is retained in snapshot history.
+After the final dated report and ledgers are verified, stop Phase A and hand off to `$atlas-daily-operator`. Do not run website deployment from this skill.
 
 Treat `atlas.py quality --strict` as the research-promotion gate. A normal daily run
 may remain operational while strict mode stays blocked for insufficient resolved

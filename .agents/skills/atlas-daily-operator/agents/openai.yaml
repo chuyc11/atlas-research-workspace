@@ -1,0 +1,4 @@
+interface:
+  display_name: "ATLAS Daily Operator"
+  short_description: "Run the resumable ATLAS research-to-publication cycle"
+  default_prompt: "Use $atlas-daily-operator to run today's resumable ATLAS briefing, control, recovery, and publication workflow."

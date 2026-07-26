@@ -1,0 +1,4 @@
+interface:
+  display_name: "ATLAS Site Publisher"
+  short_description: "Publish frozen ATLAS briefings with isolated builds"
+  default_prompt: "Use $atlas-site-publisher to safely resume and deploy the current frozen ATLAS site candidate."

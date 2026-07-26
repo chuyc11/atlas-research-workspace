@@ -1,6 +1,6 @@
-# A-share Owner-Readiness Chain
+# Archived A-share Owner-Readiness Chain
 
-Use this reference for v0.8.13+ owner-readiness work.
+This reference preserves historical v0.8.13-v0.8.17 semantics for audit and regression work. It is not a current roadmap. Always read `work/trading-core/VERSION` and the active task contract first; never advance from this document's old recommendation without explicit user authorization.
 
 ## Current Chain Shape
 
@@ -56,7 +56,6 @@ For `as_of_date=2026-06-26`:
 - `auto_waiver_allowed=false`
 - `manual_waiver_approval_recorded=false`
 
-Recommended next after v0.8.17:
+Historical recommendation after v0.8.17 (superseded by later releases):
 
 `v0.8.18-a-share-recovery-evidence-collection-and-readiness-improvement-artifacts`
-

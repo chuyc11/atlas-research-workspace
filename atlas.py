@@ -1300,6 +1300,13 @@ def canonicalize_temp_order_intent(
         else row.get("quantity")
     )
     price = maybe_float(row.get("price"))
+    declared_notional = (
+        row.get("notional")
+        if row.get("notional") is not None
+        else row.get("gross_value")
+    )
+    notional = maybe_float(declared_notional, price * quantity)
+    has_positive_sizing = quantity > 0 or notional > 0
     event = {
         "ledger_id": LEDGER_ID,
         "schema_version": LEDGER_SCHEMA_VERSION,
@@ -1322,10 +1329,14 @@ def canonicalize_temp_order_intent(
         "side": action,
         "filled_price": price,
         "filled_quantity": quantity,
-        "notional": maybe_float(row.get("gross_value"), price * quantity),
+        "notional": notional,
         "fee": maybe_float(row.get("fee")),
         "tax": maybe_float(row.get("tax")),
-        "status": "INTENT_RECORDED" if action in {"BUY", "SELL"} and quantity > 0 else "HELD",
+        "status": (
+            "INTENT_RECORDED"
+            if action in {"BUY", "SELL"} and has_positive_sizing
+            else "HELD"
+        ),
         "trade_id": event_id,
         "order_id": str(row.get("order_id") or event_id),
         "prediction_id": row.get("prediction_id"),
@@ -1616,11 +1627,10 @@ def audit_ledger_continuity(
     mutated = sorted(
         locator
         for locator in set(previous_by_locator) & set(current_by_locator)
-        if previous_by_locator[locator].get("source_hash") != current_by_locator[locator].get("source_hash")
-        or previous_by_locator[locator].get("ledger_event_id") != current_by_locator[locator].get("ledger_event_id")
+        if stable_hash(previous_by_locator[locator]) != stable_hash(current_by_locator[locator])
     )
     blocking.extend(f"previous canonical event source deleted: {locator}" for locator in deleted)
-    blocking.extend(f"previous canonical event source mutated: {locator}" for locator in mutated)
+    blocking.extend(f"previous canonical event mutated: {locator}" for locator in mutated)
     preserved = len(set(previous_by_locator) & set(current_by_locator)) - len(mutated)
     return {
         "previous_ledger_present": True,
@@ -1807,8 +1817,19 @@ def audit_virtual_execution_ledger(
             if quantity is None or quantity != 0:
                 blocking.append(f"{event_id}: virtual hold quantity must be zero")
         if event_type == "virtual_order_intent" and str(event.get("side")).upper() in {"BUY", "SELL"}:
-            if quantity is None or price is None or quantity <= 0 or price <= 0:
-                blocking.append(f"{event_id}: order intent requires positive quantity and price")
+            notional = numeric_values.get("notional")
+            if (
+                price is None
+                or price <= 0
+                or (
+                    (quantity is None or quantity <= 0)
+                    and (notional is None or notional <= 0)
+                )
+            ):
+                blocking.append(
+                    f"{event_id}: order intent requires a positive price and "
+                    "positive quantity or notional"
+                )
         forbidden = sorted(nested_forbidden_keys(event))
         if forbidden:
             blocking.append(f"{event_id}: forbidden broker/live keys {forbidden}")
@@ -2469,7 +2490,11 @@ def command_sync(args: argparse.Namespace) -> int:
         return 1
 
     exporter = BRIEFING_ROOT / "scripts" / "export_trading_core_signals.py"
-    export_command = [sys.executable, str(exporter), "--date", date]
+    # A valid daily briefing may contain no prediction mapped to trading-core's
+    # deliberately narrow China ETF universe.  The standalone exporter remains
+    # fail-closed by default; the audited daily orchestration explicitly accepts
+    # that transparent zero-signal state and still materializes the dated bridge.
+    export_command = [sys.executable, str(exporter), "--date", date, "--allow-empty"]
     if args.dry_run:
         export_command.append("--dry-run")
     if run_command(export_command) != 0:
@@ -2501,7 +2526,15 @@ def command_sync(args: argparse.Namespace) -> int:
     if run_command(evolution_policy) != 0:
         return 1
 
-    load_macro = [sys.executable, "-m", "trading_core.entrypoint", "load-macro", "--date", date]
+    load_macro = [
+        sys.executable,
+        "-m",
+        "trading_core.entrypoint",
+        "load-macro",
+        "--date",
+        date,
+        "--allow-empty",
+    ]
     if args.dry_run:
         load_macro.append("--dry-run")
     if run_command(load_macro, cwd=TRADING_ROOT, trading_core=True) != 0:
@@ -2599,6 +2632,40 @@ def command_backup(args: argparse.Namespace) -> int:
     if args.json:
         command.append("--json")
     return run_command(command)
+
+
+def verify_existing_backup(*, timeout_seconds: float = 300.0) -> dict[str, Any]:
+    """Ask the independent DR implementation to authenticate and restore-check latest.json."""
+
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(BRIEFING_ROOT / "scripts" / "disaster_recovery.py"),
+                "--verify-existing",
+                "--json",
+            ],
+            cwd=ROOT,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_seconds,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return {"verified": False, "error_type": type(exc).__name__}
+    if completed.returncode != 0:
+        return {"verified": False, "returncode": completed.returncode}
+    try:
+        payload = json.loads(completed.stdout)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {"verified": False, "returncode": completed.returncode, "error_type": "InvalidJSON"}
+    if not isinstance(payload, dict):
+        return {"verified": False, "returncode": completed.returncode, "error_type": "InvalidPayload"}
+    return payload
 
 
 def command_alerts(args: argparse.Namespace) -> int:
@@ -2829,6 +2896,17 @@ def publication_backup_bootstrap_readiness(
     evidence["archive_present"] = archive_path.is_file() if archive_path.is_absolute() else False
     evidence["archive_hash_verified"] = archive_ok
     evidence["date"] = backup.get("date")
+    independent_verification = verify_existing_backup()
+    evidence["independent_restore_verification"] = {
+        "verified": independent_verification.get("verified") is True,
+        "archive_sha256": independent_verification.get("archive_sha256"),
+        "manifest_sha256": independent_verification.get("manifest_sha256"),
+        "restore_verified": independent_verification.get("restore_verified") is True,
+    }
+    if independent_verification.get("verified") is not True:
+        reasons.append("existing backup failed independent authentication and restore verification")
+    elif independent_verification.get("archive_sha256") != archive_hash:
+        reasons.append("independent backup verification selected a different archive")
     return {
         "ready": not reasons,
         "reasons": list(dict.fromkeys(reasons)),

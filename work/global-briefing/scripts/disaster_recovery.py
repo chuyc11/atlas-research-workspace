@@ -1493,6 +1493,69 @@ def create_snapshot(
     return result
 
 
+def verify_latest_snapshot(
+    *,
+    root: Path = ROOT,
+    config_path: Path = CONFIG_PATH,
+    latest_path: Path = LATEST_PATH,
+) -> dict[str, Any]:
+    """Re-authenticate and restore-check the exact archive selected by latest.json."""
+
+    config = load_config(config_path)
+    encryption_key = encryption_key_for_config(config)
+    if encryption_key is None:
+        raise ValueError("existing backup verification requires an AES-256-GCM key")
+    latest = read_json(latest_path)
+    if not isinstance(latest, dict):
+        raise ValueError("latest backup metadata must be a JSON object")
+    authenticate_metadata(latest, encryption_key, "latest")
+
+    archive = Path(str(latest.get("archive") or ""))
+    if not archive.is_absolute() or not archive.is_file():
+        raise ValueError("latest backup archive is missing")
+    try:
+        archive.resolve().relative_to(root.resolve())
+    except ValueError:
+        pass
+    else:
+        raise ValueError("latest backup archive must be outside the workspace")
+    archive_hash = str(latest.get("archive_sha256") or "")
+    if not HEX_SHA256.fullmatch(archive_hash) or sha256(archive) != archive_hash:
+        raise ValueError("latest backup archive hash mismatch")
+
+    manifest_path = Path(str(latest.get("manifest_sidecar") or ""))
+    if not manifest_path.is_absolute() or not manifest_path.is_file():
+        raise ValueError("latest backup manifest sidecar is missing")
+    manifest = read_json(manifest_path)
+    validate_manifest(manifest)
+    authenticate_metadata(manifest, encryption_key, "manifest")
+    manifest_hash = stable_json_sha256(manifest)
+    if manifest_hash != latest.get("manifest_sha256"):
+        raise ValueError("latest backup manifest hash mismatch")
+    digest_path = archive.with_suffix(".manifest.sha256")
+    if not digest_path.is_file() or digest_path.read_text(encoding="ascii").strip() != manifest_hash:
+        raise ValueError("latest backup manifest digest sidecar mismatch")
+
+    verification = verify_archive_detailed(
+        archive,
+        manifest,
+        encryption_key=encryption_key,
+    )
+    if verification.get("verified") is not True:
+        raise ValueError("latest backup restore verification failed")
+    return {
+        "schema_version": MANIFEST_SCHEMA_VERSION,
+        "date": latest.get("date"),
+        "verified": True,
+        "archive_sha256": archive_hash,
+        "manifest_sha256": manifest_hash,
+        "archive_integrity_verified": verification.get("archive_integrity_verified") is True,
+        "restore_verified": verification.get("restore_verified") is True,
+        "encrypted_container_authenticated": verification.get("encrypted_container_authenticated") is True,
+        "restore_scope": verification.get("restore_scope"),
+    }
+
+
 def cli_failure_payload(date: str, exc: Exception) -> dict[str, Any]:
     """Return a bounded, machine-readable failure without exposing configuration values.
 
@@ -1527,18 +1590,24 @@ def cli_failure_payload(date: str, exc: Exception) -> dict[str, Any]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Create an external ATLAS backup and run a restore drill.")
-    parser.add_argument("--date", required=True)
+    parser.add_argument("--date")
     parser.add_argument("--json", action="store_true")
+    parser.add_argument("--verify-existing", action="store_true")
     args = parser.parse_args()
     try:
-        result = create_snapshot(date=args.date)
+        if args.verify_existing:
+            result = verify_latest_snapshot()
+        else:
+            if not args.date:
+                raise ValueError("--date is required unless --verify-existing is used")
+            result = create_snapshot(date=args.date)
     except (OSError, RuntimeError, ValueError) as exc:
         # A nonzero exit is important: callers must not infer a passing backup
         # from this diagnostic payload.  Do not write ``latest.json`` here;
         # only a fully encrypted, restore-verified snapshot may replace it.
-        print(json.dumps(cli_failure_payload(args.date, exc), ensure_ascii=False))
+        print(json.dumps(cli_failure_payload(args.date or "unknown", exc), ensure_ascii=False))
         return 1
-    if args.json:
+    if args.json or args.verify_existing:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
         print(f"backup={result['archive']} files={result['file_count']} restore_verified={result['restore_verified']}")

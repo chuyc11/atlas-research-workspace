@@ -294,6 +294,23 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(cleaned, "确认事实不等于分析判断；后续验证")
         self.assertNotIn("｜｜", cleaned)
 
+    def test_short_transmission_label_does_not_replace_event_implication(self) -> None:
+        sections = {
+            "经济、宏观与能源": [
+                "1. **关税与油运共同推高成本。** 确认事实：企业成本上升；传导：腾讯科创50。"
+            ]
+        }
+
+        events = SITE_SYNC.parse_events(sections, [], [])
+
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["category"], "宏观")
+        self.assertEqual(
+            events[0]["implication"],
+            SITE_SYNC.default_event_implication("宏观"),
+        )
+        self.assertGreaterEqual(len(events[0]["implication"]), 12)
+
     def test_core_summary_table_produces_distinct_public_hero_copy(self) -> None:
         sections = {
             "一、核心摘要": [
@@ -742,6 +759,7 @@ class WorkspaceSyncTests(unittest.TestCase):
                 patch.object(SITE_SYNC, "site_input_hash", return_value=content_hash),
                 patch.object(SITE_SYNC, "load_publication_snapshot", return_value=snapshot),
                 patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(SITE_SYNC, "refresh_production_verification", return_value=0) as refresh,
                 patch.object(
                     sys,
                     "argv",
@@ -758,6 +776,8 @@ class WorkspaceSyncTests(unittest.TestCase):
                 redirect_stdout(StringIO()),
             ):
                 self.assertEqual(SITE_SYNC.main(), 0)
+
+            refresh.assert_called_once_with("https://example.com", verification_path)
 
             state = json.loads(state_path.read_text(encoding="utf-8"))
 
@@ -805,6 +825,7 @@ class WorkspaceSyncTests(unittest.TestCase):
                 patch.object(SITE_SYNC, "site_input_hash", return_value=content_hash),
                 patch.object(SITE_SYNC, "load_publication_snapshot", return_value=snapshot),
                 patch.object(SITE_SYNC, "validate_payload", return_value=[]),
+                patch.object(SITE_SYNC, "refresh_production_verification", return_value=1),
                 patch.object(
                     sys,
                     "argv",
@@ -1738,6 +1759,72 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertTrue(any("deep self-healing" in reason for reason in blocked["reasons"]))
         self.assertFalse(blocked_operational["ready"])
         self.assertTrue(any("cycle has not passed" in reason for reason in blocked_operational["reasons"]))
+
+    def test_publication_status_accepts_verified_repairs_and_nonblocking_alerts(self) -> None:
+        report_date = "2026-07-22"
+        artifacts = {
+            "cycle": {
+                "date": report_date,
+                "overall_passed": True,
+                "operational_gate_passed": True,
+                "stages": [
+                    {"name": name, "status": "passed"}
+                    for name in SITE_SYNC.DAILY_PUBLICATION_REQUIRED_CYCLE_STAGES
+                ],
+                "ledger": {"write_performed": True},
+                "boundary": {"canonical_write_performed": True},
+            },
+            "selfHealing": {
+                "date": report_date,
+                "overall_status": "healthy",
+                "deep": True,
+                "strict": True,
+                "counts": {"blocking": 0, "failed": 0, "unresolved": 0},
+                "checks": [
+                    {"check_id": "briefing_tests", "executed": True, "passed": True},
+                    {"check_id": "site_quality", "executed": True, "passed": True},
+                    {
+                        "check_id": "drift_diagnostics_freshness",
+                        "executed": True,
+                        "passed": False,
+                    },
+                ],
+            },
+            "improvements": {"date": report_date, "counts": {"blocking": 0}},
+            "alerts": {
+                "date": report_date,
+                "status": "attention_required",
+                "finding_count": 1,
+                "findings": [
+                    {
+                        "id": "ATLAS-IMP-NONBLOCKING",
+                        "severity": "medium",
+                        "status": "regressed",
+                    }
+                ],
+                "requires_acknowledgement": False,
+            },
+            "backup": {
+                "schema_version": SITE_SYNC.BACKUP_SCHEMA_VERSION,
+                "date": report_date,
+                "verified": True,
+                "encrypted": True,
+                "encryption_algorithm": "AES-256-GCM",
+                "encrypted_container_authenticated": True,
+                "archive_integrity_verified": True,
+                "restore_verified": True,
+                "restore_scope": "configured_workspace_files_and_git_bundles",
+                "target_outside_workspace": True,
+            },
+        }
+
+        result = SITE_SYNC._publication_snapshot_status_checks(
+            report_date,
+            artifacts=artifacts,
+        )
+
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["reasons"], [])
 
     @requires_runtime_report("2026-07-12")
     def test_frozen_publication_snapshot_is_retry_stable_and_rejects_silent_report_drift(self) -> None:

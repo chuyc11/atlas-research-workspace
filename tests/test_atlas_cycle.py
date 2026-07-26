@@ -422,6 +422,27 @@ class AtlasCycleTests(unittest.TestCase):
         raw_event = atlas.canonicalize_temp_order_intent(payload["orders"][0], orders_path, 1)
         self.assertFalse(raw_event["no_real_broker_order"])
 
+    def test_notional_sized_temp_order_is_a_valid_order_intent(self) -> None:
+        orders_path = self.briefing / "data" / "temp-orders-2026-07-10.json"
+        payload = json.loads(orders_path.read_text(encoding="utf-8"))
+        payload["orders"][0].pop("quantity")
+        payload["orders"][0]["notional"] = 400
+        write_json(orders_path, payload)
+
+        result = atlas.build_virtual_execution_ledger(write_files=True)
+
+        intents = [
+            event
+            for event in result["events"]
+            if event["event_type"] == "virtual_order_intent"
+        ]
+        self.assertTrue(result["audit"]["overall_passed"])
+        self.assertTrue(result["write_performed"])
+        self.assertEqual(len(intents), 1)
+        self.assertEqual(intents[0]["filled_quantity"], 0)
+        self.assertEqual(intents[0]["notional"], 400)
+        self.assertEqual(intents[0]["status"], "INTENT_RECORDED")
+
     def test_raw_safety_audit_normalizes_camel_case_and_separator_variants(self) -> None:
         orders_path = self.briefing / "data" / "temp-orders-2026-07-10.json"
         payload = json.loads(orders_path.read_text(encoding="utf-8"))
@@ -532,6 +553,24 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertFalse(failed["write_performed"])
         self.assertTrue(failed["audit"]["continuity"]["mutated_locators"])
         self.assertEqual(ledger_path.read_bytes(), first_bytes)
+
+    def test_canonical_semantic_mutation_with_unchanged_provenance_fails_closed(self) -> None:
+        first = atlas.build_virtual_execution_ledger(write_files=True)
+        events = atlas.read_jsonl_file(Path(first["ledger_path"]))
+        state = atlas.read_json_file(Path(first["state_path"]))
+        mutated = [dict(event) for event in events]
+        mutated[0]["filled_price"] = float(mutated[0]["filled_price"]) + 1.0
+
+        continuity = atlas.audit_ledger_continuity(mutated, state["accounts"])
+
+        self.assertFalse(continuity["baseline_verified"])
+        self.assertTrue(continuity["mutated_locators"])
+        self.assertTrue(
+            any(
+                "previous canonical event mutated" in reason
+                for reason in continuity["blocking_reasons"]
+            )
+        )
 
     def test_valid_new_source_event_can_append_to_an_authenticated_ledger(self) -> None:
         first = atlas.build_virtual_execution_ledger(write_files=True)
@@ -1025,6 +1064,30 @@ class AtlasCycleTests(unittest.TestCase):
             result = atlas.capture_command(["blocked"], timeout=0.01)
         self.assertEqual(result.returncode, 124)
         self.assertIn("timed out", result.stderr)
+
+    def test_daily_sync_allows_an_explicitly_empty_macro_export(self) -> None:
+        commands: list[list[str]] = []
+
+        def record_command(command: list[str], **_: object) -> int:
+            commands.append(command)
+            return 0
+
+        args = argparse.Namespace(date="2026-07-10", dry_run=False, force_site=False)
+        with (
+            patch.object(atlas, "command_quality", return_value=0),
+            patch.object(atlas, "run_command", side_effect=record_command),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(atlas.command_sync(args), 0)
+
+        exporter = next(
+            command
+            for command in commands
+            if any(str(part).endswith("export_trading_core_signals.py") for part in command)
+        )
+        self.assertIn("--allow-empty", exporter)
+        loader = next(command for command in commands if "load-macro" in command)
+        self.assertIn("--allow-empty", loader)
 
     def test_sync_failure_writes_audit_but_never_writes_canonical_ledger(self) -> None:
         args = argparse.Namespace(

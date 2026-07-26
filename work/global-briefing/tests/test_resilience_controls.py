@@ -258,6 +258,11 @@ class ResilienceControlTests(unittest.TestCase):
                     config_path=config,
                     latest_path=latest,
                 )
+                verified_latest = DR.verify_latest_snapshot(
+                    root=root,
+                    config_path=config,
+                    latest_path=latest,
+                )
 
             archive = Path(result["archive"])
             manifest = DR.read_json(Path(result["manifest_sidecar"]))
@@ -265,6 +270,8 @@ class ResilienceControlTests(unittest.TestCase):
             self.assertEqual(archive.suffix, ".atlasdr")
             self.assertTrue(result["encrypted"])
             self.assertTrue(result["encrypted_container_authenticated"])
+            self.assertTrue(verified_latest["verified"])
+            self.assertEqual(verified_latest["archive_sha256"], result["archive_sha256"])
             self.assertFalse(result["full_runtime_restore_verified"])
             self.assertEqual(result["schema_version"], DR.MANIFEST_SCHEMA_VERSION)
             self.assertNotIn("legacy_migration_genesis", result)

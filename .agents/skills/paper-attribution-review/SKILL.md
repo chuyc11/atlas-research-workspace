@@ -42,6 +42,7 @@ Never merge cash, equity, buying power, positions, P/L, or performance between a
 
 Each BUY/SELL/HOLD decision must include:
 
+- stable `order_id` in the form `YYYY-MM-DD-ACCOUNT-ACTION-SYMBOL-PREDICTION_ID`
 - account: `US` or `CHINA`
 - symbol and exchange/market
 - action
@@ -52,6 +53,10 @@ Each BUY/SELL/HOLD decision must include:
 - thesis/reason
 - risk
 - linked prediction/scenario when possible
+
+Use only `BUY`, `SELL`, and `HOLD` in the ledger. Express an addition as `BUY` and a reduction as `SELL`. Resolve a full liquidation to the finite held quantity; never write `ALL`.
+
+Before a same-day retry, inspect orders and valuations. Reuse an identical stable ID without creating another economic action; stop on an ID/content conflict. Every BUY or SELL must reference an original prediction already present in `predictions.jsonl`.
 
 Prefer HOLD or skip when data is stale, confidence is low, or risk limits would be breached.
 

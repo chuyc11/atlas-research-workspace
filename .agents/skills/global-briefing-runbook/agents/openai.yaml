@@ -1,4 +1,4 @@
 interface:
   display_name: "Global Briefing Runbook"
-  short_description: "Daily briefing workflow guardrails"
-  default_prompt: "Use $global-briefing-runbook to run the daily global briefing workflow end to end."
+  short_description: "Build audited Phase-A briefing and paper artifacts"
+  default_prompt: "Use $global-briefing-runbook to generate and validate today's Phase-A briefing artifacts."

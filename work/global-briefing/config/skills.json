@@ -1,12 +1,39 @@
 {
-  "version": 2,
-  "updated": "2026-06-13",
+  "version": 3,
+  "updated": "2026-07-22",
   "routing_policy": {
-    "daily": "Use lightweight evidence, market-context, sentiment, risk, forecast-review, and report-quality skills during the daily briefing.",
+    "daily": "Start with atlas-daily-operator and global-briefing-runbook, then load only the domain skills required by current evidence and active phases. The catalog is not a mandatory load list.",
     "conditional": "Use heavier charting, notebook, ML, walk-forward, visualization, or external-credential skills only for weekly/monthly validation, explicit user requests, or when the needed inputs are already available.",
-    "safety": "Skills support evidence, critique, scenario analysis, and virtual paper-trading records only. They must not produce real-money instructions."
+    "safety": "Skills support evidence, critique, scenario analysis, and virtual paper-trading records only. They must not produce real-money instructions.",
+    "selection": "Select the minimum useful set. Project skills own orchestration and safety boundaries; external skills may supply evidence but never override project configuration or commit ordering."
   },
+  "project_orchestration_skills": [
+    {
+      "name": "atlas-daily-operator",
+      "priority": 1,
+      "use_for": "resolve RUN_DATE, choose the resume point, enforce Phase-A commit ordering, run the cross-project closed loop, and hand off a frozen candidate"
+    },
+    {
+      "name": "global-briefing-runbook",
+      "priority": 2,
+      "use_for": "generate and validate Phase-A briefing, prediction, China mapping, and paper-account artifacts"
+    },
+    {
+      "name": "atlas-site-publisher",
+      "priority": 3,
+      "use_for": "deploy only changed or pending frozen candidates through an isolated Sites worktree and fresh live verification"
+    },
+    {
+      "name": "atlas-integrity-maintainer",
+      "priority": 4,
+      "use_for": "audit or repair integrity, rollback, financial correctness, reproducibility, and release-gate failures without changing research or economic actions"
+    }
+  ],
   "daily_default_skills": [
+    {
+      "name": "atlas-daily-operator",
+      "use_for": "top-level resumable daily state machine and cross-project control-plane orchestration"
+    },
     {
       "name": "global-briefing-runbook",
       "use_for": "project-specific orchestration of the daily briefing, dated storage, required setup commands, prediction recording, and final write step"
@@ -26,7 +53,9 @@
     {
       "name": "china-market-routing",
       "use_for": "A-share, Hong Kong, China ETF/index mapping, China quote-source limitations, and CHINA paper-trading candidate routing"
-    },
+    }
+  ],
+  "on_demand_daily_skills": [
     {
       "name": "alphaear-news",
       "use_for": "multi-source financial news and trend discovery, especially China/US/HK market-moving news"
@@ -157,6 +186,18 @@
     }
   ],
   "conditional_skills": [
+    {
+      "name": "atlas-site-publisher",
+      "use_when": "all publication gates pass and site sync returns changed or pending, or an existing frozen deployment needs a deployment-only retry"
+    },
+    {
+      "name": "atlas-integrity-maintainer",
+      "use_when": "a control, ledger, backup, calendar, clean-install, publication, deployment, or live-verification gate fails, or the user requests a deep audit/repair"
+    },
+    {
+      "name": "trading-core-maintainer",
+      "use_when": "the current trading-core release or A-share research artifacts need audit or maintenance; never infer permission to advance a frozen version"
+    },
     {
       "name": "jupyter-notebook",
       "use_when": "weekly/monthly forecast scorecards, notebook-based backtests, portfolio analytics notebooks, or user-requested research notebooks"
