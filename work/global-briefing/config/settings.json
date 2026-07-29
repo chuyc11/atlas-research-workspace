@@ -162,6 +162,16 @@
     "legacy_status_scores_are_research_metrics": false,
     "promotion_requires_all_gates": true
   },
+  "calibration_recovery": {
+    "enabled": true,
+    "gate_mode": "shadow",
+    "minimum_feedback_independent_event_families": 8,
+    "minimum_novel_event_families_per_daily_batch": 2,
+    "maximum_rolling_restatements_per_daily_batch": 1,
+    "automatic_probability_rewrite_allowed": false,
+    "historical_prediction_rewrite_allowed": false,
+    "filler_forecasts_allowed": false
+  },
   "paper_trading_config": "work/global-briefing/config/paper_trading.json",
   "china_watchlist": "work/global-briefing/config/china_watchlist.json",
   "china_market_snapshot": "work/global-briefing/data/china-market-snapshot-YYYY-MM-DD.json",

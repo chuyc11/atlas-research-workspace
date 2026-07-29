@@ -1403,13 +1403,21 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertEqual(command[command.index("--alert-id") + 1], "alert-2026-07-10-deadbeef")
         self.assertIn("--retry", command)
 
-    def test_full_test_mode_runs_unfiltered_trading_core_suite(self) -> None:
+    def test_full_test_mode_runs_audited_trading_core_matrix(self) -> None:
         args = argparse.Namespace(skip_site=True, skip_trading_core=False, full=True)
         with patch.object(atlas, "run_command", return_value=0) as run:
             self.assertEqual(atlas.command_test(args), 0)
 
         core_call = next(call for call in run.call_args_list if call.kwargs.get("cwd") == self.trading)
-        self.assertEqual(core_call.args[0], [atlas.sys.executable, "-m", "pytest"])
+        self.assertEqual(
+            core_call.args[0],
+            [
+                atlas.sys.executable,
+                "-m",
+                "trading_core.testing.full_test_matrix",
+            ],
+        )
+        self.assertEqual(core_call.kwargs["timeout"], 45 * 60)
 
 
 if __name__ == "__main__":

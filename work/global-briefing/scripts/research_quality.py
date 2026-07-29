@@ -1092,6 +1092,92 @@ def proper_scoring_metrics(
     }
 
 
+def calibration_recovery_guidance(
+    metrics: dict[str, Any],
+    recovery_config: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Turn proper-scoring state into bounded, non-mutating next-run guidance."""
+
+    config = recovery_config or {}
+    thresholds = metrics.get("thresholds") if isinstance(metrics.get("thresholds"), dict) else {}
+    minimum_sample = max(1, int(thresholds.get("minimum_sample") or 30))
+    independent_families = max(0, int(metrics.get("independent_event_family_count") or 0))
+    family_gap = max(0, minimum_sample - independent_families)
+    configured_novel_target = max(
+        0,
+        int(config.get("minimum_novel_event_families_per_daily_batch") or 0),
+    )
+    novel_target = min(configured_novel_target, family_gap)
+
+    signed_gaps: list[tuple[float, float]] = []
+    for item in metrics.get("calibration_bins") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            weight = float(item.get("independence_weight") or 0.0)
+            signed_gap = float(item.get("observed_rate")) - float(item.get("mean_probability"))
+        except (TypeError, ValueError):
+            continue
+        if weight > 0:
+            signed_gaps.append((signed_gap, weight))
+    total_weight = sum(weight for _gap, weight in signed_gaps)
+    weighted_signed_gap = (
+        sum(gap * weight for gap, weight in signed_gaps) / total_weight
+        if total_weight
+        else None
+    )
+    minimum_feedback_families = max(
+        1,
+        int(config.get("minimum_feedback_independent_event_families") or 8),
+    )
+    if weighted_signed_gap is None or independent_families < minimum_feedback_families:
+        bias = "insufficient_evidence"
+    elif weighted_signed_gap > 0:
+        bias = "underconfident"
+    elif weighted_signed_gap < 0:
+        bias = "overconfident"
+    else:
+        bias = "balanced"
+
+    gates = metrics.get("gates") if isinstance(metrics.get("gates"), dict) else {}
+    status = "research_ready" if metrics.get("is_research_ready") is True else "shadow"
+    return {
+        "status": status,
+        "gate_mode": str(config.get("gate_mode") or "shadow"),
+        "cutoff": metrics.get("cutoff"),
+        "automatic_probability_rewrite_allowed": False,
+        "historical_prediction_rewrite_allowed": False,
+        "independent_event_family_count": independent_families,
+        "minimum_independent_event_families": minimum_sample,
+        "independent_event_family_gap": family_gap,
+        "minimum_novel_event_families_per_daily_batch": novel_target,
+        "maximum_rolling_restatements_per_daily_batch": max(
+            0,
+            int(config.get("maximum_rolling_restatements_per_daily_batch") or 0),
+        ),
+        "estimated_daily_batches_to_sample_gate": (
+            math.ceil(family_gap / novel_target) if family_gap and novel_target else None
+        ),
+        "weighted_signed_calibration_gap": (
+            round(weighted_signed_gap, 6) if weighted_signed_gap is not None else None
+        ),
+        "calibration_bias": bias,
+        "feedback_confidence": (
+            "low"
+            if independent_families < minimum_sample
+            else "moderate"
+        ),
+        "failed_gates": sorted(name for name, passed in gates.items() if passed is not True),
+        "operating_rules": [
+            "Prefer genuinely decision-useful new event families while the independent-family gate is short.",
+            "Keep rolled deadlines, paraphrases, and unchanged causal propositions in their existing event family.",
+            "Do not create filler forecasts merely to increase the sample count.",
+            "Treat calibration bias as advisory until the configured independent-family threshold is met.",
+            "Never rewrite historical probabilities or lower promotion thresholds to clear shadow status.",
+        ],
+    }
+
+
 def market_mapping_metrics(
     records: list[dict[str, Any]],
     *,
@@ -1750,6 +1836,10 @@ def build_quality_report(
         review_policy=settings.get("review_queue", {}),
         prediction_contract=contract,
         family_registry=family_registry,
+    )
+    prediction_audit["calibration_recovery"] = calibration_recovery_guidance(
+        prediction_audit["proper_scoring"],
+        settings.get("calibration_recovery", {}),
     )
     news_policy = dict(settings.get("news_research_policy", {}))
     source_aliases = settings.get("drift_diagnostics", {}).get("source_family_aliases", {})

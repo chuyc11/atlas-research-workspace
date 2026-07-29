@@ -4351,8 +4351,14 @@ def command_test(args: argparse.Namespace) -> int:
         return 1
 
     if not args.skip_trading_core:
-        core_tests = [sys.executable, "-m", "pytest"]
-        if not getattr(args, "full", False):
+        if getattr(args, "full", False):
+            core_tests = [
+                sys.executable,
+                "-m",
+                "trading_core.testing.full_test_matrix",
+            ]
+        else:
+            core_tests = [sys.executable, "-m", "pytest"]
             core_tests.extend(
                 [
                     "tests/test_global_briefing_integration.py",
@@ -4365,7 +4371,13 @@ def command_test(args: argparse.Namespace) -> int:
                     "tests/test_cli_stage_boundaries.py",
                 ]
             )
-        if run_command(core_tests, cwd=TRADING_ROOT, trading_core=True) != 0:
+        core_timeout = 45 * 60 if getattr(args, "full", False) else COMMAND_TIMEOUT_SECONDS
+        if run_command(
+            core_tests,
+            cwd=TRADING_ROOT,
+            trading_core=True,
+            timeout=core_timeout,
+        ) != 0:
             return 1
 
     if not args.skip_site:

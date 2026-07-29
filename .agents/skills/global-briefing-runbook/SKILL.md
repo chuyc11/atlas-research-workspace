@@ -48,6 +48,10 @@ python work\global-briefing\scripts\evolution.py update-policy --period month --
 ledger, writes `work/global-briefing/data/review-queue-YYYY-MM-DD.json`, and prints the
 bounded `review_now` set before the prior report. Work through that set before creating
 new forecasts. Do not limit review discovery to yesterday or the last N ledger rows.
+It also prints `CALIBRATION_RECOVERY_GUIDANCE`. When research promotion is still
+shadow, use its independent-family gap and advisory batch target to prefer genuinely
+decision-useful novel event families. Never create filler, relabel a rolling update as
+novel, automatically change a probability, or rewrite history to satisfy the target.
 Date-only forecast and market deadlines cover the full named day in the configured
 report timezone; an ordinary review is valid on a later date, while same-day closure
 requires explicit `terminal_evidence=true`.
@@ -110,6 +114,13 @@ Prepare a complete temporary report draft and prediction JSON before any ledger 
 ```powershell
 python work\global-briefing\scripts\briefing_store.py validate-records --date YYYY-MM-DD --input TEMP_PREDICTIONS_JSON
 ```
+
+Read `batch_family_audit` in the preflight result. Its shadow warning identifies when
+the proposed batch adds too few independent event families or overuses rolling
+restatements. Improve the batch only when the evidence supports a distinct causal
+proposition; otherwise keep the useful forecast and disclose the sample shortfall.
+The family audit is not permission to add low-value forecasts and is not an
+operational blocker.
 
 Only after it succeeds, append structured prediction records:
 

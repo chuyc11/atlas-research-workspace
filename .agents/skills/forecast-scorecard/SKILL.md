@@ -40,6 +40,13 @@ python work\global-briefing\scripts\evolution.py scorecard --period day --date Y
 python work\global-briefing\scripts\evolution.py validate-records --period day --date YYYY-MM-DD
 ```
 
+At startup, read the `CALIBRATION_RECOVERY_GUIDANCE` block printed by
+`briefing_store.py previous`. When the minimum independent-family gate is short,
+prefer the configured number of genuinely novel, decision-useful event families and
+limit rolling restatements. This is an advisory recovery target: do not manufacture
+filler forecasts, split one causal proposition into fake families, lower thresholds,
+or automatically rewrite historical or proposed probabilities.
+
 When writing the daily report, include a concise review of yesterday's open predictions:
 
 - What happened.
@@ -98,6 +105,12 @@ Save records with:
 ```powershell
 python work\global-briefing\scripts\briefing_store.py record --date YYYY-MM-DD --input TEMP_PREDICTIONS_JSON
 ```
+
+Before saving, inspect `batch_family_audit` from `briefing_store.py validate-records`.
+If it reports `attention_required`, either replace a restatement with an
+evidence-supported independent event or explicitly carry the shadow limitation
+forward. The audit remains nonblocking because evidence quality outranks sample-count
+growth.
 
 Do not invent outcomes for forecasts that have not reached their horizon. Mark them open and list the next verification signal.
 

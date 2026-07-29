@@ -21,9 +21,12 @@ SCRIPT_PATH = Path(__file__).resolve()
 if str(SCRIPT_PATH.parent) not in sys.path:
     sys.path.insert(0, str(SCRIPT_PATH.parent))
 
+from research_quality import calibration_recovery_guidance
 from research_quality import parse_date as parse_contract_date
 from research_quality import maturity_date
 from research_quality import market_mapping_key
+from research_quality import prediction_family_indexes
+from research_quality import proper_scoring_metrics
 from research_quality import resolved_market_mapping_index
 from research_quality import review_scope
 from research_quality import review_is_valid_for_resolution
@@ -445,11 +448,23 @@ def validate_prediction_records(
     existing = load_json_records(predictions)
     settings = load_prediction_settings()
     prepared, skipped_identical = prepare_prediction_records(records, date, existing, settings)
-    return {
+    result: dict[str, Any] = {
         "status": "ok",
         "would_record": len(prepared),
         "skipped_identical": skipped_identical,
     }
+    recovery_config = settings.get("calibration_recovery", {})
+    if not isinstance(recovery_config, dict) or recovery_config.get("enabled") is not True:
+        return result
+    guidance, family_registry = current_calibration_guidance(existing, date, settings)
+    result["calibration_recovery"] = guidance
+    result["batch_family_audit"] = prediction_batch_family_audit(
+        existing,
+        prepared,
+        guidance,
+        family_registry,
+    )
+    return result
 
 
 def append_prediction_records(input_path: Path, date: str, predictions: Path = DEFAULT_PREDICTIONS) -> int:
@@ -470,6 +485,115 @@ def append_prediction_records(input_path: Path, date: str, predictions: Path = D
         )
         atomic_write_text(predictions, text)
         return len(prepared)
+
+
+def load_prediction_family_registry(settings: dict[str, Any]) -> dict[str, Any]:
+    contract = settings.get("prediction_contract", {})
+    relative = str(contract.get("family_registry_file") or "").strip()
+    path = ROOT / relative if relative else None
+    if path is None or not path.is_file():
+        return {}
+    value = strict_json_loads(path.read_text(encoding="utf-8"), source=str(path))
+    return value if isinstance(value, dict) else {}
+
+
+def current_calibration_guidance(
+    records: list[dict[str, Any]],
+    cutoff: str,
+    settings: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    evaluation = settings.get("research_evaluation", {})
+    minimum_sample = int(
+        evaluation.get(
+            "minimum_independent_event_families",
+            evaluation.get("minimum_sample", 30),
+        )
+    )
+    family_registry = load_prediction_family_registry(settings)
+    metrics = proper_scoring_metrics(
+        records,
+        cutoff=cutoff,
+        minimum_sample=minimum_sample,
+        maximum_brier=float(evaluation.get("maximum_brier", 0.25)),
+        maximum_ece=float(evaluation.get("maximum_expected_calibration_error", 0.15)),
+        family_registry=family_registry,
+    )
+    return (
+        calibration_recovery_guidance(
+            metrics,
+            settings.get("calibration_recovery", {}),
+        ),
+        family_registry,
+    )
+
+
+def prediction_batch_family_audit(
+    existing: list[dict[str, Any]],
+    prepared: list[dict[str, Any]],
+    guidance: dict[str, Any],
+    family_registry: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    event_index, _market_index = prediction_family_indexes(family_registry)
+    existing_families = {
+        str(
+            item.get("event_family_id")
+            or event_index.get(str(item.get("prediction_id") or ""))
+            or item.get("prediction_id")
+            or ""
+        )
+        for item in existing
+        if not isinstance(item.get("review"), dict) and item.get("prediction_id")
+    }
+    batch_originals = [
+        item
+        for item in prepared
+        if not isinstance(item.get("review"), dict) and item.get("prediction_id")
+    ]
+    batch_families = {
+        str(
+            item.get("event_family_id")
+            or event_index.get(str(item.get("prediction_id") or ""))
+            or item.get("prediction_id")
+            or ""
+        )
+        for item in batch_originals
+    } - {""}
+    novel_families = sorted(batch_families - existing_families)
+    rolling_families = sorted(batch_families & existing_families)
+    configured_target = max(
+        0,
+        int(guidance.get("minimum_novel_event_families_per_daily_batch") or 0),
+    )
+    effective_target = min(configured_target, len(batch_families))
+    maximum_rolling = max(
+        0,
+        int(guidance.get("maximum_rolling_restatements_per_daily_batch") or 0),
+    )
+    novelty_passed = len(novel_families) >= effective_target
+    rolling_passed = len(rolling_families) <= maximum_rolling
+    warnings = []
+    if not novelty_passed:
+        warnings.append(
+            f"new batch adds {len(novel_families)} novel event families; "
+            f"shadow recovery target is {effective_target}"
+        )
+    if not rolling_passed:
+        warnings.append(
+            f"new batch restates {len(rolling_families)} event families; "
+            f"shadow recovery maximum is {maximum_rolling}"
+        )
+    return {
+        "gate_mode": str(guidance.get("gate_mode") or "shadow"),
+        "status": "passed" if novelty_passed and rolling_passed else "attention_required",
+        "batch_original_prediction_count": len(batch_originals),
+        "batch_event_family_count": len(batch_families),
+        "novel_event_families": novel_families,
+        "rolling_event_families": rolling_families,
+        "minimum_novel_event_families": effective_target,
+        "maximum_rolling_restatements": maximum_rolling,
+        "warnings": warnings,
+        "operational_blocking": False,
+    }
 
 
 def print_previous(
@@ -498,6 +622,10 @@ def print_previous(
         print(DEFAULT_EVOLUTION_STATE.read_text(encoding="utf-8").strip())
     else:
         print("(none; run evolution.py update-policy)")
+    print("\n=== CALIBRATION_RECOVERY_GUIDANCE ===")
+    settings = load_prediction_settings()
+    guidance, _family_registry = current_calibration_guidance(records, run_date, settings)
+    print(json.dumps(guidance, ensure_ascii=False, sort_keys=True))
     print("\n=== RECENT_PREDICTION_RECORDS ===")
     recent = records[-limit:]
     if not recent:

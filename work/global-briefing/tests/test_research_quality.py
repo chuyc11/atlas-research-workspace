@@ -207,6 +207,69 @@ class ResearchQualityTests(unittest.TestCase):
         self.assertFalse(metrics["gates"]["minimum_sample"])
         self.assertAlmostEqual(metrics["brier_score"], 0.05)
 
+    def test_calibration_recovery_guidance_is_advisory_and_requires_novel_families(self) -> None:
+        first = v2_prediction("2026-07-12-P01", probability=0.6)
+        second = v2_prediction("2026-07-13-P01", probability=0.7)
+        second["date"] = "2026-07-13"
+        second["deadline"] = "2026-07-14"
+        second["market_mapping"][0]["evaluation_deadline"] = "2026-07-14"
+        first_review = resolved_review("2026-07-12-P01", outcome=1)
+        second_review = resolved_review("2026-07-13-P01", outcome=1)
+        second_review["date"] = "2026-07-15"
+        second_review["review"]["review_date"] = "2026-07-15"
+        metrics = MODULE.proper_scoring_metrics(
+            [first, first_review, second, second_review],
+            cutoff="2026-07-15",
+            minimum_sample=4,
+        )
+
+        guidance = MODULE.calibration_recovery_guidance(
+            metrics,
+            {
+                "minimum_feedback_independent_event_families": 2,
+                "minimum_novel_event_families_per_daily_batch": 2,
+                "maximum_rolling_restatements_per_daily_batch": 1,
+            },
+        )
+
+        self.assertEqual(guidance["status"], "shadow")
+        self.assertEqual(guidance["independent_event_family_gap"], 2)
+        self.assertEqual(guidance["minimum_novel_event_families_per_daily_batch"], 2)
+        self.assertEqual(guidance["estimated_daily_batches_to_sample_gate"], 1)
+        self.assertEqual(guidance["calibration_bias"], "underconfident")
+        self.assertFalse(guidance["automatic_probability_rewrite_allowed"])
+        self.assertFalse(guidance["historical_prediction_rewrite_allowed"])
+
+    def test_prediction_batch_family_audit_flags_restatements_without_blocking_operations(self) -> None:
+        existing = [
+            {
+                "prediction_id": "2026-07-28-P01",
+                "event_family_id": "EXISTING_EVENT_FAMILY",
+            }
+        ]
+        prepared = [
+            {
+                "prediction_id": "2026-07-29-P01",
+                "event_family_id": "EXISTING_EVENT_FAMILY",
+            },
+            {
+                "prediction_id": "2026-07-29-P02",
+                "event_family_id": "NOVEL_EVENT_FAMILY",
+            },
+        ]
+        guidance = {
+            "minimum_novel_event_families_per_daily_batch": 2,
+            "maximum_rolling_restatements_per_daily_batch": 1,
+        }
+
+        audit = STORE.prediction_batch_family_audit(existing, prepared, guidance)
+
+        self.assertEqual(audit["status"], "attention_required")
+        self.assertEqual(audit["novel_event_families"], ["NOVEL_EVENT_FAMILY"])
+        self.assertEqual(audit["rolling_event_families"], ["EXISTING_EVENT_FAMILY"])
+        self.assertFalse(audit["operational_blocking"])
+        self.assertTrue(audit["warnings"])
+
     def test_asset_only_prediction_is_excluded_from_event_calibration(self) -> None:
         original = v2_prediction()
         original["scenario"] = "TEST total return exceeds SPY total return by the deadline"
@@ -611,6 +674,48 @@ class ResearchQualityTests(unittest.TestCase):
             )
             self.assertFalse(predictions.exists())
             self.assertFalse(predictions.with_suffix(".jsonl.lock").exists())
+
+    def test_storage_validate_records_adds_recovery_audit_only_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            predictions = root / "predictions.jsonl"
+            predictions.write_text(
+                json.dumps(v2_prediction(), ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            input_path = root / "input.json"
+            input_path.write_text(
+                json.dumps(v2_prediction("2026-07-12-P02"), ensure_ascii=False),
+                encoding="utf-8",
+            )
+            settings = root / "settings.json"
+            settings.write_text(
+                json.dumps({
+                    "prediction_contract": {"enforce_from_date": "2026-07-12"},
+                    "calibration_recovery": {
+                        "enabled": True,
+                        "gate_mode": "shadow",
+                        "minimum_novel_event_families_per_daily_batch": 1,
+                    },
+                }),
+                encoding="utf-8",
+            )
+
+            with patch.object(STORE, "DEFAULT_SETTINGS", settings):
+                result = STORE.validate_prediction_records(
+                    input_path,
+                    "2026-07-12",
+                    predictions,
+                )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["would_record"], 1)
+            self.assertEqual(result["calibration_recovery"]["status"], "shadow")
+            self.assertEqual(result["batch_family_audit"]["status"], "passed")
+            self.assertEqual(
+                result["batch_family_audit"]["novel_event_families"],
+                ["2026-07-12-P02"],
+            )
 
     def test_storage_validate_records_and_record_reject_same_ledger_conflict(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
