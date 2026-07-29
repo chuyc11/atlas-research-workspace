@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import gzip
 import html
 import ipaddress
+import io
 import re
 import json
 import socket
@@ -39,6 +41,7 @@ USER_AGENT = (
 REQUEST_HEADERS = {
     "User-Agent": USER_AGENT,
     "Accept": "application/rss+xml, application/atom+xml, application/xml, text/xml, text/html;q=0.9,*/*;q=0.8",
+    "Accept-Encoding": "gzip",
     "Accept-Language": "en-US,en;q=0.9,zh-CN;q=0.7,zh;q=0.6",
 }
 MAX_RESPONSE_BYTES = 5 * 1024 * 1024
@@ -156,6 +159,19 @@ def fetch(
             payload = response.read(max_response_bytes + 1)
             if len(payload) > max_response_bytes:
                 raise ValueError(f"Response exceeds {max_response_bytes} byte limit: {url}")
+            content_encoding = str(response.headers.get("Content-Encoding") or "identity").strip().lower()
+            if content_encoding in {"gzip", "x-gzip"}:
+                try:
+                    with gzip.GzipFile(fileobj=io.BytesIO(payload)) as compressed:
+                        payload = compressed.read(max_response_bytes + 1)
+                except (EOFError, OSError) as exc:
+                    raise ValueError(f"Response uses invalid gzip encoding: {url}") from exc
+                if len(payload) > max_response_bytes:
+                    raise ValueError(
+                        f"Decompressed response exceeds {max_response_bytes} byte limit: {url}"
+                    )
+            elif content_encoding not in {"", "identity"}:
+                raise ValueError(f"Unsupported response content encoding {content_encoding!r}: {url}")
             return payload
     raise UnsafeUrlError("source redirect limit exceeded")
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import gzip
 import json
 import sys
 import unittest
@@ -19,9 +20,17 @@ SPEC.loader.exec_module(MODULE)
 
 
 class FakeResponse:
-    def __init__(self, payload: bytes, content_length: str | None = None, url: str = "https://example.test/feed") -> None:
+    def __init__(
+        self,
+        payload: bytes,
+        content_length: str | None = None,
+        url: str = "https://example.test/feed",
+        content_encoding: str | None = None,
+    ) -> None:
         self.payload = payload
         self.headers = {} if content_length is None else {"Content-Length": content_length}
+        if content_encoding is not None:
+            self.headers["Content-Encoding"] = content_encoding
         self.url = url
 
     def __enter__(self):
@@ -57,6 +66,27 @@ class RssCollectSecurityTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(ValueError, "exceeds 10 byte limit"):
                 MODULE.fetch("https://example.test/feed", timeout=1, max_response_bytes=10)
+
+    def test_fetch_decompresses_gzip_before_feed_parsing(self) -> None:
+        xml = b"<rss><channel><item><title>Compressed item</title></item></channel></rss>"
+        response = FakeResponse(gzip.compress(xml), content_encoding="gzip")
+        with patch.object(MODULE, "_resolve_host_addresses", return_value={"93.184.216.34"}), patch.object(
+            MODULE.urllib.request,
+            "build_opener",
+            return_value=FakeOpener(response),
+        ):
+            payload = MODULE.fetch("https://example.test/feed", timeout=1)
+        self.assertEqual(payload, xml)
+
+    def test_fetch_rejects_gzip_expansion_over_limit(self) -> None:
+        response = FakeResponse(gzip.compress(b"x" * 33), content_encoding="gzip")
+        with patch.object(MODULE, "_resolve_host_addresses", return_value={"93.184.216.34"}), patch.object(
+            MODULE.urllib.request,
+            "build_opener",
+            return_value=FakeOpener(response),
+        ):
+            with self.assertRaisesRegex(ValueError, "Decompressed response exceeds 32 byte limit"):
+                MODULE.fetch("https://example.test/feed", timeout=1, max_response_bytes=32)
 
     def test_feed_parser_rejects_entity_expansion(self) -> None:
         malicious = b'<!DOCTYPE rss [<!ENTITY x "expanded">]><rss><channel><title>&x;</title></channel></rss>'
