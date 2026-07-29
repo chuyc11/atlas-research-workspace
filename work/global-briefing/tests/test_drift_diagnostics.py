@@ -127,6 +127,61 @@ class DriftDiagnosticsTests(unittest.TestCase):
         self.assertNotIn("combined_equity", result)
         self.assertTrue(all(row["explicit_theme_attribution_coverage_pct"] == 0 for row in result["accounts"]))
 
+    def test_unlinked_prediction_exposure_escalates_the_affected_account_only(self) -> None:
+        attribution = {
+            "accounts": [
+                {
+                    "account": "US",
+                    "latest_valuation": {"equity": 100, "cash": 60, "base_currency": "USD"},
+                    "positions": [
+                        {
+                            "symbol": "LEGACY",
+                            "market_value": 40,
+                            "last_price_date": "2026-07-13",
+                            "prediction_id": "unlinked",
+                            "prediction_lineage_status": "legacy_unlinked",
+                            "prediction_ids": ["P-LATER"],
+                            "unlinked_buy_count": 1,
+                            "scenario": "legacy position",
+                        }
+                    ],
+                },
+                {
+                    "account": "CHINA",
+                    "latest_valuation": {"equity": 100, "cash": 60, "base_currency": "CNY"},
+                    "positions": [
+                        {
+                            "symbol": "510300.SH",
+                            "market_value": 40,
+                            "last_price_date": "2026-07-13",
+                            "prediction_id": "P-CHINA",
+                            "prediction_lineage_status": "linked",
+                            "prediction_ids": ["P-CHINA"],
+                            "scenario": "china broad market",
+                        }
+                    ],
+                },
+            ]
+        }
+        result = MODULE.paper_account_diagnostics(
+            attribution,
+            {"max_position_pct": 0.6, "min_cash_pct": 0.02},
+            date(2026, 7, 13),
+            {
+                "theme_taxonomy": {},
+                "paper_unlinked_prediction_value_watch_pct": 5.0,
+                "paper_unlinked_prediction_value_alert_pct": 15.0,
+            },
+        )
+        us = next(row for row in result["accounts"] if row["account"] == "US")
+        china = next(row for row in result["accounts"] if row["account"] == "CHINA")
+
+        self.assertEqual(us["unlinked_prediction_value_pct"], 100.0)
+        self.assertEqual(us["status"], "alert")
+        self.assertTrue(any("prediction lineage" in signal for signal in us["signals"]))
+        self.assertEqual(china["unlinked_prediction_value_pct"], 0.0)
+        self.assertNotIn("prediction lineage", " ".join(china["signals"]))
+
 
 if __name__ == "__main__":
     unittest.main()

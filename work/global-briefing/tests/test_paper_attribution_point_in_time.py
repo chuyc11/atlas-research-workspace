@@ -139,6 +139,29 @@ class PaperAttributionPointInTimeTests(unittest.TestCase):
         self.assertAlmostEqual(us["period_performance"]["reconciliation_difference"], 50.0)
         self.assertEqual(us["period_performance"]["reconciliation_status"], "legacy_position_mark_gap")
 
+    def test_open_position_retains_all_buy_prediction_lineage(self) -> None:
+        trades_path = self.root / "data" / "us-trades.jsonl"
+        with trades_path.open("a", encoding="utf-8") as handle:
+            for row in [
+                {"date": "2026-06-12", "action": "BUY", "symbol": "LEGACY", "exchange": "NASDAQ", "currency": "USD", "quantity": 10, "price": 20, "gross_value": 200, "fee": 0},
+                {"date": "2026-06-13", "action": "BUY", "symbol": "LEGACY", "exchange": "NASDAQ", "currency": "USD", "quantity": 5, "price": 22, "gross_value": 110, "fee": 0, "prediction_id": "P-LATER"},
+                {"date": "2026-06-12", "action": "BUY", "symbol": "MIXED", "exchange": "NASDAQ", "currency": "USD", "quantity": 5, "price": 10, "gross_value": 50, "fee": 0, "prediction_id": "P-EARLY"},
+                {"date": "2026-06-13", "action": "BUY", "symbol": "MIXED", "exchange": "NASDAQ", "currency": "USD", "quantity": 5, "price": 12, "gross_value": 60, "fee": 0, "prediction_id": "P-LATER"},
+            ]:
+                handle.write(json.dumps(row) + "\n")
+
+        result = MODULE.paper_attribution("day", "2026-06-14")
+        us = next(item for item in result["accounts"] if item["account"] == "US")
+        legacy = next(item for item in us["positions"] if item["symbol"] == "LEGACY")
+        mixed = next(item for item in us["positions"] if item["symbol"] == "MIXED")
+
+        self.assertEqual(legacy["prediction_id"], "unlinked")
+        self.assertEqual(legacy["prediction_ids"], ["P-LATER"])
+        self.assertEqual(legacy["unlinked_buy_count"], 1)
+        self.assertEqual(legacy["prediction_lineage_status"], "legacy_unlinked")
+        self.assertEqual(mixed["prediction_ids"], ["P-EARLY", "P-LATER"])
+        self.assertEqual(mixed["prediction_lineage_status"], "requires_review")
+
 
 if __name__ == "__main__":
     unittest.main()

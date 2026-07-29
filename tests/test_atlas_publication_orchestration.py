@@ -81,6 +81,20 @@ class AtlasPublicationOrchestrationTests(unittest.TestCase):
         self.runtime_patch.stop()
         self.tmp.cleanup()
 
+    def test_manual_daily_control_config_bootstraps_backup_before_strict_controls(self) -> None:
+        settings_path = Path(__file__).resolve().parents[1] / "work" / "global-briefing" / "config" / "settings.json"
+        commands = json.loads(settings_path.read_text(encoding="utf-8"))["self_healing_commands"]
+
+        self.assertEqual(commands[0], "python atlas.py backup --date YYYY-MM-DD")
+        self.assertLess(
+            commands.index("python atlas.py backup --date YYYY-MM-DD"),
+            commands.index("python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict"),
+        )
+        self.assertLess(
+            commands.index("python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict"),
+            commands.index("python atlas.py heal --date YYYY-MM-DD --apply-safe --deep --strict"),
+        )
+
     def test_post_gate_orchestration_runs_controls_in_order_then_retries_only_staged_candidate(self) -> None:
         calls: list[str] = []
 

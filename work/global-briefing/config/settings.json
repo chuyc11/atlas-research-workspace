@@ -15,6 +15,7 @@
   },
   "improvement_tracking_config": "work/global-briefing/config/improvement_tracking.json",
   "self_healing_commands": [
+    "python atlas.py backup --date YYYY-MM-DD",
     "python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict",
     "python atlas.py heal --date YYYY-MM-DD --apply-safe --deep --strict",
     "python atlas.py heal --status --json"
@@ -126,6 +127,8 @@
     "paper_price_stale_after_calendar_days": 4,
     "paper_stale_value_watch_pct": 20.0,
     "paper_stale_value_alert_pct": 50.0,
+    "paper_unlinked_prediction_value_watch_pct": 5.0,
+    "paper_unlinked_prediction_value_alert_pct": 15.0,
     "primary_domain_suffixes": [".gov", ".gov.cn", ".gov.uk", ".go.jp", ".int", ".europa.eu"],
     "source_family_aliases": {
       "apnews.com": "Associated Press",

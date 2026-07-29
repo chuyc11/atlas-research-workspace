@@ -46,16 +46,16 @@ python atlas.py cycle --date RUN_DATE --skip-site --skip-publication
 Then execute the durable closed-loop stages:
 
 ```powershell
+python atlas.py backup --date RUN_DATE
 python atlas.py improvements --date RUN_DATE --apply-safe --strict
 python atlas.py heal --date RUN_DATE --apply-safe --deep --strict
-python atlas.py backup --date RUN_DATE
 python atlas.py alerts --date RUN_DATE
 python atlas.py improvements --date RUN_DATE --apply-safe --strict
 python atlas.py alerts --date RUN_DATE
 python atlas.py backup --date RUN_DATE
 ```
 
-Read the date-aligned JSON artifacts under `work/shared/atlas/` after each command. The first backup makes recovery capability observable; the second retains the final post-verification state. An alert may be nonblocking only when its artifact explicitly classifies every finding and configured blocking severities remain absent.
+Read the date-aligned JSON artifacts under `work/shared/atlas/` after each command. The first backup makes recovery capability observable before strict controls are evaluated; the second retains the final post-verification state. If the bootstrap backup does not restore-verify, stop before `improvements --strict` and preserve the completed Phase A artifacts. An alert may be nonblocking only when its artifact explicitly classifies every finding and configured blocking severities remain absent.
 
 Do not infer success from a zero exit code alone. Verify the final self-healing counts/status, restore result, alert findings, cycle audit, and artifact dates directly. Proper-scoring sample insufficiency may remain shadow-only; operational, ledger, recovery, or publication failures do not.
 

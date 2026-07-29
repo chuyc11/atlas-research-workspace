@@ -656,6 +656,8 @@ def paper_account_diagnostics(
     stale_after = int(policy.get("paper_price_stale_after_calendar_days", 4))
     stale_watch = float(policy.get("paper_stale_value_watch_pct", 20.0))
     stale_alert = float(policy.get("paper_stale_value_alert_pct", 50.0))
+    unlinked_watch = float(policy.get("paper_unlinked_prediction_value_watch_pct", 5.0))
+    unlinked_alert = float(policy.get("paper_unlinked_prediction_value_alert_pct", 15.0))
     concentration_watch_ratio = float(policy.get("paper_position_limit_watch_ratio", 0.90))
     max_position_rule = float(paper_config.get("max_position_pct", 0.35)) * 100
     min_cash_rule = float(paper_config.get("min_cash_pct", 0.02)) * 100
@@ -692,7 +694,10 @@ def paper_account_diagnostics(
                 unknown_price_date_value += market_value
             elif age > stale_after:
                 stale_value += market_value
-            if str(position.get("prediction_id") or "unlinked") == "unlinked":
+            lineage_status = str(position.get("prediction_lineage_status") or "").strip().lower()
+            if lineage_status in {"unlinked", "legacy_unlinked"} or (
+                not lineage_status and str(position.get("prediction_id") or "unlinked") == "unlinked"
+            ):
                 unlinked_value += market_value
             explicit_theme = position.get("theme")
             if explicit_theme:
@@ -711,6 +716,9 @@ def paper_account_diagnostics(
                 "price_age_calendar_days": age,
                 "price_date_provenance": position.get("last_price_date_provenance"),
                 "prediction_id": position.get("prediction_id"),
+                "prediction_ids": position.get("prediction_ids", []),
+                "prediction_lineage_status": lineage_status or None,
+                "unlinked_buy_count": position.get("unlinked_buy_count", 0),
                 "explicit_theme": explicit_theme,
                 "theme_source": position.get("theme_source"),
                 "secondary_themes": position.get("secondary_themes", []),
@@ -740,6 +748,7 @@ def paper_account_diagnostics(
             "alert" if cash_pct is not None and cash_pct < min_cash_rule else "healthy",
             "watch" if invested and theme_coverage < 80 else "healthy",
             "watch" if invested and unknown_price_pct > 20 else "healthy",
+            metric_status(unlinked_pct, watch=unlinked_watch, alert=unlinked_alert),
             "alert" if largest_theme_pct is not None and largest_theme_pct > maximum_theme_rule + 0.01 else "watch" if largest_theme_pct is not None and largest_theme_pct >= maximum_theme_rule * concentration_watch_ratio else "healthy",
         ]
         status = worst_status(account_statuses)
@@ -752,6 +761,8 @@ def paper_account_diagnostics(
             signals.append("explicit position-theme coverage is below 80%; the configured theme cap cannot yet be audited reliably")
         if unknown_price_pct > 20 and invested:
             signals.append("price-date provenance is incomplete; freshness conclusions are conservative")
+        if unlinked_pct >= unlinked_watch and invested:
+            signals.append("a material share of invested value lacks a complete prediction lineage and needs attribution review")
         if largest_theme_pct is not None and largest_theme_pct >= maximum_theme_rule * concentration_watch_ratio:
             signals.append("primary-theme exposure is close to or above the configured hard limit")
         account_rows.append({
@@ -793,6 +804,8 @@ def paper_account_diagnostics(
             "paper_price_stale_after_calendar_days": stale_after,
             "paper_stale_value_watch_pct": stale_watch,
             "paper_stale_value_alert_pct": stale_alert,
+            "paper_unlinked_prediction_value_watch_pct": unlinked_watch,
+            "paper_unlinked_prediction_value_alert_pct": unlinked_alert,
         },
     }
 

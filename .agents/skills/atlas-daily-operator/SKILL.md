@@ -44,16 +44,16 @@ Do not use `--skip-tests` or `--skip-trading-core` for a normal daily run. `--sk
 Then run the closed loop in configuration order:
 
 ```powershell
+python atlas.py backup --date RUN_DATE
 python atlas.py improvements --date RUN_DATE --apply-safe --strict
 python atlas.py heal --date RUN_DATE --apply-safe --deep --strict
-python atlas.py backup --date RUN_DATE
 python atlas.py alerts --date RUN_DATE
 python atlas.py improvements --date RUN_DATE --apply-safe --strict
 python atlas.py alerts --date RUN_DATE
 python atlas.py backup --date RUN_DATE
 ```
 
-Verify that the final improvement, self-healing, alert, and backup artifacts are date-aligned; the final backup must be external and restore-verified. Then hand off to `$atlas-site-publisher`.
+The first backup is a bootstrap gate: strict improvement and self-healing checks consult recovery evidence, so do not run either strict command against a stale or absent backup. If the bootstrap backup fails, stop before the strict controls. Verify that the final improvement, self-healing, alert, and backup artifacts are date-aligned; the final backup must be external and restore-verified. Then hand off to `$atlas-site-publisher`.
 
 Use `python atlas.py publish --date RUN_DATE` only to resume the control-plane publication sequence for an existing staged candidate when that is the chosen recovery path. It must not replay Phase A.
 

@@ -84,6 +84,18 @@ class PaperTradingTransactionTests(unittest.TestCase):
         MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
         return ledger_path
 
+    def enable_prediction_lifecycle_contract(self) -> Path:
+        ledger_path = self.root / "data" / "predictions.jsonl"
+        self.config["prediction_ledger_file"] = "data/predictions.jsonl"
+        self.config["order_contract"] = {
+            "prediction_reference_required_from_date": "2026-07-17",
+            "prediction_lifecycle_required_from_date": "2026-07-17",
+            "buy_requires_v2_active_prediction": True,
+            "buy_requires_matching_market_mapping": True,
+        }
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+        return ledger_path
+
     def write_predictions(self, rows: list[dict]) -> Path:
         path = self.root / "data" / "predictions.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -92,6 +104,33 @@ class PaperTradingTransactionTests(unittest.TestCase):
             encoding="utf-8",
         )
         return path
+
+    def v2_prediction(
+        self,
+        prediction_id: str,
+        *,
+        symbol: str = "AAA",
+        deadline: str = "2026-07-20",
+        mapping_deadline: str | None = None,
+        status: str = "open",
+    ) -> dict:
+        return {
+            "schema_version": 2,
+            "date": "2026-07-17",
+            "deadline": deadline,
+            "prediction_id": prediction_id,
+            "status": status,
+            "horizon": "1d",
+            "market_mapping": [
+                {
+                    "symbol": symbol,
+                    "benchmark": "SPY",
+                    "direction": "outperform",
+                    "verification_rule": "test mapping",
+                    "evaluation_deadline": mapping_deadline or deadline,
+                }
+            ],
+        }
 
     def order(self, order_id: str, symbol: str = "AAA", notional: float = 10000.0) -> dict:
         return {
@@ -240,6 +279,107 @@ class PaperTradingTransactionTests(unittest.TestCase):
         self.assertFalse(first[0]["idempotent_replay"])
         self.assertTrue(second[0]["idempotent_replay"])
         self.assertEqual(len(MODULE.read_jsonl(self.root / "data" / "trades.jsonl")), 1)
+
+    def test_buy_lifecycle_contract_requires_live_v2_and_matching_unexpired_mapping(self) -> None:
+        self.enable_prediction_lifecycle_contract()
+
+        legacy = self.order("ORDER-LIFECYCLE-LEGACY")
+        legacy["prediction_id"] = "2026-07-17-P01"
+        self.write_predictions([{"date": "2026-07-17", "prediction_id": legacy["prediction_id"]}])
+        with self.assertRaisesRegex(ValueError, "schema_version 2"):
+            MODULE.apply_orders(self.write_orders([legacy]), "2026-07-17", account="US")
+
+        terminal = self.order("ORDER-LIFECYCLE-TERMINAL")
+        terminal["prediction_id"] = "2026-07-17-P02"
+        self.write_predictions([
+            self.v2_prediction(terminal["prediction_id"]),
+            {
+                "date": "2026-07-17",
+                "prediction_id": terminal["prediction_id"],
+                "status": "validated",
+                "review": {"review_date": "2026-07-17", "resolution_scope": "event", "observed_outcome": 1},
+            },
+        ])
+        with self.assertRaisesRegex(ValueError, "terminal review"):
+            MODULE.apply_orders(self.write_orders([terminal]), "2026-07-17", account="US")
+
+        expired = self.order("ORDER-LIFECYCLE-EXPIRED")
+        expired["prediction_id"] = "2026-07-17-P03"
+        self.write_predictions([self.v2_prediction(expired["prediction_id"], deadline="2026-07-16")])
+        with self.assertRaisesRegex(ValueError, "follows prediction deadline"):
+            MODULE.apply_orders(self.write_orders([expired]), "2026-07-17", account="US")
+
+        mismatch = self.order("ORDER-LIFECYCLE-MISMATCH")
+        mismatch["prediction_id"] = "2026-07-17-P04"
+        self.write_predictions([self.v2_prediction(mismatch["prediction_id"], symbol="BBB")])
+        with self.assertRaisesRegex(ValueError, "no matching pre-registered market_mapping"):
+            MODULE.apply_orders(self.write_orders([mismatch]), "2026-07-17", account="US")
+
+        mapping_expired = self.order("ORDER-LIFECYCLE-MAPPING-EXPIRED")
+        mapping_expired["prediction_id"] = "2026-07-17-P05"
+        self.write_predictions([
+            self.v2_prediction(mapping_expired["prediction_id"], mapping_deadline="2026-07-16")
+        ])
+        with self.assertRaisesRegex(ValueError, "follows every matching market-mapping deadline"):
+            MODULE.apply_orders(self.write_orders([mapping_expired]), "2026-07-17", account="US")
+
+        valid = self.order("ORDER-LIFECYCLE-VALID")
+        valid["prediction_id"] = "2026-07-17-P06"
+        self.write_predictions([self.v2_prediction(valid["prediction_id"])])
+        applied = MODULE.apply_orders(self.write_orders([valid]), "2026-07-17", account="US")
+
+        self.assertFalse(applied[0]["idempotent_replay"])
+        self.assertEqual(len(MODULE.read_jsonl(self.root / "data" / "trades.jsonl")), 1)
+
+    def test_buy_lifecycle_keeps_sell_hold_and_idempotent_replay_available(self) -> None:
+        self.enable_prediction_lifecycle_contract()
+        prediction_id = "2026-07-17-P07"
+        self.write_predictions([self.v2_prediction(prediction_id)])
+        buy = self.order("ORDER-LIFECYCLE-REPLAY")
+        buy["prediction_id"] = prediction_id
+        first = MODULE.apply_orders(self.write_orders([buy]), "2026-07-17", account="US")
+
+        self.write_predictions([
+            self.v2_prediction(prediction_id),
+            {
+                "date": "2026-07-17",
+                "prediction_id": prediction_id,
+                "status": "validated",
+                "review": {"review_date": "2026-07-17", "resolution_scope": "combined", "observed_outcome": 1},
+            },
+        ])
+        replay = MODULE.apply_orders(self.write_orders([buy]), "2026-07-17", account="US")
+
+        sell = self.order("ORDER-LIFECYCLE-SELL")
+        sell.update({"action": "SELL", "quantity": 100.0, "prediction_id": prediction_id})
+        hold = self.order("ORDER-LIFECYCLE-HOLD")
+        hold.update({"action": "HOLD", "prediction_id": prediction_id})
+        sold = MODULE.apply_orders(self.write_orders([sell]), "2026-07-18", account="US")
+        held = MODULE.apply_orders(self.write_orders([hold]), "2026-07-18", account="US")
+
+        self.assertFalse(first[0]["idempotent_replay"])
+        self.assertTrue(replay[0]["idempotent_replay"])
+        self.assertEqual(sold[0]["action"], "SELL")
+        self.assertEqual(held[0]["action"], "HOLD")
+
+    def test_buy_lifecycle_does_not_read_a_future_effective_review_into_today(self) -> None:
+        self.enable_prediction_lifecycle_contract()
+        prediction_id = "2026-07-17-P08"
+        self.write_predictions([
+            self.v2_prediction(prediction_id),
+            {
+                "date": "2026-07-17",
+                "prediction_id": prediction_id,
+                "status": "validated",
+                "review": {"review_date": "2026-07-18", "resolution_scope": "event", "observed_outcome": 1},
+            },
+        ])
+        order = self.order("ORDER-LIFECYCLE-FUTURE-REVIEW")
+        order["prediction_id"] = prediction_id
+
+        applied = MODULE.apply_orders(self.write_orders([order]), "2026-07-17", account="US")
+
+        self.assertFalse(applied[0]["idempotent_replay"])
 
     def test_later_invalid_order_rolls_back_the_whole_account_batch(self) -> None:
         invalid = self.order("ORDER-INVALID", symbol="BBB")

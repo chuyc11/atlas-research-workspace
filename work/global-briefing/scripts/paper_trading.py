@@ -29,11 +29,13 @@ from paper_theme_registry import assignment_for as registry_theme_assignment
 from paper_theme_registry import audit_history as audit_theme_registry_history
 from paper_theme_registry import load_registry as load_theme_registry
 from paper_theme_registry import resolve_order_theme
+from research_quality import review_scope
 from report_clock import report_date
 from report_clock import report_now
 
 
 ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+TERMINAL_PREDICTION_STATUSES = {"validated", "partial", "wrong", "expired"}
 
 
 def report_settings_path() -> Path:
@@ -1177,17 +1179,30 @@ def prediction_reference_required(config: dict[str, Any], decision_date: str) ->
     return decision_date >= required_from
 
 
-def load_original_prediction_dates(config: dict[str, Any]) -> dict[str, list[str]]:
+def buy_prediction_lifecycle_required(config: dict[str, Any], decision_date: str, action: str) -> bool:
+    if action != "BUY":
+        return False
+    contract = config.get("order_contract", {}) if isinstance(config.get("order_contract"), dict) else {}
+    required_from = str(contract.get("prediction_lifecycle_required_from_date") or "9999-12-31")[:10]
+    return decision_date >= required_from and bool(
+        contract.get("buy_requires_v2_active_prediction")
+        or contract.get("buy_requires_matching_market_mapping")
+    )
+
+
+def load_prediction_reference_index(config: dict[str, Any]) -> dict[str, Any]:
     ledger_path = resolve_path(config, "prediction_ledger_file")
     if not ledger_path.exists():
         raise ValueError(f"Prediction ledger required for new paper orders does not exist: {ledger_path}")
 
-    originals: dict[str, list[str]] = {}
+    originals: dict[str, dict[str, Any]] = {}
+    reviews: dict[str, list[dict[str, Any]]] = {}
     for index, row in enumerate(read_jsonl(ledger_path), start=1):
-        if isinstance(row.get("review"), dict):
-            continue
         prediction_id = str(row.get("prediction_id") or "").strip()
         if not prediction_id:
+            continue
+        if isinstance(row.get("review"), dict):
+            reviews.setdefault(prediction_id, []).append(row)
             continue
         record_date = strict_iso_date(
             row.get("date"),
@@ -1198,8 +1213,17 @@ def load_original_prediction_dates(config: dict[str, Any]) -> dict[str, list[str
                 "Prediction ledger contains duplicate original prediction_id "
                 f"{prediction_id}; new paper orders fail closed."
             )
-        originals.setdefault(prediction_id, []).append(record_date)
-    return originals
+        originals[prediction_id] = row
+    return {"originals": originals, "reviews": reviews}
+
+
+def load_original_prediction_dates(config: dict[str, Any]) -> dict[str, list[str]]:
+    """Compatibility helper for callers that only need original prediction dates."""
+    index = load_prediction_reference_index(config)
+    return {
+        prediction_id: [strict_iso_date(original.get("date"), f"Prediction {prediction_id} date")]
+        for prediction_id, original in index["originals"].items()
+    }
 
 
 def required_prediction_id(order: dict[str, Any], decision_date: str) -> str:
@@ -1216,19 +1240,93 @@ def required_prediction_id(order: dict[str, Any], decision_date: str) -> str:
 def validate_prediction_reference(
     prediction_id: str,
     decision_date: str,
-    original_dates: dict[str, list[str]],
+    originals: dict[str, dict[str, Any]],
 ) -> None:
-    dates = original_dates.get(prediction_id, [])
-    if not dates:
+    original = originals.get(prediction_id)
+    if not original:
         raise ValueError(
             f"New paper order references prediction_id {prediction_id}, but no original prediction record exists."
         )
-    if not any(record_date <= decision_date for record_date in dates):
-        earliest = min(dates)
+    record_date = strict_iso_date(original.get("date"), f"Prediction {prediction_id} date")
+    if record_date > decision_date:
         raise ValueError(
-            f"New paper order references prediction_id {prediction_id} dated {earliest}, "
+            f"New paper order references prediction_id {prediction_id} dated {record_date}, "
             f"which follows order date {decision_date}."
         )
+
+
+def validate_buy_prediction_lifecycle(
+    order: dict[str, Any],
+    prediction_id: str,
+    decision_date: str,
+    reference_index: dict[str, Any],
+    config: dict[str, Any],
+) -> None:
+    """Require a live v2 thesis and an unexpired pre-registered mapping for new BUYs."""
+    contract = config.get("order_contract", {}) if isinstance(config.get("order_contract"), dict) else {}
+    original = reference_index["originals"].get(prediction_id)
+    if not original:
+        raise ValueError(
+            f"New BUY references prediction_id {prediction_id}, but no original prediction record exists."
+        )
+
+    if contract.get("buy_requires_v2_active_prediction"):
+        if original.get("schema_version") != 2:
+            raise ValueError(f"New BUY requires a schema_version 2 prediction: {prediction_id}.")
+        status = str(original.get("status") or "").strip().lower()
+        if status not in {"open", "active"}:
+            raise ValueError(
+                f"New BUY requires an open or active prediction, but {prediction_id} is {status or 'unset'}."
+            )
+        deadline = strict_iso_date(original.get("deadline"), f"Prediction {prediction_id} deadline")
+        if decision_date > deadline:
+            raise ValueError(
+                f"New BUY decision date {decision_date} follows prediction deadline {deadline} for {prediction_id}."
+            )
+        for review_record in reference_index["reviews"].get(prediction_id, []):
+            ledger_date = strict_iso_date(
+                review_record.get("date"),
+                f"Prediction review date for {prediction_id}",
+            )
+            review = review_record.get("review")
+            review_date = strict_iso_date(
+                review.get("review_date") if isinstance(review, dict) and review.get("review_date") else ledger_date,
+                f"Prediction review effective date for {prediction_id}",
+            )
+            if ledger_date > decision_date or review_date > decision_date:
+                continue
+            review_status = str(review_record.get("status") or "").strip().lower()
+            if (
+                review_status in TERMINAL_PREDICTION_STATUSES
+                and review_scope(review_record) in {"event", "combined"}
+            ):
+                raise ValueError(
+                    f"New BUY cannot use {prediction_id}: an event or combined terminal review is already recorded."
+                )
+
+    if contract.get("buy_requires_matching_market_mapping"):
+        symbol = str(order.get("symbol") or "").strip().upper()
+        mappings = original.get("market_mapping")
+        matches = [
+            mapping
+            for mapping in mappings if isinstance(mapping, dict)
+            and str(mapping.get("symbol") or "").strip().upper() == symbol
+        ] if isinstance(mappings, list) else []
+        if not matches:
+            raise ValueError(
+                f"New BUY {symbol or '<missing symbol>'} has no matching pre-registered market_mapping in {prediction_id}."
+            )
+        deadlines = [
+            strict_iso_date(
+                mapping.get("evaluation_deadline"),
+                f"Market mapping evaluation_deadline for {prediction_id}/{symbol}",
+            )
+            for mapping in matches
+        ]
+        if all(decision_date > deadline for deadline in deadlines):
+            raise ValueError(
+                f"New BUY decision date {decision_date} follows every matching market-mapping deadline for {prediction_id}/{symbol}."
+            )
 
 
 def position_key(symbol: str, exchange: str | None = None) -> str:
@@ -2334,7 +2432,7 @@ def apply_orders(input_path: Path, date: str, account: str | None = None) -> lis
 
     returned_records: list[dict[str, Any]] = []
     prepared: list[tuple[dict[str, Any], dict[str, Any], list[dict[str, Any]], bool]] = []
-    original_prediction_dates: dict[str, list[str]] | None = None
+    prediction_reference_index: dict[str, Any] | None = None
     recovery_contexts = [
         (account_name, account_config(base_config, account_name))
         for account_name in target_accounts(base_config, "ALL")
@@ -2370,7 +2468,8 @@ def apply_orders(input_path: Path, date: str, account: str | None = None) -> lis
             input_order_ids: set[str] = set()
 
             for order in orders:
-                order_decision_date(order, date)
+                decision_date = order_decision_date(order, date)
+                action = str(order.get("action") or "").strip().upper()
                 order_id = order_idempotency_key(config, order, date)
                 if order_id in input_order_ids:
                     raise ValueError(f"Duplicate order_id {order_id} in the same input batch.")
@@ -2408,11 +2507,24 @@ def apply_orders(input_path: Path, date: str, account: str | None = None) -> lis
                         f"{fingerprint_owner or '<legacy>'} with a different order_id."
                     )
 
-                if prediction_reference_required(config, date):
-                    prediction_id = required_prediction_id(order, date)
-                    if original_prediction_dates is None:
-                        original_prediction_dates = load_original_prediction_dates(config)
-                    validate_prediction_reference(prediction_id, date, original_prediction_dates)
+                lifecycle_required = buy_prediction_lifecycle_required(config, decision_date, action)
+                if prediction_reference_required(config, decision_date) or lifecycle_required:
+                    prediction_id = required_prediction_id(order, decision_date)
+                    if prediction_reference_index is None:
+                        prediction_reference_index = load_prediction_reference_index(config)
+                    validate_prediction_reference(
+                        prediction_id,
+                        decision_date,
+                        prediction_reference_index["originals"],
+                    )
+                    if lifecycle_required:
+                        validate_buy_prediction_lifecycle(
+                            order,
+                            prediction_id,
+                            decision_date,
+                            prediction_reference_index,
+                            config,
+                        )
 
                 record = apply_order(
                     state,

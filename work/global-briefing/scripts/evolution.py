@@ -571,6 +571,53 @@ def valuation_price_book(valuations: list[dict[str, Any]], end: date_type) -> di
     return result
 
 
+def record_position_prediction_lineage(position: dict[str, Any], trade: dict[str, Any]) -> None:
+    """Preserve every BUY linkage without rewriting the legacy display identifier."""
+    prediction_ids = position.get("prediction_ids")
+    if not isinstance(prediction_ids, list):
+        prediction_ids = []
+        position["prediction_ids"] = prediction_ids
+    if not prediction_ids:
+        legacy_id = str(position.get("prediction_id") or "").strip()
+        if legacy_id and legacy_id != "unlinked":
+            prediction_ids.append(legacy_id)
+
+    prediction_id = str(trade.get("prediction_id") or "").strip()
+    if prediction_id:
+        if prediction_id not in prediction_ids:
+            prediction_ids.append(prediction_id)
+    else:
+        position["unlinked_buy_count"] = int(position.get("unlinked_buy_count") or 0) + 1
+
+
+def position_prediction_lineage(position: dict[str, Any]) -> dict[str, Any]:
+    raw_ids = position.get("prediction_ids")
+    prediction_ids: list[str] = []
+    if isinstance(raw_ids, list):
+        for value in raw_ids:
+            prediction_id = str(value or "").strip()
+            if prediction_id and prediction_id != "unlinked" and prediction_id not in prediction_ids:
+                prediction_ids.append(prediction_id)
+    if not prediction_ids:
+        legacy_id = str(position.get("prediction_id") or "").strip()
+        if legacy_id and legacy_id != "unlinked":
+            prediction_ids.append(legacy_id)
+    unlinked_buy_count = int(position.get("unlinked_buy_count") or 0)
+    if unlinked_buy_count > 0:
+        status = "legacy_unlinked" if prediction_ids else "unlinked"
+    elif len(prediction_ids) > 1:
+        status = "requires_review"
+    elif prediction_ids:
+        status = "linked"
+    else:
+        status = "unlinked"
+    return {
+        "prediction_ids": prediction_ids,
+        "unlinked_buy_count": unlinked_buy_count,
+        "status": status,
+    }
+
+
 def reconstruct_account_at_date(
     config: dict[str, Any], trades: list[dict[str, Any]], end: date_type
 ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]], dict[str, float], float, float]:
@@ -620,10 +667,13 @@ def reconstruct_account_at_date(
                     "quantity": 0.0,
                     "avg_cost": 0.0,
                     "prediction_id": str(trade.get("prediction_id") or "unlinked"),
+                    "prediction_ids": [],
+                    "unlinked_buy_count": 0,
                     "scenario": str(trade.get("scenario") or ""),
                     "theme": trade.get("theme"),
                 },
             )
+            record_position_prediction_lineage(position, trade)
             old_qty = float(position["quantity"])
             old_cost_native = old_qty * float(position["avg_cost"])
             new_qty = old_qty + quantity
@@ -725,6 +775,7 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
             cost_basis = cost_basis_native * fx_to_base
             unrealized = market_value - cost_basis
             prediction_id = str(position.get("prediction_id") or "unlinked")
+            lineage = position_prediction_lineage(position)
             registry_assignment = registry_theme_assignment(
                 theme_registry,
                 account,
@@ -742,6 +793,9 @@ def paper_attribution(period: str, date: str) -> dict[str, Any]:
                 "symbol": position.get("symbol"),
                 "exchange": position.get("exchange"),
                 "prediction_id": prediction_id,
+                "prediction_ids": lineage["prediction_ids"],
+                "prediction_lineage_status": lineage["status"],
+                "unlinked_buy_count": lineage["unlinked_buy_count"],
                 "scenario": position.get("scenario"),
                 "theme": theme,
                 "theme_source": theme_source,
