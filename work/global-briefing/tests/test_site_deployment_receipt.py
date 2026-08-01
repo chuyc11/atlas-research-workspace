@@ -29,8 +29,8 @@ def valid_receipt(manifest_sha256: str, content_hash: str, deployment_url: str) 
         "published_commit": "2" * 40,
         "artifact_sha256": "3" * 64,
         "artifact_size_bytes": 1234,
-        "sites_version_id": "version-27",
-        "sites_deployment_id": "deployment-27",
+        "sites_version_id": f"{SITE_SYNC.SITES_PROJECT_ID}~appgver_00885d0976e881919aecd23fd48fefd8",
+        "sites_deployment_id": "appgdep_6a6e1454ff3881919f909d3f5d783a2e",
         "publication_manifest_sha256": manifest_sha256,
         "content_hash": content_hash,
     }

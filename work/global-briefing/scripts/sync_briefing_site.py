@@ -2377,7 +2377,7 @@ def deployment_receipt_errors(
         ("sites_deployment_id", "deployment"),
     ):
         value = str(receipt.get(field) or "")
-        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,199}", value):
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:~-]{2,199}", value):
             errors.append(f"Sites deployment receipt platform {label} ID is invalid")
     if receipt.get("publication_manifest_sha256") != expected_manifest_sha256:
         errors.append("Sites deployment receipt publication manifest hash does not match")
