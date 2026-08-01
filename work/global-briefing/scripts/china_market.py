@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import concurrent.futures
 import json
+import math
 import multiprocessing as mp
 import sys
 import urllib.parse
@@ -60,7 +61,7 @@ def now_utc() -> str:
 def timestamp_price_date(value: Any, timezone_name: str = "Asia/Shanghai") -> str | None:
     try:
         stamp = int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     try:
         return datetime.fromtimestamp(stamp, timezone.utc).astimezone(ZoneInfo(timezone_name)).date().isoformat()
@@ -179,8 +180,9 @@ def as_float(value: Any) -> float | None:
     if value is None:
         return None
     try:
-        return float(str(value).replace(",", "").replace("%", ""))
-    except ValueError:
+        number = float(str(value).replace(",", "").replace("%", ""))
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError):
         return None
 
 
@@ -257,13 +259,13 @@ def fetch_yahoo_item(item: dict[str, Any], timeout: int) -> dict[str, Any]:
             "provider": "Yahoo Finance chart fallback",
         }
     meta = result.get("meta", {})
-    price = meta.get("regularMarketPrice")
-    previous = meta.get("chartPreviousClose")
+    price = as_float(meta.get("regularMarketPrice"))
+    previous = as_float(meta.get("chartPreviousClose"))
     change_pct = None
     if price is not None and previous:
         try:
-            change_pct = (float(price) / float(previous) - 1.0) * 100
-        except (TypeError, ValueError, ZeroDivisionError):
+            change_pct = as_float((float(price) / float(previous) - 1.0) * 100)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
             change_pct = None
     code, exchange = normalize_symbol(item["symbol"])
     timestamps = result.get("timestamp") or []
@@ -277,8 +279,8 @@ def fetch_yahoo_item(item: dict[str, Any], timeout: int) -> dict[str, Any]:
         "group": item.get("group"),
         "name": meta.get("longName") or meta.get("shortName") or item.get("name"),
         "theme": item.get("theme"),
-        "price": as_float(price),
-        "previous_close": as_float(previous),
+        "price": price,
+        "previous_close": previous,
         "change_pct": change_pct,
         "currency": meta.get("currency"),
         "provider": "Yahoo Finance chart fallback",
@@ -420,8 +422,8 @@ def fetch_eastmoney_item(item: dict[str, Any], timeout: int) -> dict[str, Any]:
     change_pct = None
     if price is not None and previous:
         try:
-            change_pct = (price / previous - 1.0) * 100
-        except (TypeError, ValueError, ZeroDivisionError):
+            change_pct = as_float((price / previous - 1.0) * 100)
+        except (TypeError, ValueError, ZeroDivisionError, OverflowError):
             change_pct = None
     if change_pct is None:
         change_pct = scaled_eastmoney_number(data.get("f170"), 100.0)
@@ -794,7 +796,10 @@ def main(argv: list[str] | None = None) -> int:
             watchlist_path=args.watchlist,
         )
         output_path = args.output or DATA_DIR / f"china-market-snapshot-{current_report_date()}.json"
-        output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+        output_path.write_text(
+            json.dumps(result, allow_nan=False, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
         print(f"items={len(result.get('items', []))} errors={len(result.get('errors', []))}")
         print(output_path)
         return 0

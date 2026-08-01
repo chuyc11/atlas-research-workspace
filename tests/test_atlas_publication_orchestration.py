@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -66,6 +67,17 @@ def ready_candidate() -> dict:
 class AtlasPublicationOrchestrationTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
+        self.trust_root = Path(self.tmp.name) / "external-trust"
+        self.environment_patch = patch.dict(
+            os.environ,
+            {
+                atlas.TRUST_ANCHOR_ROOT_ENV: str(self.trust_root),
+                atlas.TRUST_ANCHOR_HMAC_KEY_ENV: "publication-test-only-anchor-key",
+                atlas.TRUST_ANCHOR_NAMESPACE_ENV: "atlas-publication-test",
+            },
+            clear=False,
+        )
+        self.environment_patch.start()
         self.runtime = Path(self.tmp.name) / "runtime"
         self.runtime_patch = patch.object(atlas, "ATLAS_RUNTIME_ROOT", self.runtime)
         self.runtime_patch.start()
@@ -79,20 +91,54 @@ class AtlasPublicationOrchestrationTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.backup_bootstrap_patch.stop()
         self.runtime_patch.stop()
+        self.environment_patch.stop()
         self.tmp.cleanup()
 
-    def test_manual_daily_control_config_bootstraps_backup_before_strict_controls(self) -> None:
+    def test_daily_backup_requires_authenticated_full_baseline_shape(self) -> None:
+        daily = {"snapshot_profile": "daily"}
+        self.assertIn(
+            "daily backup is not bound to a full recovery baseline",
+            atlas._daily_backup_baseline_reasons(daily),
+        )
+        daily["full_snapshot"] = {
+            "archive_sha256": "a" * 64,
+            "manifest_sha256": "b" * 64,
+            "date": "2026-07-18",
+            "created_at": "2026-07-18T00:00:00Z",
+            "restore_verified": True,
+        }
+        self.assertEqual(atlas._daily_backup_baseline_reasons(daily), [])
+        self.assertIn(
+            "daily backup full baseline is outside the configured freshness window",
+            atlas._daily_backup_baseline_reasons(
+                daily,
+                maximum_age_hours=24,
+                now=atlas.datetime(2026, 7, 20, tzinfo=atlas.UTC),
+            ),
+        )
+
+    def test_manual_daily_control_config_writes_one_final_backup_after_controls(self) -> None:
         settings_path = Path(__file__).resolve().parents[1] / "work" / "global-briefing" / "config" / "settings.json"
         commands = json.loads(settings_path.read_text(encoding="utf-8"))["self_healing_commands"]
 
-        self.assertEqual(commands[0], "python atlas.py backup --date YYYY-MM-DD")
-        self.assertLess(
-            commands.index("python atlas.py backup --date YYYY-MM-DD"),
-            commands.index("python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict"),
+        self.assertEqual(
+            commands,
+            [
+                "python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict",
+                "python atlas.py heal --date YYYY-MM-DD --apply-safe --deep --strict",
+                "python atlas.py alerts --date YYYY-MM-DD",
+                "python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict",
+                "python atlas.py alerts --date YYYY-MM-DD",
+                "python atlas.py backup --date YYYY-MM-DD",
+            ],
         )
         self.assertLess(
             commands.index("python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict"),
             commands.index("python atlas.py heal --date YYYY-MM-DD --apply-safe --deep --strict"),
+        )
+        self.assertLess(
+            commands.index("python atlas.py alerts --date YYYY-MM-DD"),
+            commands.index("python atlas.py backup --date YYYY-MM-DD"),
         )
 
     def test_post_gate_orchestration_runs_controls_in_order_then_retries_only_staged_candidate(self) -> None:
@@ -125,7 +171,15 @@ class AtlasPublicationOrchestrationTests(unittest.TestCase):
 
         self.assertEqual(
             calls,
-            ["improvements", "self_healing", "alerts", "backup", "retry_staged_candidate"],
+            [
+                "improvements",
+                "self_healing",
+                "alerts",
+                "improvements",
+                "alerts",
+                "backup",
+                "retry_staged_candidate",
+            ],
         )
         sync.assert_not_called()
         quality.assert_not_called()
@@ -134,7 +188,7 @@ class AtlasPublicationOrchestrationTests(unittest.TestCase):
         self.assertFalse(result["phase_a_reexecuted"])
         self.assertEqual(
             [stage["status"] for stage in result["stages"]],
-            ["passed", "passed", "passed", "passed", "passed"],
+            ["passed", "passed", "passed", "passed", "passed", "passed", "passed"],
         )
         saved = json.loads(Path(result["audit_path"]).read_text(encoding="utf-8"))
         self.assertEqual(saved["status"], "frozen_or_pending_deployment")
@@ -187,6 +241,8 @@ class AtlasPublicationOrchestrationTests(unittest.TestCase):
                 "improvements",
                 "self_healing",
                 "alerts",
+                "improvements",
+                "alerts",
                 "backup",
                 "retry_staged_candidate",
             ],
@@ -223,7 +279,10 @@ class AtlasPublicationOrchestrationTests(unittest.TestCase):
         ):
             result = atlas.run_post_gate_publication("2026-07-18", initiated_by="test")
 
-        self.assertEqual(calls, ["improvements", "self_healing", "alerts", "backup"])
+        self.assertEqual(
+            calls,
+            ["improvements", "self_healing", "alerts", "improvements", "alerts", "backup"],
+        )
         retry.assert_not_called()
         self.assertEqual(result["status"], "blocked")
         self.assertEqual(result["returncode"], atlas.PUBLICATION_BLOCKED_RETURN_CODE)
@@ -347,6 +406,41 @@ class AtlasPublicationOrchestrationTests(unittest.TestCase):
         passed = atlas.publication_gate_artifact_readiness("2026-07-18")
         self.assertTrue(passed["ready"])
 
+        write_json(
+            paths["alerts"],
+            {
+                "date": "2026-07-18",
+                "status": "attention_required",
+                "finding_count": 1,
+                "findings": [
+                    {
+                        "id": "ATLAS-IMP-NONBLOCKING",
+                        "severity": "medium",
+                        "status": "regressed",
+                        "summary": "External delivery receipt remains unavailable",
+                    }
+                ],
+            },
+        )
+        attention = atlas.publication_gate_artifact_readiness("2026-07-18")
+        self.assertTrue(attention["ready"])
+
+        alert_payload = json.loads(paths["alerts"].read_text(encoding="utf-8"))
+        alert_payload["findings"][0]["severity"] = "high"
+        write_json(paths["alerts"], alert_payload)
+        high = atlas.publication_gate_artifact_readiness("2026-07-18")
+        self.assertFalse(high["ready"])
+        self.assertIn(
+            "date-aligned alerts are missing or still require attention",
+            high["blockers"],
+        )
+
+        alert_payload["findings"][0]["severity"] = "medium"
+        alert_payload["finding_count"] = 2
+        write_json(paths["alerts"], alert_payload)
+        malformed = atlas.publication_gate_artifact_readiness("2026-07-18")
+        self.assertFalse(malformed["ready"])
+
         write_json(paths["self_healing"], {"date": "2026-07-18", "deep": False})
         blocked = atlas.publication_gate_artifact_readiness("2026-07-18")
         self.assertFalse(blocked["ready"])
@@ -448,6 +542,18 @@ class AtlasPublicationOrchestrationTests(unittest.TestCase):
             patch.object(atlas, "command_test", return_value=0),
             patch.object(atlas, "audit_cycle_history", return_value=history),
             patch.object(atlas, "write_cycle_history_anchor", return_value={}),
+            patch.object(
+                atlas,
+                "audit_global_cycle_history",
+                return_value={
+                    "passed": True,
+                    "errors": [],
+                    "anchor_present": True,
+                    "migration_required": False,
+                    "append_pending": False,
+                },
+            ),
+            patch.object(atlas, "write_global_cycle_history_anchor", return_value={}),
             patch.object(
                 atlas,
                 "build_cycle_fingerprint",

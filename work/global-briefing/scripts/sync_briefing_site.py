@@ -43,6 +43,9 @@ EVOLUTION_STATE_PATH = DATA_DIR / "evolution_state.json"
 SOURCES_CONFIG_PATH = ROOT / "work" / "global-briefing" / "config" / "sources.json"
 SETTINGS_CONFIG_PATH = ROOT / "work" / "global-briefing" / "config" / "settings.json"
 PAPER_CONFIG_PATH = ROOT / "work" / "global-briefing" / "config" / "paper_trading.json"
+IMPROVEMENT_TRACKING_CONFIG_PATH = (
+    ROOT / "work" / "global-briefing" / "config" / "improvement_tracking.json"
+)
 ATLAS_RUNTIME_ROOT = ROOT / "work" / "shared" / "atlas"
 ATLAS_CYCLE_STATE = ATLAS_RUNTIME_ROOT / "cycle_state.json"
 ATLAS_LEDGER_STATE = ATLAS_RUNTIME_ROOT / "virtual_execution" / "atlas_virtual_execution_state.json"
@@ -58,6 +61,26 @@ PUBLICATION_SNAPSHOT_SCHEMA_VERSION = 2
 PUBLICATION_MANIFEST_SCHEMA_VERSION = 1
 CANDIDATE_FINGERPRINT_SCHEMA_VERSION = 1
 PUBLICATION_CANDIDATE_SCHEMA_VERSION = 1
+DEPLOYMENT_RECEIPT_SCHEMA_VERSION = 1
+SITES_PROJECT_ID = "appgprj_6a5041d5aca88191a3c6e2c9ebd03490"
+SITES_PRODUCTION_URL = "https://atlas-global-brief-2026.poetic-kiwi-4295.chatgpt.site"
+DEPLOYMENT_RECEIPT_FIELDS = frozenset({
+    "schema_version",
+    "status",
+    "created_at",
+    "project_id",
+    "deployment_url",
+    "source_base_commit",
+    "published_commit",
+    "artifact_sha256",
+    "artifact_size_bytes",
+    "sites_version_id",
+    "sites_deployment_id",
+    "publication_manifest_sha256",
+    "content_hash",
+})
+DEPLOYMENT_RECEIPT_MAX_BYTES = 32 * 1024
+DEPLOYMENT_RECEIPT_ARCHIVE_ROOT = ATLAS_RUNTIME_ROOT / "deployment_receipts"
 MAX_GATE_ARTIFACT_AGE = timedelta(hours=72)
 BACKUP_SCHEMA_VERSION = 4
 DAILY_PUBLICATION_REQUIRED_CYCLE_STAGES = (
@@ -704,33 +727,103 @@ def latest_snapshot(prefix: str, report_date: str) -> dict[str, Any]:
     return load_json(path, {}) if path else {}
 
 
+def selected_price_date_range(items: list[dict[str, Any]], report_date: str) -> tuple[str, list[str]]:
+    dates: list[str] = []
+    report_day = Date.fromisoformat(report_date)
+    for item in items:
+        value = str(item.get("price_date") or "")[:10]
+        try:
+            price_day = Date.fromisoformat(value)
+        except ValueError:
+            continue
+        if price_day <= report_day:
+            dates.append(value)
+    if not dates:
+        return "", []
+    ordered = sorted(set(dates))
+    return ordered[0], [ordered[0], ordered[-1]]
+
+
+def valid_market_change(item: dict[str, Any], report_date: str) -> float | None:
+    """Return a finite change only when its price date is observable and not future."""
+
+    value = str(item.get("price_date") or "")[:10]
+    try:
+        price_day = Date.fromisoformat(value)
+        report_day = Date.fromisoformat(report_date)
+    except ValueError:
+        return None
+    if price_day > report_day:
+        return None
+    raw_change = item.get("change_pct")
+    if isinstance(raw_change, bool) or raw_change in (None, ""):
+        return None
+    try:
+        change = float(raw_change)
+    except (TypeError, ValueError):
+        return None
+    return change if math.isfinite(change) else None
+
+
 def parse_markets(report_date: str) -> dict[str, Any]:
     us_snapshot = latest_snapshot("market-snapshot", report_date)
     china_snapshot = latest_snapshot("china-market-snapshot", report_date)
     us_preferred = ["SPY", "QQQ", "SMH", "CIBR", "GLD"]
     us_map = {str(item.get("ticker")): item for item in us_snapshot.get("items", [])}
     us_items = []
+    us_selected: list[dict[str, Any]] = []
     for ticker in us_preferred:
         item = us_map.get(ticker)
         if item:
-            change = float(item.get("change_pct") or 0)
+            change = valid_market_change(item, report_date)
+            if change is None:
+                continue
             us_items.append({"label": ticker, "change": f"{change:+.2f}%", "direction": "up" if change > 0 else "down" if change < 0 else "flat"})
+            us_selected.append(item)
     china_preferred = ["000300.SH", "399006.SZ", "000688.SH", "HSI.HK", "HSTECH.HK"]
     china_map = {str(item.get("symbol")): item for item in china_snapshot.get("items", [])}
     china_items = []
+    china_selected: list[dict[str, Any]] = []
     for symbol in china_preferred:
         item = china_map.get(symbol)
         if item:
-            change = float(item.get("change_pct") or 0)
+            change = valid_market_change(item, report_date)
+            if change is None:
+                continue
             china_items.append({"label": str(item.get("name") or symbol).replace("指数", ""), "change": f"{change:+.2f}%", "direction": "up" if change > 0 else "down" if change < 0 else "flat"})
-    us_date = next((str(item.get("price_date")) for item in us_snapshot.get("items", []) if item.get("price_date")), report_date)
-    china_time = str(china_snapshot.get("generated_at") or report_date)[:10]
-    china_note = "结构化行情源可用。"
+            china_selected.append(item)
+    us_date, us_date_range = selected_price_date_range(us_selected, report_date)
+    china_date, china_date_range = selected_price_date_range(china_selected, report_date)
+    us_as_of = us_date or "未知"
+    china_as_of = china_date or "未知"
+    china_note = "结构化行情源可用。" if china_selected else "无可验证的非未来价格，行情状态未知。"
     if china_snapshot.get("errors"):
-        china_note = "行情使用回退数据源，方向可观察，精度为中等。"
+        china_note = (
+            "行情使用回退数据源，方向可观察，精度为中等。"
+            if china_selected
+            else "回退行情源仍未提供可验证的非未来价格。"
+        )
+    if china_date_range and china_date_range[0] != china_date_range[-1]:
+        china_note += f" 所示资产实际价格日期介于 {china_date_range[0]} 至 {china_date_range[-1]}。"
     return {
-        "us": {"label": "美国 / 全球", "asOf": us_date, "freshness": "最近收盘", "isStale": us_date != report_date, "items": us_items, "note": f"截至 {us_date} 最近有效收盘。"},
-        "china": {"label": "中国 / 香港", "asOf": china_time, "freshness": "报告日", "isStale": china_time != report_date, "items": china_items, "note": china_note},
+        "us": {
+            "label": "美国 / 全球",
+            "asOf": us_as_of,
+            "priceDateRange": us_date_range,
+            "freshness": "最近实际收盘" if us_date else "行情日期未知",
+            "isStale": not us_date or us_date != report_date,
+            "items": us_items,
+            "note": f"所示资产最旧价格截至 {us_date}。" if us_date else "无可验证的非未来价格。",
+        },
+        "china": {
+            "label": "中国 / 香港",
+            "asOf": china_as_of,
+            "priceDateRange": china_date_range,
+            "freshness": "最近实际收盘" if china_date else "行情日期未知",
+            "isStale": not china_date or china_date != report_date,
+            "items": china_items,
+            "note": china_note,
+        },
     }
 
 
@@ -2221,6 +2314,105 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def deployment_receipt_errors(
+    receipt_path: Path,
+    *,
+    expected_manifest_sha256: str,
+    expected_content_hash: str,
+    deployment_url: str,
+    now: datetime | None = None,
+) -> tuple[list[str], dict[str, Any], bytes]:
+    """Validate and freeze publisher metadata returned by the isolated Sites publisher.
+
+    The live verifier proves what is visible.  This separate receipt preserves
+    which clean Sites base, pushed commit, build package and platform identifiers
+    the publisher reported.  It is audit metadata, not provider-authenticated
+    proof; the fresh fixed-origin live verifier remains deployment authority.
+    """
+    if not receipt_path.is_file():
+        return [f"Sites deployment receipt is missing or invalid: {receipt_path}"], {}, b""
+    try:
+        receipt_size = receipt_path.stat().st_size
+    except OSError:
+        return [f"Sites deployment receipt is unreadable: {receipt_path}"], {}, b""
+    if receipt_size <= 0 or receipt_size > DEPLOYMENT_RECEIPT_MAX_BYTES:
+        return ["Sites deployment receipt size is outside the allowed range"], {}, b""
+    try:
+        raw_receipt = receipt_path.read_bytes()
+        receipt = json.loads(raw_receipt.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return [f"Sites deployment receipt is missing or invalid: {receipt_path}"], {}, b""
+    if not isinstance(receipt, dict) or not receipt:
+        return [f"Sites deployment receipt is missing or invalid: {receipt_path}"], {}, b""
+    errors: list[str] = []
+    if set(receipt) != DEPLOYMENT_RECEIPT_FIELDS:
+        errors.append("Sites deployment receipt must use the exact credential-free schema")
+    if receipt.get("schema_version") != DEPLOYMENT_RECEIPT_SCHEMA_VERSION:
+        errors.append("Sites deployment receipt schema version is invalid")
+    if receipt.get("status") != "succeeded":
+        errors.append("Sites deployment receipt status is not succeeded")
+    if receipt.get("project_id") != SITES_PROJECT_ID:
+        errors.append("Sites deployment receipt project does not match the existing production project")
+    if deployment_url.rstrip("/") != SITES_PRODUCTION_URL:
+        errors.append("--deployment-url does not match the fixed Sites production URL")
+    if str(receipt.get("deployment_url") or "").rstrip("/") != SITES_PRODUCTION_URL:
+        errors.append("Sites deployment receipt does not match the fixed production URL")
+    if str(receipt.get("deployment_url") or "").rstrip("/") != deployment_url.rstrip("/"):
+        errors.append("Sites deployment receipt URL does not match --deployment-url")
+    source_base = str(receipt.get("source_base_commit") or "").lower()
+    published = str(receipt.get("published_commit") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", source_base):
+        errors.append("Sites deployment receipt source base commit is invalid")
+    if not re.fullmatch(r"[0-9a-f]{40}", published):
+        errors.append("Sites deployment receipt published commit is invalid")
+    elif published == source_base:
+        errors.append("Sites deployment receipt published commit must differ from the fetched base commit")
+    if not re.fullmatch(r"[0-9a-f]{64}", str(receipt.get("artifact_sha256") or "")):
+        errors.append("Sites deployment receipt artifact SHA-256 is invalid")
+    artifact_size = receipt.get("artifact_size_bytes")
+    if isinstance(artifact_size, bool) or not isinstance(artifact_size, int) or artifact_size <= 0:
+        errors.append("Sites deployment receipt artifact size is invalid")
+    for field, label in (
+        ("sites_version_id", "version"),
+        ("sites_deployment_id", "deployment"),
+    ):
+        value = str(receipt.get(field) or "")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:-]{2,199}", value):
+            errors.append(f"Sites deployment receipt platform {label} ID is invalid")
+    if receipt.get("publication_manifest_sha256") != expected_manifest_sha256:
+        errors.append("Sites deployment receipt publication manifest hash does not match")
+    if receipt.get("content_hash") != expected_content_hash:
+        errors.append("Sites deployment receipt content hash does not match")
+    created_at = str(receipt.get("created_at") or "")
+    try:
+        created = datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            raise ValueError("timezone required")
+        current = now or datetime.now(timezone.utc)
+        age = current.astimezone(timezone.utc) - created.astimezone(timezone.utc)
+        if age < -timedelta(minutes=5) or age > timedelta(hours=24):
+            errors.append("Sites deployment receipt is stale or future-dated")
+    except ValueError:
+        errors.append("Sites deployment receipt created_at is invalid")
+    return errors, receipt, raw_receipt
+
+
+def archive_deployment_receipt(raw: bytes, report_date: str) -> tuple[Path, str]:
+    """Persist the exact credential-free publisher metadata used for one mark."""
+
+    digest = hashlib.sha256(raw).hexdigest()
+    archive_path = DEPLOYMENT_RECEIPT_ARCHIVE_ROOT / report_date / f"{digest}.json"
+    archive_path.parent.mkdir(parents=True, exist_ok=True)
+    if archive_path.exists():
+        if archive_path.read_bytes() != raw:
+            raise OSError("deployment receipt archive digest collision")
+        return archive_path, digest
+    temporary = archive_path.with_suffix(".json.tmp")
+    temporary.write_bytes(raw)
+    temporary.replace(archive_path)
+    return archive_path, digest
+
+
 def generated_site_artifacts() -> list[dict[str, str]]:
     artifacts: list[dict[str, str]] = []
     for relative_path, workspace_path in (
@@ -3327,6 +3519,56 @@ def publication_snapshot_path(report_date: str) -> Path:
     return PUBLICATION_SNAPSHOT_ROOT / f"atlas-publication-{report_date}.json"
 
 
+def configured_blocking_alert_severities() -> set[str]:
+    config = load_json(IMPROVEMENT_TRACKING_CONFIG_PATH, {})
+    configured = config.get("blocking_severities") if isinstance(config, dict) else None
+    if not isinstance(configured, list) or not configured:
+        return {"critical", "high"}
+    severities = {
+        str(value).strip().lower()
+        for value in configured
+        if isinstance(value, str) and value.strip()
+    }
+    return severities or {"critical", "high"}
+
+
+def alert_artifact_is_nonblocking(alerts: Any) -> bool:
+    """Accept a structurally valid alert payload only when no finding is blocking."""
+
+    if not isinstance(alerts, dict):
+        return False
+    status = str(alerts.get("status") or "")
+    if status == "healthy":
+        return True
+    if status != "attention_required":
+        return False
+    findings = alerts.get("findings")
+    finding_count = alerts.get("finding_count")
+    if (
+        not isinstance(findings, list)
+        or not findings
+        or isinstance(finding_count, bool)
+        or not isinstance(finding_count, int)
+        or finding_count != len(findings)
+    ):
+        return False
+    blocking = configured_blocking_alert_severities()
+    allowed_severities = {"critical", "high", "medium", "low"}
+    for finding in findings:
+        if not isinstance(finding, dict):
+            return False
+        severity = str(finding.get("severity") or "").strip().lower()
+        if (
+            not str(finding.get("id") or "").strip()
+            or not str(finding.get("status") or "").strip()
+            or not str(finding.get("summary") or "").strip()
+            or severity not in allowed_severities
+            or severity in blocking
+        ):
+            return False
+    return True
+
+
 def _publication_snapshot_status_checks(
     report_date: str,
     *,
@@ -3413,26 +3655,25 @@ def _publication_snapshot_status_checks(
         or int(improvement_counts.get("blocking") or 0) != 0
     ):
         reasons.append("date-aligned improvement verification is missing or blocking")
-    alert_status = str(alerts.get("status") or "") if isinstance(alerts, dict) else ""
-    alert_findings = alerts.get("findings") if isinstance(alerts, dict) else None
-    alert_finding_count = alerts.get("finding_count") if isinstance(alerts, dict) else None
-    alert_contract_valid = bool(
-        alert_status == "healthy"
-        or (
-            alert_status == "attention_required"
-            and isinstance(alert_findings, list)
-            and bool(alert_findings)
-            and isinstance(alert_finding_count, int)
-            and not isinstance(alert_finding_count, bool)
-            and alert_finding_count == len(alert_findings)
-        )
-    )
     if (
         not isinstance(alerts, dict)
         or alerts.get("date") != report_date
-        or not alert_contract_valid
+        or not alert_artifact_is_nonblocking(alerts)
     ):
         reasons.append("date-aligned alerts are missing or still require attention")
+    backup_profile = backup.get("snapshot_profile", "full") if isinstance(backup, dict) else None
+    backup_full_snapshot = backup.get("full_snapshot") if isinstance(backup, dict) else None
+    backup_full_baseline_valid = bool(
+        backup_profile != "daily"
+        or (
+            isinstance(backup_full_snapshot, dict)
+            and backup_full_snapshot.get("restore_verified") is True
+            and all(
+                re.fullmatch(r"[0-9a-f]{64}", str(backup_full_snapshot.get(field) or ""))
+                for field in ("archive_sha256", "manifest_sha256")
+            )
+        )
+    )
     if (
         not isinstance(backup, dict)
         or backup.get("schema_version") != BACKUP_SCHEMA_VERSION
@@ -3445,6 +3686,7 @@ def _publication_snapshot_status_checks(
         or backup.get("restore_verified") is not True
         or backup.get("restore_scope") != "configured_workspace_files_and_git_bundles"
         or backup.get("target_outside_workspace") is not True
+        or not backup_full_baseline_valid
     ):
         reasons.append("date-aligned encrypted external backup and restore verification has not passed")
 
@@ -3725,6 +3967,10 @@ def _backup_content_binding(
             errors.append("backup manifest is not AES-256-GCM encrypted")
         if manifest.get("restore_scope") != "configured_workspace_files_and_git_bundles":
             errors.append("backup manifest restore scope is invalid")
+        if manifest.get("snapshot_profile", "full") != backup.get("snapshot_profile", "full"):
+            errors.append("backup manifest snapshot profile differs from latest metadata")
+        if manifest.get("full_snapshot") != backup.get("full_snapshot"):
+            errors.append("backup manifest full snapshot reference differs from latest metadata")
         errors.extend(_metadata_authentication_shape_errors(manifest, "backup manifest"))
         latest_auth = backup.get("metadata_authentication", {})
         manifest_auth = manifest.get("metadata_authentication", {})
@@ -4038,6 +4284,14 @@ def main() -> int:
         type=Path,
         help="Fresh passing artifact from verify_production_site.py; required by --mark-deployed.",
     )
+    parser.add_argument(
+        "--deployment-receipt",
+        type=Path,
+        help=(
+            "Fresh Sites publisher receipt binding the fetched base commit, pushed commit, build package "
+            "and platform version/deployment IDs; required by --mark-deployed."
+        ),
+    )
     parser.add_argument("--force", action="store_true", help="Regenerate even when the newest hash is already deployed.")
     parser.add_argument(
         "--candidate-only",
@@ -4126,6 +4380,20 @@ def main() -> int:
         else:
             deployment_reasons.append("frozen publication snapshot is missing")
 
+        deployment_receipt: dict[str, Any] = {}
+        deployment_receipt_raw = b""
+        receipt_path = args.deployment_receipt
+        if receipt_path is None:
+            deployment_reasons.append("--deployment-receipt is required to mark a deployment")
+        else:
+            receipt_errors, deployment_receipt, deployment_receipt_raw = deployment_receipt_errors(
+                receipt_path,
+                expected_manifest_sha256=current_manifest_sha,
+                expected_content_hash=args.mark_deployed,
+                deployment_url=args.deployment_url,
+            )
+            deployment_reasons.extend(receipt_errors)
+
         if deployment_reasons:
             print(json.dumps({
                 "status": "error",
@@ -4160,6 +4428,18 @@ def main() -> int:
                 "reasons": verification_errors,
             }, ensure_ascii=False))
             return 2
+        try:
+            archived_receipt_path, archived_receipt_sha = archive_deployment_receipt(
+                deployment_receipt_raw,
+                report_date,
+            )
+        except OSError as error:
+            print(json.dumps({
+                "status": "error",
+                "error": "cannot archive credential-free publisher metadata",
+                "detail": type(error).__name__,
+            }, ensure_ascii=False))
+            return 2
         state.update({
             "last_deployed_sha": args.mark_deployed,
             "last_deployed_payload_sha": current_payload_sha,
@@ -4174,6 +4454,16 @@ def main() -> int:
             "last_deployment_verification_artifact": str(verification_path),
             "last_deployment_verification_sha256": hashlib.sha256(verification_path.read_bytes()).hexdigest(),
             "last_deployment_connected_ip": verification.get("network", {}).get("connected_ip"),
+            "last_deployment_receipt_artifact": str(archived_receipt_path),
+            "last_deployment_receipt_sha256": archived_receipt_sha,
+            "last_deployment_receipt_trust": "publisher_metadata_unverified",
+            "last_deployment_authority": "fresh_live_production_verification",
+            "last_deployment_source_base_commit": deployment_receipt.get("source_base_commit"),
+            "last_deployment_published_commit": deployment_receipt.get("published_commit"),
+            "last_deployment_artifact_sha256": deployment_receipt.get("artifact_sha256"),
+            "last_deployment_artifact_size_bytes": deployment_receipt.get("artifact_size_bytes"),
+            "last_sites_version_id": deployment_receipt.get("sites_version_id"),
+            "last_sites_deployment_id": deployment_receipt.get("sites_deployment_id"),
         })
         for key in (
             "pending_sha",
@@ -4196,6 +4486,13 @@ def main() -> int:
             "deployment_id": current_manifest.get("deploymentId"),
             "deployment_url": args.deployment_url,
             "verification_artifact": str(verification_path),
+            "deployment_receipt": str(archived_receipt_path),
+            "deployment_receipt_trust": "publisher_metadata_unverified",
+            "deployment_authority": "fresh_live_production_verification",
+            "published_commit": deployment_receipt.get("published_commit"),
+            "artifact_sha256": deployment_receipt.get("artifact_sha256"),
+            "sites_version_id": deployment_receipt.get("sites_version_id"),
+            "sites_deployment_id": deployment_receipt.get("sites_deployment_id"),
         }, ensure_ascii=False))
         return 0
 

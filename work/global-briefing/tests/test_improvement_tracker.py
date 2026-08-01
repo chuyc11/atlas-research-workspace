@@ -119,10 +119,14 @@ class ImprovementTrackerTests(unittest.TestCase):
 
         self.assertEqual(source["status"], "regressed")
         self.assertEqual(source["last_evaluation"]["evidence"]["score"], 42)
+        occurrence_count = source["occurrences"]
+        history_count = len(source["verification_history"])
 
         _rc, third = self.tracker.run("2026-07-13", apply_safe=False, strict=False)
         source = next(item for item in third["actions"] if item["spec"]["source_key"] == "capability-source-health")
         self.assertEqual(source["status"], "regressed")
+        self.assertEqual(source["occurrences"], occurrence_count)
+        self.assertEqual(len(source["verification_history"]), history_count)
 
     def test_high_source_score_cannot_verify_failed_core_story_evidence(self) -> None:
         self.write_quality("2026-07-12", passed=False)
@@ -267,6 +271,7 @@ class ImprovementTrackerTests(unittest.TestCase):
             archive.write_bytes(b"encrypted backup")
             payload = {
                 "archive": str(archive),
+                "archive_sha256": MODULE.hashlib.sha256(archive.read_bytes()).hexdigest(),
                 "created_at": MODULE.utc_now(),
                 "archive_integrity_verified": True,
                 "restore_verified": True,
@@ -289,10 +294,134 @@ class ImprovementTrackerTests(unittest.TestCase):
                 }
             )
             write_json(latest, payload)
-            encrypted = self.tracker.evaluate(spec, action, date)
+            unauthenticated = self.tracker.evaluate(spec, action, date)
+            self.assertEqual(unauthenticated.outcome, "fail")
+
+            authenticated_result = {
+                "verified": True,
+                "archive_sha256": MODULE.hashlib.sha256(archive.read_bytes()).hexdigest(),
+                "archive_integrity_verified": True,
+                "restore_verified": True,
+                "restore_scope": "configured_workspace_files_and_git_bundles",
+                "snapshot_profile": "full",
+                "full_baseline_authenticated": False,
+                "verification_mode": "authenticated_archive",
+            }
+            with patch.object(
+                self.tracker,
+                "verify_disaster_recovery_snapshot",
+                return_value=authenticated_result,
+            ):
+                encrypted = self.tracker.evaluate(spec, action, date)
 
         self.assertEqual(encrypted.outcome, "pass")
         self.assertFalse(encrypted.evidence["full_runtime_restore_verified"])
+
+    def test_manual_action_becomes_overdue_after_due_date(self) -> None:
+        spec = MODULE.ActionSpec(
+            source_key="manual-critical",
+            domain="governance",
+            title="manual evidence",
+            recommendation="provide durable proof",
+            acceptance_key="manual_evidence",
+            acceptance_criteria="proof exists",
+            severity="critical",
+            risk="high",
+        )
+        with (
+            patch.object(self.tracker, "retrospective_specs", return_value=[spec]),
+            patch.object(self.tracker, "capability_specs", return_value=[]),
+        ):
+            self.tracker.run("2026-07-12", apply_safe=False, strict=False)
+            rc, report = self.tracker.run("2026-07-20", apply_safe=False, strict=True)
+
+        action = report["actions"][0]
+        self.assertEqual(rc, 1)
+        self.assertEqual(action["status"], "overdue")
+        self.assertEqual(report["counts"]["blocking"], 1)
+
+    def test_reverse_date_cannot_downgrade_a_verified_action(self) -> None:
+        self.tracker.run("2026-07-12", apply_safe=False, strict=False)
+        self.write_quality("2026-07-13", passed=True)
+        _rc, verified = self.tracker.run("2026-07-13", apply_safe=False, strict=False)
+        action = next(
+            item
+            for item in verified["actions"]
+            if item["spec"]["source_key"] == "failure-asset_mapping_error"
+        )
+        self.assertEqual(action["status"], "verified")
+
+        with self.assertRaisesRegex(ValueError, "earlier than its last check"):
+            self.tracker.run("2026-07-12", apply_safe=False, strict=False)
+
+    def test_same_day_dynamic_age_is_semantically_idempotent_before_fixer(self) -> None:
+        spec = MODULE.ActionSpec(
+            source_key="dynamic-age",
+            domain="resilience",
+            title="dynamic evidence",
+            recommendation="keep the gate stable",
+            acceptance_key="dynamic",
+            acceptance_criteria="passes",
+            severity="critical",
+            risk="low",
+            origin="capability_audit",
+            auto_fixer="safe-test-fixer",
+        )
+        observed_ages = iter([1.0, 1.1])
+
+        def evaluate(_spec, _action, _date):
+            return MODULE.Evaluation(
+                "fail",
+                "same semantic failure",
+                {"age_hours": next(observed_ages), "stable_reason": "missing"},
+            )
+
+        with (
+            patch.object(self.tracker, "retrospective_specs", return_value=[]),
+            patch.object(self.tracker, "capability_specs", return_value=[spec]),
+            patch.object(self.tracker, "evaluate", side_effect=evaluate),
+            patch.object(self.tracker, "apply_fixer", return_value=(False, "still missing")) as fixer,
+        ):
+            _rc, first = self.tracker.run("2026-07-12", apply_safe=True, strict=False)
+            _rc, second = self.tracker.run("2026-07-12", apply_safe=True, strict=False)
+
+        first_action = first["actions"][0]
+        second_action = second["actions"][0]
+        self.assertEqual(fixer.call_count, 1)
+        self.assertEqual(second_action["occurrences"], first_action["occurrences"])
+        self.assertEqual(
+            len(second_action["verification_history"]),
+            len(first_action["verification_history"]),
+        )
+        self.assertEqual(second_action["last_evaluation"]["evidence"]["age_hours"], 1.1)
+
+    def test_verified_manual_result_reopens_as_regressed(self) -> None:
+        spec = MODULE.ActionSpec(
+            source_key="manual-regression",
+            domain="governance",
+            title="manual regression",
+            recommendation="retain evidence",
+            acceptance_key="manual",
+            acceptance_criteria="evidence remains valid",
+            severity="high",
+            risk="high",
+            origin="capability_audit",
+        )
+        evaluations = iter(
+            [
+                MODULE.Evaluation("pass", "evidence present", {"proof": "one"}),
+                MODULE.Evaluation("manual", "evidence must be renewed", {}),
+            ]
+        )
+        with (
+            patch.object(self.tracker, "retrospective_specs", return_value=[]),
+            patch.object(self.tracker, "capability_specs", return_value=[spec]),
+            patch.object(self.tracker, "evaluate", side_effect=lambda *_args: next(evaluations)),
+        ):
+            self.tracker.run("2026-07-12", apply_safe=False, strict=False)
+            _rc, report = self.tracker.run("2026-07-13", apply_safe=False, strict=False)
+
+        self.assertEqual(report["actions"][0]["status"], "regressed")
 
     def test_paper_attribution_uses_only_allowlisted_safe_fixer(self) -> None:
         target = self.root / "work" / "global-briefing" / "data" / "paper-attribution-day-2026-07-12.json"

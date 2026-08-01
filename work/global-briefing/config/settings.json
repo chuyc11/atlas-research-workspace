@@ -15,10 +15,12 @@
   },
   "improvement_tracking_config": "work/global-briefing/config/improvement_tracking.json",
   "self_healing_commands": [
-    "python atlas.py backup --date YYYY-MM-DD",
     "python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict",
     "python atlas.py heal --date YYYY-MM-DD --apply-safe --deep --strict",
-    "python atlas.py heal --status --json"
+    "python atlas.py alerts --date YYYY-MM-DD",
+    "python atlas.py improvements --date YYYY-MM-DD --apply-safe --strict",
+    "python atlas.py alerts --date YYYY-MM-DD",
+    "python atlas.py backup --date YYYY-MM-DD"
   ],
   "evolution_outputs": {
     "daily_scorecard": "work/global-briefing/data/scorecard-day-YYYY-MM-DD.json",

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import errno
 import hashlib
 import json
 import math
@@ -29,6 +30,7 @@ from paper_theme_registry import assignment_for as registry_theme_assignment
 from paper_theme_registry import audit_history as audit_theme_registry_history
 from paper_theme_registry import load_registry as load_theme_registry
 from paper_theme_registry import resolve_order_theme
+from market_session_calendar import market_session_age as calculate_market_session_age
 from research_quality import review_scope
 from report_clock import report_date
 from report_clock import report_now
@@ -154,6 +156,24 @@ def business_day_age(price_date: str, valuation_date: str) -> int:
     return age
 
 
+def market_session_age(
+    price_date: str,
+    valuation_date: str,
+    *,
+    market_type: str,
+    exchange: str,
+    config: dict[str, Any],
+) -> int:
+    return calculate_market_session_age(
+        price_date,
+        valuation_date,
+        market_type=market_type,
+        exchange=exchange,
+        config=config,
+        root=ROOT,
+    )
+
+
 def atomic_write_text(path: Path, text: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
@@ -205,6 +225,7 @@ def validate_config(config: dict[str, Any]) -> None:
             "default_price_limit_pct",
             "star_market_price_limit_pct",
             "chinext_price_limit_pct",
+            "beijing_price_limit_pct",
             "st_price_limit_pct",
         ):
             if field in rules:
@@ -223,6 +244,11 @@ def validate_config(config: dict[str, Any]) -> None:
             valuation_policy.get("max_price_age_business_days", 1),
             "valuation_policy.max_price_age_business_days",
         )
+        if valuation_policy.get("session_calendar_required_from_date"):
+            strict_iso_date(
+                valuation_policy["session_calendar_required_from_date"],
+                "valuation_policy.session_calendar_required_from_date",
+            )
 
     contract = config.get("order_contract", {}) if isinstance(config.get("order_contract"), dict) else {}
     if "max_price_age_business_days" in contract:
@@ -236,9 +262,12 @@ def validate_config(config: dict[str, Any]) -> None:
         "theme_required_from_date",
         "maximum_theme_exposure_enforce_from_date",
         "theme_registry_history_required_from_date",
+        "strategy_controls_required_from_date",
+        "session_calendar_required_from_date",
+        "a_share_previous_close_required_from_date",
     ):
         if contract.get(field):
-            datetime.strptime(str(contract[field])[:10], "%Y-%m-%d")
+            strict_iso_date(contract[field], f"order_contract.{field}")
     if contract.get("prediction_reference_required_from_date"):
         prediction_ledger_file = config.get("prediction_ledger_file")
         if not isinstance(prediction_ledger_file, str) or not prediction_ledger_file.strip():
@@ -297,6 +326,34 @@ def validate_config(config: dict[str, Any]) -> None:
         )
         if not 0 < maximum_theme <= 1:
             raise ValueError("strategy_profile maximum_theme_exposure_pct must be greater than 0 and at most 1.")
+    sizing = profile.get("position_sizing", {}) if isinstance(profile.get("position_sizing"), dict) else {}
+    if "maximum_adds_per_position" in sizing:
+        non_negative_int(
+            sizing["maximum_adds_per_position"],
+            "strategy_profile.position_sizing.maximum_adds_per_position",
+        )
+    for field in ("daily_loss_circuit_breaker_pct", "portfolio_drawdown_derisk_pct"):
+        if field in risk_overlays:
+            value = finite_float(risk_overlays[field], f"strategy_profile.risk_overlays.{field}")
+            if not 0 < value <= 1:
+                raise ValueError(f"strategy_profile.risk_overlays.{field} must be greater than 0 and at most 1.")
+
+    calendar_dates = [
+        contract.get("session_calendar_required_from_date"),
+        valuation_policy.get("session_calendar_required_from_date") if isinstance(valuation_policy, dict) else None,
+    ]
+    if any(calendar_dates):
+        market_calendar = config.get("market_calendar")
+        required_calendar_fields = {
+            "a_share_sessions_file",
+            "exchange_holiday_contract_file",
+            "us_calendar_file",
+        }
+        if not isinstance(market_calendar, dict) or not required_calendar_fields.issubset(market_calendar):
+            raise ValueError(
+                "market_calendar must configure A-share sessions, exchange holidays, and the US calendar "
+                "when session-calendar enforcement is enabled."
+            )
 
 
 def load_config() -> dict[str, Any]:
@@ -552,6 +609,74 @@ def load_account_snapshot(
     return state, trades, valuations
 
 
+def read_locked_execution_snapshot(account: str | None = "ALL") -> dict[str, Any]:
+    """Read every selected paper account as one non-mutating locked generation.
+
+    Canonical consumers must not independently read portfolio and trade files:
+    doing so can combine state from opposite sides of a committed batch.  This
+    API acquires every account lock in canonical order and fails closed when a
+    transaction journal is pending instead of recovering or mutating it.
+    """
+
+    base_config = load_config()
+    selected = target_accounts(base_config, account)
+    configs = all_account_configs(base_config)
+    selected_ids = {
+        str(account_config(base_config, name).get("account_id")) for name in selected
+    }
+    with account_locks(configs):
+        pending_paths = [
+            path
+            for valuation in (False, True)
+            for path in (
+                batch_coordinator_path(valuation=valuation),
+                *(transaction_journal_path(config, valuation=valuation) for config in configs),
+            )
+            if path.exists()
+        ]
+        if pending_paths:
+            raise RuntimeError(
+                "Paper-trading snapshot is blocked by a pending transaction generation: "
+                + ", ".join(str(path) for path in sorted(set(pending_paths)))
+            )
+        accounts: list[dict[str, Any]] = []
+        for config in configs:
+            if str(config.get("account_id")) not in selected_ids:
+                continue
+            portfolio_path = resolve_path(config, "portfolio_file")
+            trades_path = resolve_path(config, "trades_file")
+            valuations_path = resolve_path(config, "valuations_file")
+            missing = [
+                str(path)
+                for path in (portfolio_path, trades_path, valuations_path)
+                if not path.is_file()
+            ]
+            if missing:
+                raise FileNotFoundError(
+                    "Paper-trading snapshot source is missing: " + ", ".join(missing)
+                )
+            accounts.append(
+                {
+                    "account": config.get("account"),
+                    "account_id": config.get("account_id"),
+                    "market_scope": config.get("market_scope"),
+                    "portfolio_path": str(portfolio_path.resolve()),
+                    "trades_path": str(trades_path.resolve()),
+                    "valuations_path": str(valuations_path.resolve()),
+                    "state": load_state_unlocked(config),
+                    "trades": read_jsonl(trades_path),
+                    "valuations": read_jsonl(valuations_path),
+                }
+            )
+    semantic = {"accounts": accounts}
+    return {
+        "schema_version": 1,
+        "captured_at_utc": utc_now_iso(),
+        "generation_sha256": hashlib.sha256(stable_json(semantic).encode("utf-8")).hexdigest(),
+        **semantic,
+    }
+
+
 def load_state(account: str | None = None) -> dict[str, Any]:
     state, _trades, _valuations = load_account_snapshot(account)
     return state
@@ -619,6 +744,88 @@ def lock_path(config: dict[str, Any]) -> Path:
     return resolve_path(config, "portfolio_file").with_suffix(".lock")
 
 
+def account_lock_guard_path(config: dict[str, Any]) -> Path:
+    """Return the persistent OS-lock file for an account.
+
+    The JSON ``.lock`` file is diagnostic metadata only.  A separate persistent
+    inode/file is required because unlinking a stale-looking lock file can race a
+    live owner between its existence check and takeover.
+    """
+
+    path = lock_path(config)
+    return path.with_name(f"{path.name}.guard")
+
+
+def _lock_contention(exc: OSError) -> bool:
+    return exc.errno in {errno.EACCES, errno.EAGAIN} or getattr(exc, "winerror", None) in {
+        32,
+        33,
+    }
+
+
+def acquire_account_lock_guard(path: Path) -> int | None:
+    """Acquire a non-blocking OS-held guard, returning its open descriptor."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(descriptor)
+        if _lock_contention(exc):
+            return None
+        raise RuntimeError(f"Unable to acquire paper-trading OS lock: {path}") from exc
+    return descriptor
+
+
+def release_account_lock_guard(descriptor: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+def publish_account_lock_metadata(path: Path, payload: dict[str, Any]) -> None:
+    """Atomically replace diagnostic owner metadata after the OS guard is held."""
+
+    encoded = (stable_json(payload) + "\n").encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{os.getpid()}.{payload['token'][:12]}.tmp")
+    descriptor = os.open(temporary, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        written = 0
+        while written < len(encoded):
+            written += os.write(descriptor, encoded[written:])
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    try:
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
 def process_is_alive(pid: int) -> bool:
     if pid <= 0:
         return False
@@ -663,7 +870,12 @@ def lock_is_stale(path: Path, existing: dict[str, Any], *, maximum_age_seconds: 
 def account_lock(config: dict[str, Any]):
     path = lock_path(config)
     path.parent.mkdir(parents=True, exist_ok=True)
-    token = hashlib.sha256(f"{os.getpid()}:{now_iso()}:{config.get('account_id')}".encode("utf-8")).hexdigest()
+    guard = acquire_account_lock_guard(account_lock_guard_path(config))
+    if guard is None:
+        raise RuntimeError(f"Paper-trading account is locked: {config.get('account_id')}")
+    token = hashlib.sha256(
+        os.urandom(32) + f"{os.getpid()}:{config.get('account_id')}".encode("utf-8")
+    ).hexdigest()
     payload = {
         "pid": os.getpid(),
         "hostname": socket.gethostname(),
@@ -671,37 +883,32 @@ def account_lock(config: dict[str, Any]):
         "created_at_utc": utc_now_iso(),
         "token": token,
     }
-    for _attempt in range(2):
-        try:
-            descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-        except FileExistsError as exc:
-            try:
-                existing = strict_json_loads(
-                    path.read_text(encoding="utf-8"),
-                    source=str(path),
-                )
-                if not isinstance(existing, dict):
-                    existing = {}
-            except (OSError, ValueError):
-                existing = {}
-            stale = lock_is_stale(path, existing)
-            if stale:
-                path.unlink(missing_ok=True)
-                continue
-            raise RuntimeError(f"Paper-trading account is locked: {config.get('account_id')}") from exc
-        else:
-            with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
-                json.dump(
-                    payload,
-                    handle,
-                    allow_nan=False,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            break
-    else:
-        raise RuntimeError(f"Unable to acquire paper-trading lock: {path}")
     try:
+        existing: dict[str, Any] = {}
+        if path.exists():
+            try:
+                loaded = strict_json_loads(path.read_text(encoding="utf-8"), source=str(path))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Paper-trading account is locked; owner metadata is unreadable: "
+                    f"{config.get('account_id')}"
+                ) from exc
+            if not isinstance(loaded, dict):
+                raise RuntimeError(
+                    f"Paper-trading account is locked; owner metadata is invalid: "
+                    f"{config.get('account_id')}"
+                )
+            existing = loaded
+            existing_pid = existing.get("pid")
+            existing_host = str(existing.get("hostname") or "").casefold()
+            if (
+                existing_host != socket.gethostname().casefold()
+                or isinstance(existing_pid, bool)
+                or not isinstance(existing_pid, int)
+                or process_is_alive(existing_pid)
+            ):
+                raise RuntimeError(f"Paper-trading account is locked: {config.get('account_id')}")
+        publish_account_lock_metadata(path, payload)
         yield
     finally:
         try:
@@ -713,6 +920,7 @@ def account_lock(config: dict[str, Any]):
             existing = {}
         if existing.get("token") == token:
             path.unlink(missing_ok=True)
+        release_account_lock_guard(guard)
 
 
 @contextmanager
@@ -1204,7 +1412,7 @@ def load_prediction_reference_index(config: dict[str, Any]) -> dict[str, Any]:
         if isinstance(row.get("review"), dict):
             reviews.setdefault(prediction_id, []).append(row)
             continue
-        record_date = strict_iso_date(
+        strict_iso_date(
             row.get("date"),
             f"Prediction ledger row {index} date for {prediction_id}",
         )
@@ -1731,18 +1939,25 @@ def price_limit_for_symbol(symbol: str, order: dict[str, Any], rules: dict[str, 
             raise ValueError("price_limit_pct must be at most 1.")
         return limit
     symbol_clean = symbol.strip().upper()
+    code = symbol_clean.split(".", 1)[0]
+    exchange = str(order.get("exchange") or order.get("market") or "").strip().upper()
     name = str(order.get("name", "")).upper()
     if "ST" in name:
         return non_negative_float(
             rules.get("st_price_limit_pct", rules.get("default_price_limit_pct", 0.1)),
             "st_price_limit_pct",
         )
-    if symbol_clean.startswith("688"):
+    if symbol_clean.endswith(".BJ") or exchange in {"BJ", "BSE", "BEIJING"}:
+        return non_negative_float(
+            rules.get("beijing_price_limit_pct", rules.get("default_price_limit_pct", 0.1)),
+            "beijing_price_limit_pct",
+        )
+    if code.startswith(("688", "689")):
         return non_negative_float(
             rules.get("star_market_price_limit_pct", rules.get("default_price_limit_pct", 0.1)),
             "star_market_price_limit_pct",
         )
-    if symbol_clean.startswith("300"):
+    if code.startswith(("300", "301")):
         return non_negative_float(
             rules.get("chinext_price_limit_pct", rules.get("default_price_limit_pct", 0.1)),
             "chinext_price_limit_pct",
@@ -1753,11 +1968,27 @@ def price_limit_for_symbol(symbol: str, order: dict[str, Any], rules: dict[str, 
     )
 
 
-def validate_price_limit(symbol: str, price: float, order: dict[str, Any], market_type: str, rules: dict[str, Any]) -> None:
+def validate_price_limit(
+    symbol: str,
+    price: float,
+    order: dict[str, Any],
+    market_type: str,
+    rules: dict[str, Any],
+    *,
+    decision_date: str | None = None,
+    contract: dict[str, Any] | None = None,
+) -> None:
     if market_type != "A_SHARE":
         return
     previous_close = order.get("previous_close")
     if previous_close in (None, ""):
+        required_from = str(
+            (contract or {}).get("a_share_previous_close_required_from_date") or "9999-12-31"
+        )[:10]
+        if decision_date is not None and decision_date >= required_from:
+            raise ValueError(
+                f"A-share order for {symbol} requires previous_close from {required_from}."
+            )
         return
     previous = finite_float(previous_close, "previous_close")
     if previous <= 0:
@@ -1885,6 +2116,262 @@ def actions_for_date(
         for record in [*read_jsonl(trades_path), *(pending_records or [])]
         if record.get("date") == date and record.get("action") in {"BUY", "SELL"}
     )
+
+
+def position_add_count(
+    symbol: str,
+    exchange: str,
+    trades_path: Path,
+    pending_records: list[dict[str, Any]] | None = None,
+) -> int:
+    buys = [
+        row
+        for row in [*read_jsonl(trades_path), *(pending_records or [])]
+        if str(row.get("action") or "").upper() == "BUY"
+        and str(row.get("symbol") or "").strip().upper() == symbol
+        and str(row.get("exchange") or "").strip().upper() == exchange
+    ]
+    if not buys:
+        return 0
+    opening_index = next(
+        (index for index in range(len(buys) - 1, -1, -1) if buys[index].get("opened_new_position") is True),
+        None,
+    )
+    if opening_index is None:
+        return max(0, len(buys) - 1)
+    return max(0, len(buys) - opening_index - 1)
+
+
+def canonical_strategy_account_risk(
+    state: dict[str, Any],
+    config: dict[str, Any],
+    decision_date: str,
+) -> dict[str, Any]:
+    current_equity = positive_float(equity(state), "strategy account current equity")
+    valuations_path = resolve_path(config, "valuations_file")
+    by_date: dict[str, dict[str, Any]] = {}
+    if valuations_path.exists():
+        for index, row in enumerate(read_jsonl(valuations_path), start=1):
+            row_date = strict_iso_date(
+                row.get("date"),
+                f"strategy valuation row {index} date",
+            )
+            if row_date > decision_date:
+                continue
+            row_equity = positive_float(
+                row.get("equity"),
+                f"strategy valuation row {index} equity",
+            )
+            prior = by_date.get(row_date)
+            if prior is not None and abs(float(prior["equity"]) - row_equity) > 1e-8:
+                raise ValueError(
+                    f"BUY strategy risk cannot resolve conflicting valuations for {row_date}."
+                )
+            by_date[row_date] = {**row, "equity": row_equity}
+
+    ordered = [by_date[day] for day in sorted(by_date)]
+    initial_equity = positive_float(config.get("initial_cash"), "strategy account initial equity")
+    peak_equity = max([initial_equity, current_equity, *(float(row["equity"]) for row in ordered)])
+    drawdown = max(0.0, (peak_equity - current_equity) / peak_equity)
+
+    daily_return = 0.0
+    latest_date = None
+    latest_valuation_id = None
+    if ordered:
+        latest = ordered[-1]
+        latest_equity = float(latest["equity"])
+        latest_date = str(latest.get("date"))
+        latest_valuation_id = latest.get("valuation_id")
+        tolerance = max(1e-8, abs(latest_equity) * 1e-10)
+        if abs(current_equity - latest_equity) > tolerance:
+            daily_return = current_equity / latest_equity - 1.0
+        elif len(ordered) > 1:
+            previous_equity = float(ordered[-2]["equity"])
+            daily_return = latest_equity / previous_equity - 1.0
+    return {
+        "calculation": "canonical_valuation_ledger_and_locked_portfolio_state",
+        "latest_valuation_date": latest_date,
+        "latest_valuation_id": latest_valuation_id,
+        "current_equity": current_equity,
+        "peak_equity": peak_equity,
+        "daily_return_pct": finite_float(daily_return, "canonical strategy daily return"),
+        "portfolio_drawdown_pct": finite_float(drawdown, "canonical strategy drawdown"),
+    }
+
+
+def normalized_confirming_evidence(
+    raw: Any,
+    *,
+    decision_date: str,
+    last_buy_date: str | None,
+) -> list[dict[str, str]]:
+    if raw in (None, ""):
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("BUY strategy_context.confirming_evidence must be a list.")
+    evidence: list[dict[str, str]] = []
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"BUY confirming evidence item {index} must be an object.")
+        source = str(item.get("source") or "").strip()
+        summary = str(item.get("summary") or "").strip()
+        if not source or not summary:
+            raise ValueError(f"BUY confirming evidence item {index} requires source and summary.")
+        as_of_date = strict_iso_date(
+            item.get("as_of_date"),
+            f"BUY confirming evidence item {index} as_of_date",
+        )
+        if as_of_date > decision_date:
+            raise ValueError(f"BUY confirming evidence item {index} cannot be future-dated.")
+        if last_buy_date and as_of_date < last_buy_date:
+            raise ValueError(
+                f"BUY confirming evidence item {index} predates the position's latest BUY on {last_buy_date}."
+            )
+        evidence.append({"source": source, "as_of_date": as_of_date, "summary": summary})
+    return evidence
+
+
+def validate_strategy_buy_controls(
+    state: dict[str, Any],
+    config: dict[str, Any],
+    order: dict[str, Any],
+    *,
+    decision_date: str,
+    symbol: str,
+    exchange: str,
+    key: str,
+    price: float,
+    trades_path: Path,
+    pending_records: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    contract = config.get("order_contract", {}) if isinstance(config.get("order_contract"), dict) else {}
+    required_from = str(contract.get("strategy_controls_required_from_date") or "9999-12-31")[:10]
+    if decision_date < required_from:
+        return None
+    profile = config.get("strategy_profile")
+    if not isinstance(profile, dict) or not profile.get("enabled"):
+        raise ValueError("BUY strategy controls are required, but strategy_profile is not enabled.")
+    context = order.get("strategy_context")
+    if not isinstance(context, dict):
+        raise ValueError(f"BUY {key} requires a structured strategy_context from {required_from}.")
+    if context.get("schema_version") != 1:
+        raise ValueError(f"BUY {key} strategy_context.schema_version must be 1.")
+
+    position = state.get("positions", {}).get(key)
+    is_add = isinstance(position, dict) and non_negative_float(
+        position.get("quantity", 0.0),
+        f"position {key} quantity",
+    ) > 0
+    expected_intent = "ADD" if is_add else "OPEN"
+    intent = str(context.get("intent") or "").strip().upper()
+    if intent != expected_intent:
+        raise ValueError(f"BUY {key} strategy intent must be {expected_intent}, not {intent or '<missing>'}.")
+
+    score = finite_float(context.get("signal_score"), f"BUY {key} strategy signal_score")
+    if not 0 <= score <= 100:
+        raise ValueError(f"BUY {key} strategy signal_score must be between 0 and 100.")
+    thresholds = profile.get("signal_score", {})
+    threshold_field = "add_threshold" if is_add else "buy_threshold"
+    threshold = finite_float(thresholds.get(threshold_field), f"strategy_profile.signal_score.{threshold_field}")
+    if score < threshold:
+        label = "add threshold" if is_add else "buy threshold"
+        raise ValueError(f"BUY {key} signal score {score:.2f} is below the configured {label} {threshold:.2f}.")
+
+    risk = context.get("account_risk")
+    if not isinstance(risk, dict):
+        raise ValueError(f"BUY {key} strategy_context.account_risk must be an object.")
+    risk_date = strict_iso_date(risk.get("as_of_date"), f"BUY {key} account_risk.as_of_date")
+    if risk_date != decision_date:
+        raise ValueError(
+            f"BUY {key} account risk snapshot must be dated {decision_date}; received {risk_date}."
+        )
+    daily_return = finite_float(
+        risk.get("daily_return_pct"),
+        f"BUY {key} account_risk.daily_return_pct",
+    )
+    drawdown = finite_float(
+        risk.get("portfolio_drawdown_pct"),
+        f"BUY {key} account_risk.portfolio_drawdown_pct",
+    )
+    if daily_return < -1:
+        raise ValueError(f"BUY {key} account daily return cannot be below -1.")
+    if not 0 <= drawdown <= 1:
+        raise ValueError(f"BUY {key} portfolio drawdown must be between 0 and 1.")
+
+    canonical_risk = canonical_strategy_account_risk(state, config, decision_date)
+    effective_daily_return = min(daily_return, float(canonical_risk["daily_return_pct"]))
+    effective_drawdown = max(drawdown, float(canonical_risk["portfolio_drawdown_pct"]))
+
+    thesis_status = str(context.get("thesis_status") or "").strip().lower()
+    if thesis_status not in {"intact", "strengthening", "watch", "failed"}:
+        raise ValueError(
+            f"BUY {key} thesis_status must be intact, strengthening, watch, or failed."
+        )
+    overlays = profile.get("risk_overlays", {}) if isinstance(profile.get("risk_overlays"), dict) else {}
+    if overlays.get("thesis_failure_requires_reduce_or_exit") and thesis_status == "failed":
+        raise ValueError(f"BUY {key} is blocked by thesis failure; only reduction, exit, or monitoring is allowed.")
+    daily_loss_limit = finite_float(
+        overlays.get("daily_loss_circuit_breaker_pct"),
+        "strategy_profile.risk_overlays.daily_loss_circuit_breaker_pct",
+    )
+    if effective_daily_return <= -daily_loss_limit:
+        raise ValueError(
+            f"BUY {key} is blocked by the daily loss circuit breaker: "
+            f"{effective_daily_return:.4f} <= {-daily_loss_limit:.4f}."
+        )
+    drawdown_limit = finite_float(
+        overlays.get("portfolio_drawdown_derisk_pct"),
+        "strategy_profile.risk_overlays.portfolio_drawdown_derisk_pct",
+    )
+    if effective_drawdown >= drawdown_limit:
+        raise ValueError(
+            f"BUY {key} is blocked by portfolio drawdown derisk: "
+            f"{effective_drawdown:.4f} >= {drawdown_limit:.4f}."
+        )
+
+    last_buy_date = str(position.get("last_buy_date") or "")[:10] if is_add else None
+    evidence = normalized_confirming_evidence(
+        context.get("confirming_evidence"),
+        decision_date=decision_date,
+        last_buy_date=last_buy_date or None,
+    )
+    if is_add:
+        maximum_adds = non_negative_int(
+            profile.get("position_sizing", {}).get("maximum_adds_per_position"),
+            "strategy_profile.position_sizing.maximum_adds_per_position",
+        )
+        completed_adds = position_add_count(symbol, exchange, trades_path, pending_records)
+        if completed_adds >= maximum_adds:
+            raise ValueError(
+                f"BUY {key} exceeds maximum adds per position: {completed_adds} >= {maximum_adds}."
+            )
+        avg_cost = positive_float(position.get("avg_cost"), f"position {key} avg_cost")
+        if (
+            overlays.get("no_averaging_down_without_new_confirming_evidence")
+            and price < avg_cost - 1e-9
+            and not evidence
+        ):
+            raise ValueError(
+                f"BUY {key} would average down below {avg_cost:.4f} without new confirming evidence."
+            )
+
+    return {
+        "schema_version": 1,
+        "signal_score": score,
+        "intent": intent,
+        "thesis_status": thesis_status,
+        "account_risk": {
+            "as_of_date": risk_date,
+            "daily_return_pct": daily_return,
+            "portfolio_drawdown_pct": drawdown,
+        },
+        "canonical_account_risk": canonical_risk,
+        "effective_account_risk": {
+            "daily_return_pct": effective_daily_return,
+            "portfolio_drawdown_pct": effective_drawdown,
+        },
+        "confirming_evidence": evidence,
+    }
 
 
 def load_orders(input_path: Path) -> list[dict[str, Any]]:
@@ -2015,11 +2502,26 @@ def apply_order(
             ),
             "order price max_price_age_business_days",
         )
-        price_age = business_day_age(price_date, decision_date)
+        calendar_required_from = str(
+            contract.get("session_calendar_required_from_date") or "9999-12-31"
+        )[:10]
+        use_session_calendar = decision_date >= calendar_required_from
+        price_age = (
+            market_session_age(
+                price_date,
+                decision_date,
+                market_type=market_type,
+                exchange=exchange,
+                config=config,
+            )
+            if use_session_calendar
+            else business_day_age(price_date, decision_date)
+        )
+        age_field = "session_age" if use_session_calendar else "business_day_age"
         if price_age > maximum_price_age:
             raise ValueError(
                 f"Order price for {key} is stale: price_date={price_date}, "
-                f"business_day_age={price_age}, maximum={maximum_price_age}."
+                f"{age_field}={price_age}, maximum={maximum_price_age}."
             )
     history_required_from = str(contract.get("theme_registry_history_required_from_date") or "9999-12-31")[:10]
     require_recorded_revision = action == "BUY" and decision_date >= history_required_from
@@ -2089,7 +2591,15 @@ def apply_order(
     if validated_price is None:
         raise ValueError(f"{action} order for {key} requires positive price.")
     price = validated_price
-    validate_price_limit(symbol, price, order, market_type, market_rules)
+    validate_price_limit(
+        symbol,
+        price,
+        order,
+        market_type,
+        market_rules,
+        decision_date=decision_date,
+        contract=contract,
+    )
 
     if action == "SELL" and isinstance(quantity_raw, str) and quantity_raw.strip().upper() == "ALL":
         quantity = non_negative_float(
@@ -2176,6 +2686,22 @@ def apply_order(
                 )
 
     trades_path = resolve_path(config, "trades_file")
+    strategy_context = None
+    if action == "BUY":
+        strategy_context = validate_strategy_buy_controls(
+            state,
+            config,
+            order,
+            decision_date=decision_date,
+            symbol=symbol,
+            exchange=exchange,
+            key=key,
+            price=price,
+            trades_path=trades_path,
+            pending_records=pending_records,
+        )
+        if strategy_context is not None:
+            record["strategy_context"] = strategy_context
     policy = profile.get("decision_policy", {}) if isinstance(profile, dict) else {}
     max_actions = int(policy.get("maximum_actions_per_account_per_day", 0))
     if profile.get("enabled") and max_actions > 0 and actions_for_date(
@@ -2608,6 +3134,8 @@ def valuation_price_issues(
     valuation_date: str,
     *,
     maximum_age_business_days: int,
+    config: dict[str, Any] | None = None,
+    session_calendar_required_from_date: str = "9999-12-31",
 ) -> list[dict[str, Any]]:
     issues: list[dict[str, Any]] = []
     for key, position in sorted(state.get("positions", {}).items()):
@@ -2646,18 +3174,28 @@ def valuation_price_issues(
                 }
             )
             continue
-        age = business_day_age(price_date, valuation_date)
-        if age > maximum_age_business_days:
-            issues.append(
-                {
-                    "key": key,
-                    "issue": "stale_price",
-                    "price_date": price_date,
-                    "valuation_date": valuation_date,
-                    "business_day_age": age,
-                    "maximum_business_day_age": maximum_age_business_days,
-                }
+        use_session_calendar = valuation_date >= session_calendar_required_from_date
+        age = (
+            market_session_age(
+                price_date,
+                valuation_date,
+                market_type=str(item.get("market_type") or position.get("market_type") or ""),
+                exchange=str(item.get("exchange") or position.get("exchange") or ""),
+                config=config or {},
             )
+            if use_session_calendar
+            else business_day_age(price_date, valuation_date)
+        )
+        if age > maximum_age_business_days:
+            issue = {
+                "key": key,
+                "issue": "stale_price",
+                "price_date": price_date,
+                "valuation_date": valuation_date,
+                "maximum_business_day_age": maximum_age_business_days,
+            }
+            issue["session_age" if use_session_calendar else "business_day_age"] = age
+            issues.append(issue)
     return issues
 
 
@@ -2725,16 +3263,23 @@ def prepare_mark_account_to_market(
         policy.get("max_price_age_business_days", 1),
         "valuation_policy.max_price_age_business_days",
     )
+    session_calendar_required_from = strict_iso_date(
+        policy.get("session_calendar_required_from_date", "9999-12-31"),
+        "valuation_policy.session_calendar_required_from_date",
+    )
     issues = valuation_price_issues(
         state,
         date,
         maximum_age_business_days=maximum_age,
+        config=config,
+        session_calendar_required_from_date=session_calendar_required_from,
     )
     if issues and stale_policy == "fail":
         detail = "; ".join(
             f"{item.get('key')}:{item.get('issue')}"
             + (
-                f"(price_date={item.get('price_date')},age={item.get('business_day_age')})"
+                f"(price_date={item.get('price_date')},age="
+                f"{item.get('session_age', item.get('business_day_age'))})"
                 if item.get("price_date")
                 else ""
             )
@@ -2764,6 +3309,11 @@ def prepare_mark_account_to_market(
         "valuation_issues": issues,
         "stale_price_policy": stale_policy,
         "max_price_age_business_days": maximum_age,
+        "price_age_basis": (
+            "market_session_calendar"
+            if date >= session_calendar_required_from
+            else "legacy_weekday_calendar"
+        ),
         "price_snapshot": [
             {
                 "key": key,
@@ -3010,6 +3560,16 @@ def main(argv: list[str] | None = None) -> int:
     summary_parser = subparsers.add_parser("summary", help="Print current account summary.")
     summary_parser.add_argument("--account", default="ALL", help="Paper account to summarize: US, CHINA, or ALL.")
 
+    snapshot_parser = subparsers.add_parser(
+        "snapshot",
+        help="Print one read-only, cross-account locked execution snapshot.",
+    )
+    snapshot_parser.add_argument(
+        "--account",
+        default="ALL",
+        help="Paper account to snapshot: US, CHINA, or ALL.",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "init":
         ensure_files(reset=args.reset, account=args.account)
@@ -3043,6 +3603,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.command == "summary":
         print(json.dumps({"accounts": all_summaries(args.account)}, allow_nan=False, ensure_ascii=False, indent=2))
+        return 0
+    if args.command == "snapshot":
+        print(
+            json.dumps(
+                read_locked_execution_snapshot(args.account),
+                allow_nan=False,
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return 0
     return 2
 

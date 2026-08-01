@@ -29,6 +29,8 @@ Prepare the complete report draft and prediction JSON before any ledger mutation
 
 Every paper order must reference an original prediction already in the ledger and use a stable order ID. On retry, reuse existing prediction, order, and valuation identities. Never create a second economic action because a control, backup, or website stage failed.
 
+For BUY orders at or after the enforcement date in `paper_trading.json`, prepare the complete machine-readable `strategy_context` required by `$global-briefing-runbook` before writing `TEMP_ORDERS_JSON`. Reuse the same context on retry. Do not downgrade a missing/failed context into an unstructured reason; use HOLD with an allowed blocker or skip the BUY. A-share priced actions also require finite, source-dated `previous_close` from the enforcement date.
+
 After Phase B begins, do not regenerate news analysis, predictions, orders, marks, or account valuations. Resume only the failed control or publication stage.
 
 ## Run the Unified Control Plane
@@ -44,7 +46,6 @@ Do not use `--skip-tests` or `--skip-trading-core` for a normal daily run. `--sk
 Then run the closed loop in configuration order:
 
 ```powershell
-python atlas.py backup --date RUN_DATE
 python atlas.py improvements --date RUN_DATE --apply-safe --strict
 python atlas.py heal --date RUN_DATE --apply-safe --deep --strict
 python atlas.py alerts --date RUN_DATE
@@ -53,7 +54,7 @@ python atlas.py alerts --date RUN_DATE
 python atlas.py backup --date RUN_DATE
 ```
 
-The first backup is a bootstrap gate: strict improvement and self-healing checks consult recovery evidence, so do not run either strict command against a stale or absent backup. If the bootstrap backup fails, stop before the strict controls. Verify that the final improvement, self-healing, alert, and backup artifacts are date-aligned; the final backup must be external and restore-verified. Then hand off to `$atlas-site-publisher`.
+The normal daily path writes exactly one final backup. Bootstrap readiness uses authenticated archive verification and may reuse a restore-verified snapshot within `bootstrap_maximum_backup_age_hours`; only a stale or absent snapshot triggers an exceptional pre-control backup. The default backup is a compact daily publication checkpoint, is fully decrypted and restore-verified when created, and is cryptographically bound to a recent full recovery baseline. Run `python atlas.py backup --date RUN_DATE --full` only for the configured periodic full-history recovery drill, never on every daily run. Verify that the final improvement, self-healing, alert, and backup artifacts are date-aligned; the final daily backup must be external and restore-verified. Then hand off to `$atlas-site-publisher`.
 
 Use `python atlas.py publish --date RUN_DATE` only to resume the control-plane publication sequence for an existing staged candidate when that is the chosen recovery path. It must not replay Phase A.
 

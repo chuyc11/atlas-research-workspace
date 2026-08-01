@@ -102,6 +102,72 @@ def legacy_snapshot_v2(root: Path, target: Path, latest: Path) -> dict:
 
 
 class ResilienceControlTests(unittest.TestCase):
+    def test_disaster_recovery_os_guard_blocks_stale_metadata_takeover(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            target = Path(temporary)
+            metadata = target / "atlas-backup.lock"
+            write_json(metadata, {"pid": 2147483647, "token": "dead-looking"})
+
+            with patch.object(DR, "acquire_backup_lock_guard", return_value=None):
+                with self.assertRaisesRegex(RuntimeError, "already running"):
+                    with DR.disaster_recovery_lock(target):
+                        self.fail("contending backup must not steal an OS-held lock")
+
+            self.assertEqual(DR.read_json(metadata)["token"], "dead-looking")
+
+    def test_disaster_recovery_monotonic_head_rejects_old_signed_latest(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as workspace,
+            tempfile.TemporaryDirectory() as external,
+            tempfile.TemporaryDirectory() as trust,
+        ):
+            root = Path(workspace)
+            (root / "atlas.py").write_text("# checkout marker\n", encoding="utf-8")
+            (root / "state.txt").write_text("one", encoding="utf-8")
+            config = root / "config.json"
+            latest = root / "runtime" / "latest.json"
+            key_variable = "ATLAS_TEST_MONOTONIC_DR_KEY"
+            write_json(
+                config,
+                {
+                    "disaster_recovery": {
+                        "enabled": True,
+                        "target_directory": external,
+                        "include_paths": ["state.txt"],
+                        "git_repositories": [],
+                        "encryption": {
+                            "required": True,
+                            "algorithm": "AES-256-GCM",
+                            "key_environment_variable": key_variable,
+                        },
+                    }
+                },
+            )
+            environment = {
+                key_variable: DR.base64.b64encode(b"M" * 32).decode("ascii"),
+                DR.TRUST_ANCHOR_ROOT_ENV: trust,
+                DR.TRUST_ANCHOR_NAMESPACE_ENV: "dr-monotonic-test",
+            }
+            with patch.dict(DR.os.environ, environment, clear=False):
+                first = DR.create_snapshot(
+                    date="2026-07-12", root=root, config_path=config, latest_path=latest
+                )
+                old_latest = latest.read_bytes()
+                (root / "state.txt").write_text("two", encoding="utf-8")
+                second = DR.create_snapshot(
+                    date="2026-07-13", root=root, config_path=config, latest_path=latest
+                )
+                self.assertEqual(first["revision"], 1)
+                self.assertEqual(second["revision"], 2)
+                latest.write_bytes(old_latest)
+                with self.assertRaisesRegex(ValueError, "rolled back|revision mismatch"):
+                    DR.verify_latest_snapshot(
+                        root=root,
+                        config_path=config,
+                        latest_path=latest,
+                        quick=True,
+                    )
+
     def test_staging_cleanup_retries_transient_windows_permission_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             target = Path(temporary) / "transient.tmp"
@@ -370,6 +436,104 @@ class ResilienceControlTests(unittest.TestCase):
             self.assertEqual(set(staging_parents), {target})
             self.assertFalse(any(path.name.startswith(".atlas-") for path in target.iterdir()))
 
+    def test_daily_checkpoint_is_bound_to_full_baseline_and_quick_verify_does_not_restore_again(self) -> None:
+        with tempfile.TemporaryDirectory() as workspace, tempfile.TemporaryDirectory() as external:
+            root = Path(workspace)
+            (root / "full-state.txt").write_text("full baseline", encoding="utf-8")
+            (root / "daily-state.txt").write_text("daily authority", encoding="utf-8")
+            config = root / "config.json"
+            key_variable = "ATLAS_TEST_TIERED_BACKUP_KEY"
+            write_json(config, {"disaster_recovery": {
+                "enabled": True,
+                "target_directory": external,
+                "include_paths": ["full-state.txt", "daily-state.txt"],
+                "daily_include_paths": ["daily-state.txt"],
+                "git_repositories": [],
+                "daily_git_repositories": [],
+                "full_snapshot_maximum_age_hours": 168,
+                "encryption": {
+                    "required": True,
+                    "algorithm": "AES-256-GCM",
+                    "key_environment_variable": key_variable,
+                },
+            }})
+            latest = root / "runtime" / "latest.json"
+            key = DR.base64.b64encode(b"T" * 32).decode("ascii")
+            snapshot_date = datetime.now(UTC).date().isoformat()
+
+            with patch.dict(DR.os.environ, {key_variable: key}, clear=False):
+                full = DR.create_snapshot(
+                    date=snapshot_date,
+                    root=root,
+                    config_path=config,
+                    latest_path=latest,
+                    snapshot_profile="full",
+                )
+                daily = DR.create_snapshot(
+                    date=snapshot_date,
+                    root=root,
+                    config_path=config,
+                    latest_path=latest,
+                    snapshot_profile="daily",
+                )
+                with patch.object(
+                    DR,
+                    "verify_archive_detailed",
+                    side_effect=AssertionError("quick verification must not repeat restore"),
+                ):
+                    quick = DR.verify_latest_snapshot(
+                        root=root,
+                        config_path=config,
+                        latest_path=latest,
+                        quick=True,
+                    )
+
+            full_latest = DR.read_json(DR.full_latest_path_for(latest))
+            daily_manifest = DR.read_json(Path(daily["manifest_sidecar"]))
+            self.assertEqual(full["snapshot_profile"], "full")
+            self.assertEqual(full_latest["manifest_sha256"], full["manifest_sha256"])
+            self.assertEqual(daily["snapshot_profile"], "daily")
+            self.assertEqual(daily["file_count"], 1)
+            self.assertEqual(daily["full_snapshot"]["manifest_sha256"], full["manifest_sha256"])
+            self.assertEqual(daily_manifest["full_snapshot"], daily["full_snapshot"])
+            self.assertEqual(quick["verification_mode"], "authenticated_archive")
+            self.assertTrue(quick["restore_verified"])
+            self.assertGreaterEqual(daily["timings_seconds"]["total"], 0)
+
+            with patch.dict(DR.os.environ, {key_variable: key}, clear=False):
+                replacement_full = DR.create_snapshot(
+                    date=snapshot_date,
+                    root=root,
+                    config_path=config,
+                    latest_path=latest,
+                    snapshot_profile="full",
+                )
+                rotated_quick = DR.verify_latest_snapshot(
+                    root=root,
+                    config_path=config,
+                    latest_path=latest,
+                    quick=True,
+                )
+            self.assertNotEqual(
+                replacement_full["manifest_sha256"],
+                full["manifest_sha256"],
+            )
+            self.assertEqual(
+                rotated_quick["full_snapshot"]["manifest_sha256"],
+                full["manifest_sha256"],
+            )
+            self.assertTrue(rotated_quick["full_baseline_authenticated"])
+
+            Path(full["archive"]).unlink()
+            with patch.dict(DR.os.environ, {key_variable: key}, clear=False):
+                with self.assertRaisesRegex(ValueError, "full recovery baseline"):
+                    DR.verify_latest_snapshot(
+                        root=root,
+                        config_path=config,
+                        latest_path=latest,
+                        quick=True,
+                    )
+
     def test_git_bundle_creation_validates_tool_repository_and_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -594,6 +758,12 @@ class ResilienceControlTests(unittest.TestCase):
             "work/trading-core",
         }.issubset(includes))
         self.assertEqual(config["git_repositories"], [".", "src", "work/trading-core"])
+        self.assertEqual(config["daily_git_repositories"], [".", "src"])
+        self.assertIn("work/global-briefing", config["daily_include_paths"])
+        self.assertIn("work/shared/atlas", config["daily_include_paths"])
+        self.assertNotIn("work/trading-core", config["daily_include_paths"])
+        self.assertEqual(config["bootstrap_maximum_backup_age_hours"], 168)
+        self.assertEqual(config["full_snapshot_maximum_age_hours"], 168)
         self.assertEqual(config["encryption"]["algorithm"], "AES-256-GCM")
         self.assertTrue(config["encryption"]["required"])
         self.assertEqual(

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from datetime import UTC, datetime
 from pathlib import Path
@@ -60,13 +61,24 @@ class AtlasCycleTests(unittest.TestCase):
             VIRTUAL_LEDGER_PATH=self.ledger_root / "atlas_virtual_execution_ledger.jsonl",
             VIRTUAL_LEDGER_STATE_PATH=self.ledger_root / "atlas_virtual_execution_state.json",
             VIRTUAL_LEDGER_AUDIT_PATH=self.ledger_root / "atlas_virtual_execution_audit.json",
+            VIRTUAL_LEDGER_HEAD_PATH=self.ledger_root / "current.json",
+            VIRTUAL_LEDGER_GENERATIONS_ROOT=self.ledger_root / "generations",
             RUN_AUDIT_ROOT=self.runtime / "run_audits",
             CYCLE_STATE_PATH=self.runtime / "cycle_state.json",
+            PAPER_TRADING_CONFIG_PATH=self.briefing / "config" / "paper_trading.json",
+            PREDICTION_LEDGER_PATH=self.briefing / "data" / "predictions.jsonl",
         )
         self.patcher.start()
         self._seed_sources()
+        self.paper_snapshot_patcher = patch.object(
+            atlas,
+            "load_locked_paper_execution_snapshot",
+            side_effect=self._paper_snapshot,
+        )
+        self.paper_snapshot_patcher.start()
 
     def tearDown(self) -> None:
+        self.paper_snapshot_patcher.stop()
         self.patcher.stop()
         self.environment_patcher.stop()
         self.tmp.cleanup()
@@ -169,6 +181,115 @@ class AtlasCycleTests(unittest.TestCase):
         self.outputs.mkdir(parents=True, exist_ok=True)
         (self.outputs / "每日全球晨间简报-2026-07-10.md").write_text("briefing", encoding="utf-8")
 
+    def _paper_snapshot(self) -> dict:
+        accounts = []
+        for account in ("US", "CHINA"):
+            suffix = account.lower()
+            portfolio = self.briefing / "data" / f"paper_portfolio_{suffix}.json"
+            trades = self.briefing / "data" / f"paper_trades_{suffix}.jsonl"
+            valuations = self.briefing / "data" / f"paper_valuations_{suffix}.jsonl"
+            accounts.append(
+                {
+                    "account": account,
+                    "account_id": json.loads(portfolio.read_text(encoding="utf-8"))["account_id"],
+                    "market_scope": account,
+                    "portfolio_path": str(portfolio.resolve()),
+                    "trades_path": str(trades.resolve()),
+                    "valuations_path": str(valuations.resolve()),
+                    "state": json.loads(portfolio.read_text(encoding="utf-8")),
+                    "trades": [
+                        json.loads(line)
+                        for line in trades.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ],
+                    "valuations": [],
+                }
+            )
+        return {
+            "schema_version": 1,
+            "captured_at_utc": "2026-07-10T00:00:00+00:00",
+            "generation_sha256": atlas.stable_hash({"accounts": accounts}),
+            "accounts": accounts,
+        }
+
+    def _seed_polluted_global_history_anchor(self) -> tuple[Path, dict]:
+        anchor_path = atlas.global_cycle_history_anchor_path()
+        source_root = self.root / "polluted-cycle-root"
+        history_root = str(Path("work") / "shared" / "atlas" / "run_audits" / "history")
+        with patch.object(atlas, "ROOT", source_root):
+            source = {
+                "schema_version": atlas.HISTORY_ANCHOR_SCHEMA_VERSION,
+                "history_root": history_root,
+                "entries": [
+                    {
+                        "path": (
+                            "2026-07-18/ATLAS-CYCLE-20260718-"
+                            "RUN-20260801T053058095957Z.json"
+                        ),
+                        "sha256": "f" * 64,
+                    }
+                ],
+                "entry_count": 1,
+                **atlas.next_monotonic_anchor_fields(
+                    anchor_path,
+                    head_hash_field="anchor_sha256",
+                ),
+            }
+            source["anchor_sha256"] = atlas.history_anchor_hash(source)
+            source = atlas.sign_trust_anchor(source)
+            atlas.write_monotonic_anchor(
+                anchor_path,
+                source,
+                head_hash_field="anchor_sha256",
+            )
+        return anchor_path, source
+
+    def _seed_recovery_target_history(self) -> list[dict[str, str]]:
+        history = self.runtime / "run_audits" / "history" / "2026-07-10"
+        payload = {
+            "run_id": "REAL-RUN-1",
+            "audit_chain": {
+                "schema_version": 1,
+                "sequence": 1,
+                "previous_audit_sha256": None,
+            },
+        }
+        payload["audit_chain"]["entry_sha256"] = atlas.audit_record_hash(payload)
+        write_json(history / "REAL-RUN-1.json", payload)
+        integrity = atlas.audit_cycle_history(history, allow_unanchored_genesis=True)
+        self.assertTrue(integrity["passed"], integrity["errors"])
+        atlas.write_cycle_history_anchor(history, integrity)
+        return atlas.global_cycle_history_manifest()
+
+    def _recovery_backup_evidence(self, entries: list[dict[str, str]]) -> dict:
+        return {
+            "latest_path": str(self.runtime / "backups" / "latest.json"),
+            "latest_file_sha256": "1" * 64,
+            "manifest_path": str(self.root.parent / "atlas-backup.manifest.json"),
+            "manifest_file_sha256": "2" * 64,
+            "manifest_sha256": "3" * 64,
+            "archive_sha256": "4" * 64,
+            "created_at": "2026-07-31T19:17:06.193365Z",
+            "verified": True,
+            "archive_integrity_verified": True,
+            "restore_verified": True,
+            "encrypted_container_authenticated": True,
+            "snapshot_profile": "daily",
+            "latest_metadata_authentication_key_id": "latest-key-id",
+            "manifest_metadata_authentication_key_id": "manifest-key-id",
+            "entries": entries,
+            "entries_sha256": atlas.stable_hash(entries),
+        }
+
+    def _bootstrap_empty_global_history_anchor(self) -> None:
+        integrity = atlas.audit_global_cycle_history()
+        self.assertTrue(integrity["passed"], integrity["errors"])
+        self.assertFalse(integrity["anchor_present"])
+        atlas.write_global_cycle_history_anchor(integrity)
+        verified = atlas.audit_global_cycle_history()
+        self.assertTrue(verified["passed"], verified["errors"])
+        self.assertTrue(verified["anchor_present"])
+
     def test_canonical_virtual_ledger_is_idempotent_and_audited(self) -> None:
         first = atlas.build_virtual_execution_ledger(write_files=True)
         ledger_path = Path(first["ledger_path"])
@@ -191,6 +312,68 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertIn("virtual_order_intent", {event["event_type"] for event in second["events"]})
         self.assertEqual(second["audit"]["source_counts"]["global_briefing_temp_orders"], 1)
         self.assertTrue(second["audit"]["reconciliation"]["passed"])
+
+    def test_cycle_fingerprint_changes_when_prediction_semantics_change(self) -> None:
+        predictions = self.briefing / "data" / "predictions.jsonl"
+        write_jsonl(
+            predictions,
+            [{"date": "2026-07-10", "prediction_id": "2026-07-10-P01", "probability": 0.6}],
+        )
+        first = atlas.build_cycle_fingerprint("2026-07-10")
+
+        write_jsonl(
+            predictions,
+            [{"date": "2026-07-10", "prediction_id": "2026-07-10-P01", "probability": 0.7}],
+        )
+        second = atlas.build_cycle_fingerprint("2026-07-10")
+
+        self.assertNotEqual(first["fingerprint"], second["fingerprint"])
+        self.assertIn(
+            "work/global-briefing/data/predictions.jsonl",
+            {item["path"].replace("\\", "/") for item in second["files"]},
+        )
+
+    def test_canonical_orders_fail_closed_when_prediction_original_is_missing(self) -> None:
+        write_json(
+            self.briefing / "config" / "paper_trading.json",
+            {"order_contract": {"prediction_reference_required_from_date": "2026-07-10"}},
+        )
+        write_jsonl(
+            self.briefing / "data" / "predictions.jsonl",
+            [{"date": "2026-07-10", "prediction_id": "UNRELATED"}],
+        )
+
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["write_performed"])
+        self.assertFalse(failed["audit"]["overall_passed"])
+        self.assertTrue(
+            any(
+                "has no original prediction record" in reason
+                or "prediction_id is required" in reason
+                for reason in failed["audit"]["blocking_reasons"]
+            )
+        )
+
+    def test_canonical_state_binds_locked_paper_generation_and_predictions(self) -> None:
+        write_jsonl(
+            self.briefing / "data" / "predictions.jsonl",
+            [{"date": "2026-07-10", "prediction_id": "2026-07-10-P01"}],
+        )
+
+        result = atlas.build_virtual_execution_ledger(write_files=True)
+
+        expected_snapshot = self._paper_snapshot()
+        self.assertEqual(
+            result["state"]["paper_generation_sha256"],
+            expected_snapshot["generation_sha256"],
+        )
+        self.assertEqual(
+            result["state"]["prediction_semantic_hash"],
+            atlas.stable_hash(
+                [{"date": "2026-07-10", "prediction_id": "2026-07-10-P01"}]
+            ),
+        )
 
     def test_symbolic_all_temp_order_reconciles_to_unique_executed_trade(self) -> None:
         trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
@@ -658,6 +841,87 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertFalse(failed["audit"]["overall_passed"])
         self.assertIn("canonical ledger anchor HMAC signature mismatch", failed["audit"]["blocking_reasons"])
 
+    def test_monotonic_anchor_rejects_an_old_signed_pointer_and_workspace_generation(self) -> None:
+        first = atlas.build_virtual_execution_ledger(write_files=True)
+        anchor_path = Path(first["anchor_path"])
+        old_anchor = anchor_path.read_bytes()
+        old_ledger = atlas.VIRTUAL_LEDGER_PATH.read_bytes()
+        old_state = atlas.VIRTUAL_LEDGER_STATE_PATH.read_bytes()
+
+        trades_path = self.briefing / "data" / "paper_trades_us.jsonl"
+        trades = [
+            json.loads(line)
+            for line in trades_path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        ]
+        trades.append(
+            {
+                "account": "US",
+                "account_id": "global-briefing-us-paper-trading",
+                "action": "BUY",
+                "date": "2026-07-11",
+                "exchange": "NASDAQ",
+                "paper_trading_only": True,
+                "price": 11,
+                "quantity": 1,
+                "gross_value": 11,
+                "symbol": "TEST2",
+                "timestamp": "2026-07-11T09:30:00",
+            }
+        )
+        write_jsonl(trades_path, trades)
+        portfolio_path = self.briefing / "data" / "paper_portfolio_us.json"
+        portfolio = json.loads(portfolio_path.read_text(encoding="utf-8"))
+        portfolio["positions"]["NASDAQ:TEST2"] = {
+            "exchange": "NASDAQ",
+            "symbol": "TEST2",
+            "quantity": 1,
+        }
+        write_json(portfolio_path, portfolio)
+        second = atlas.build_virtual_execution_ledger(write_files=True)
+        self.assertTrue(second["audit"]["overall_passed"])
+        self.assertEqual(json.loads(anchor_path.read_text(encoding="utf-8"))["revision"], 2)
+
+        anchor_path.write_bytes(old_anchor)
+        atlas.VIRTUAL_LEDGER_PATH.write_bytes(old_ledger)
+        atlas.VIRTUAL_LEDGER_STATE_PATH.write_bytes(old_state)
+        failed = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertFalse(failed["write_performed"])
+        self.assertTrue(
+            any(
+                "pointer was rolled back" in reason
+                for reason in failed["audit"]["blocking_reasons"]
+            )
+        )
+
+    def test_content_addressed_generation_recovers_after_projection_write_interruption(self) -> None:
+        original_write = atlas.atomic_write_text
+        interrupted = False
+
+        def interrupt_projection(path: Path, text: str) -> None:
+            nonlocal interrupted
+            if path == atlas.VIRTUAL_LEDGER_PATH and not interrupted:
+                interrupted = True
+                raise OSError("simulated legacy projection interruption")
+            original_write(path, text)
+
+        with patch.object(atlas, "atomic_write_text", side_effect=interrupt_projection):
+            with self.assertRaisesRegex(OSError, "projection interruption"):
+                atlas.build_virtual_execution_ledger(write_files=True)
+
+        head = json.loads(atlas.VIRTUAL_LEDGER_HEAD_PATH.read_text(encoding="utf-8"))
+        generation_ledger = self.root / head["ledger_path"]
+        self.assertTrue(generation_ledger.is_file())
+        self.assertFalse(atlas.VIRTUAL_LEDGER_PATH.exists())
+
+        recovered = atlas.build_virtual_execution_ledger(write_files=True)
+
+        self.assertTrue(recovered["write_performed"])
+        self.assertEqual(atlas.VIRTUAL_LEDGER_PATH.read_bytes(), generation_ledger.read_bytes())
+        anchor = json.loads(Path(recovered["anchor_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(anchor["revision"], 1)
+
     def test_missing_anchor_key_fails_closed_before_any_ledger_write(self) -> None:
         with patch.dict(os.environ, {atlas.TRUST_ANCHOR_HMAC_KEY_ENV: ""}, clear=False):
             failed = atlas.build_virtual_execution_ledger(write_files=True)
@@ -720,22 +984,17 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertTrue(anchor_path.exists())
 
         ledger_path.unlink()
-        deleted = atlas.build_virtual_execution_ledger(write_files=True)
+        repaired = atlas.build_virtual_execution_ledger(write_files=True)
 
-        self.assertFalse(deleted["audit"]["overall_passed"])
-        self.assertFalse(deleted["write_performed"])
-        self.assertIn(
-            "canonical ledger is missing while persistent baseline evidence exists",
-            deleted["audit"]["blocking_reasons"],
-        )
+        self.assertTrue(repaired["audit"]["overall_passed"])
+        self.assertEqual(ledger_path.read_bytes(), (self.root / json.loads(anchor_path.read_text(encoding="utf-8"))["generation_ledger_path"]).read_bytes())
         self.assertTrue(anchor_path.exists())
 
-        # Removing the whole mutable ledger directory must still leave the anchor
-        # behind and prevent reconstruction from potentially altered sources.
-        shutil.rmtree(self.ledger_root)
-        missing_directory = atlas.build_virtual_execution_ledger(write_files=True)
-        self.assertFalse(missing_directory["audit"]["overall_passed"])
-        self.assertFalse(missing_directory["write_performed"])
+        generation_ledger = self.root / json.loads(anchor_path.read_text(encoding="utf-8"))["generation_ledger_path"]
+        generation_ledger.unlink()
+        missing_generation = atlas.build_virtual_execution_ledger(write_files=True)
+        self.assertFalse(missing_generation["audit"]["overall_passed"])
+        self.assertFalse(missing_generation["write_performed"])
         self.assertTrue(anchor_path.exists())
 
     def test_canonical_ledger_emptying_fails_closed_against_anchor_hash(self) -> None:
@@ -743,6 +1002,11 @@ class AtlasCycleTests(unittest.TestCase):
         ledger_path = Path(first["ledger_path"])
         ledger_path.write_text("", encoding="utf-8")
 
+        repaired = atlas.build_virtual_execution_ledger(write_files=True)
+        self.assertTrue(repaired["audit"]["overall_passed"])
+        anchor = json.loads(Path(first["anchor_path"]).read_text(encoding="utf-8"))
+        generation_ledger = self.root / anchor["generation_ledger_path"]
+        generation_ledger.write_text("", encoding="utf-8")
         failed = atlas.build_virtual_execution_ledger(write_files=True)
 
         self.assertFalse(failed["audit"]["overall_passed"])
@@ -796,6 +1060,7 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertEqual(result["replay"]["validation_scope"], "execution_isolation_only")
 
     def test_cycle_writes_run_audit_with_fail_closed_gates(self) -> None:
+        self._bootstrap_empty_global_history_anchor()
         args = argparse.Namespace(
             date="2026-07-10",
             dry_run=False,
@@ -839,11 +1104,157 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertTrue(payload["release_candidate_evidence"]["sync_passed"])
         self.assertTrue(payload["release_candidate_evidence"]["canonical_ledger_write_performed"])
         self.assertTrue(payload["release_candidate_evidence"]["required_stages_passed"])
+        test_stage = next(
+            stage
+            for stage in payload["stages"]
+            if stage["name"] == "targeted_integration_tests"
+        )
+        briefing_evidence = test_stage["detail"]["briefing_test_evidence"]
+        self.assertEqual(briefing_evidence["returncode"], 0)
+        self.assertTrue(briefing_evidence["passed"])
+        self.assertEqual(briefing_evidence["suite"], "python_unittest_discovery")
+        self.assertEqual(briefing_evidence["pattern"], "test_*.py")
+        self.assertRegex(
+            briefing_evidence["input"]["fingerprint_sha256"], r"^[0-9a-f]{64}$"
+        )
         self.assertEqual(payload["audit_chain"]["entry_sha256"], atlas.audit_record_hash(payload))
         self.assertTrue(atlas.audit_cycle_history(Path(cycle_state["last_history_json"]).parent)["passed"])
         workspace_lock = json.loads((self.runtime / "workspace-lock.json").read_text(encoding="utf-8"))
         self.assertEqual(len(workspace_lock["repositories"]), 3)
         self.assertFalse(workspace_lock["release_reproducible"])
+
+    def test_briefing_test_input_fingerprint_tracks_code_but_not_mutable_ledgers(self) -> None:
+        (self.root / "atlas.py").write_text("# atlas\n", encoding="utf-8")
+        (self.briefing / "scripts").mkdir(parents=True, exist_ok=True)
+        (self.briefing / "tests").mkdir(parents=True, exist_ok=True)
+        (self.briefing / "config").mkdir(parents=True, exist_ok=True)
+        (self.briefing / "scripts" / "worker.py").write_text("VALUE = 1\n", encoding="utf-8")
+        (self.briefing / "tests" / "test_contract.py").write_text("# test\n", encoding="utf-8")
+        (self.briefing / "requirements.txt").write_text("requests==1\n", encoding="utf-8")
+        generated = self.site / "app" / "briefing.generated.json"
+        generated.parent.mkdir(parents=True, exist_ok=True)
+        generated.write_text("{}\n", encoding="utf-8")
+        report = self.outputs / "每日全球晨间简报-2026-07-10.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("# report\n", encoding="utf-8")
+
+        before = atlas.build_briefing_test_input_fingerprint(
+            self.root, "2026-07-10"
+        )
+        write_jsonl(self.briefing / "data" / "predictions.jsonl", [{"mutable": True}])
+        after_ledger = atlas.build_briefing_test_input_fingerprint(
+            self.root, "2026-07-10"
+        )
+        (self.briefing / "scripts" / "worker.py").write_text("VALUE = 2\n", encoding="utf-8")
+        after_source = atlas.build_briefing_test_input_fingerprint(
+            self.root, "2026-07-10"
+        )
+
+        self.assertEqual(before, after_ledger)
+        self.assertNotEqual(
+            before["fingerprint_sha256"], after_source["fingerprint_sha256"]
+        )
+
+    def test_release_evidence_requires_commit_bound_github_attestation(self) -> None:
+        evidence_path = self.root / "atlas-release-evidence.json"
+        commits = {
+            "root": "1" * 40,
+            "site": "2" * 40,
+            "trading-core": "3" * 40,
+        }
+        write_json(
+            evidence_path,
+            {
+                "schema_version": 1,
+                "provider": "github-actions",
+                "repository": "example/atlas",
+                "workflow": ".github/workflows/quality.yml",
+                "source_ref": "refs/heads/main",
+                "run_id": "123",
+                "run_attempt": "1",
+                "test_profile": "full",
+                "required_jobs": ["briefing-control-plane", "composed-workspace"],
+                "repository_commits": commits,
+            },
+        )
+        workspace_lock = {
+            "repositories": [
+                {"name": name, "commit": commit}
+                for name, commit in commits.items()
+            ]
+        }
+        verified_output = json.dumps(
+            [{"attestation": {}, "verificationResult": {"statement": {"subject": []}}}]
+        )
+        completed = subprocess.CompletedProcess(
+            ["gh", "attestation", "verify"],
+            0,
+            stdout=verified_output,
+            stderr="",
+        )
+
+        with (
+            patch.object(shutil, "which", return_value="gh"),
+            patch.object(atlas, "capture_command", return_value=completed) as verifier,
+        ):
+            result = atlas.verify_release_evidence(
+                evidence_path,
+                workspace_lock=workspace_lock,
+                expected_repository="example/atlas",
+                expected_source_ref="refs/heads/main",
+            )
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["verification_count"], 1)
+        command = verifier.call_args.args[0]
+        self.assertIn("--deny-self-hosted-runners", command)
+        self.assertEqual(command[command.index("--source-digest") + 1], commits["root"])
+        self.assertEqual(
+            command[command.index("--signer-workflow") + 1],
+            "example/atlas/.github/workflows/quality.yml",
+        )
+        self.assertEqual(command[command.index("--signer-digest") + 1], commits["root"])
+
+    def test_release_evidence_commit_mismatch_fails_before_network_verification(self) -> None:
+        evidence_path = self.root / "atlas-release-evidence.json"
+        write_json(
+            evidence_path,
+            {
+                "schema_version": 1,
+                "provider": "github-actions",
+                "repository": "example/atlas",
+                "workflow": ".github/workflows/quality.yml",
+                "source_ref": "refs/heads/main",
+                "run_id": "123",
+                "run_attempt": "1",
+                "test_profile": "full",
+                "required_jobs": ["briefing-control-plane", "composed-workspace"],
+                "repository_commits": {
+                    "root": "f" * 40,
+                    "site": "2" * 40,
+                    "trading-core": "3" * 40,
+                },
+            },
+        )
+        workspace_lock = {
+            "repositories": [
+                {"name": "root", "commit": "1" * 40},
+                {"name": "site", "commit": "2" * 40},
+                {"name": "trading-core", "commit": "3" * 40},
+            ]
+        }
+
+        with patch.object(atlas, "capture_command") as verifier:
+            result = atlas.verify_release_evidence(
+                evidence_path,
+                workspace_lock=workspace_lock,
+                expected_repository="example/atlas",
+                expected_source_ref="refs/heads/main",
+            )
+
+        self.assertFalse(result["verified"])
+        self.assertIn("repository commits do not match workspace lock", result["errors"])
+        verifier.assert_not_called()
 
     def test_run_audit_hash_chain_detects_history_mutation(self) -> None:
         history = self.runtime / "run_audits" / "history" / "2026-07-10"
@@ -908,6 +1319,277 @@ class AtlasCycleTests(unittest.TestCase):
         atlas.write_cycle_history_anchor(history, pending)
         self.assertTrue(atlas.audit_cycle_history(history)["passed"])
 
+    def test_global_history_head_detects_cross_day_directory_rollback(self) -> None:
+        first_history = self.runtime / "run_audits" / "history" / "2026-07-09"
+        first = {
+            "run_id": "RUN-1",
+            "audit_chain": {"schema_version": 1, "sequence": 1, "previous_audit_sha256": None},
+        }
+        first["audit_chain"]["entry_sha256"] = atlas.audit_record_hash(first)
+        write_json(first_history / "RUN-1.json", first)
+        atlas.write_cycle_history_anchor(
+            first_history,
+            atlas.audit_cycle_history(first_history, allow_unanchored_genesis=True),
+        )
+        atlas.write_global_cycle_history_anchor(atlas.audit_global_cycle_history())
+
+        second_history = self.runtime / "run_audits" / "history" / "2026-07-10"
+        second = {
+            "run_id": "RUN-2",
+            "audit_chain": {"schema_version": 1, "sequence": 1, "previous_audit_sha256": None},
+        }
+        second["audit_chain"]["entry_sha256"] = atlas.audit_record_hash(second)
+        write_json(second_history / "RUN-2.json", second)
+        atlas.write_cycle_history_anchor(
+            second_history,
+            atlas.audit_cycle_history(second_history, allow_unanchored_genesis=True),
+        )
+        pending = atlas.audit_global_cycle_history(allow_append=True)
+        self.assertTrue(pending["passed"])
+        atlas.write_global_cycle_history_anchor(pending)
+
+        shutil.rmtree(second_history)
+        rolled_back = atlas.audit_global_cycle_history()
+
+        self.assertFalse(rolled_back["passed"])
+        self.assertIn("deleted, reordered, or mutated", "\n".join(rolled_back["errors"]))
+
+    def test_global_history_recovery_is_dry_run_then_append_only_and_idempotent(self) -> None:
+        anchor_path, source = self._seed_polluted_global_history_anchor()
+        target_entries = self._seed_recovery_target_history()
+        backup = self._recovery_backup_evidence(target_entries)
+        old_pointer = anchor_path.read_bytes()
+        old_version_path = (
+            atlas.monotonic_anchor_versions_path(anchor_path)
+            / f"{source['revision']:020d}-{source['anchor_sha256']}.json"
+        )
+        old_version = old_version_path.read_bytes()
+
+        with patch.object(
+            atlas,
+            "verify_global_history_recovery_backup",
+            return_value=backup,
+        ):
+            plan = atlas.build_global_history_recovery_plan(
+                expected_head_sha256=source["anchor_sha256"],
+                backup_latest_path=self.runtime / "backups" / "latest.json",
+            )
+
+        self.assertEqual(anchor_path.read_bytes(), old_pointer)
+        evidence_path = atlas.global_history_recovery_evidence_path(
+            plan["recovery_evidence_sha256"]
+        )
+        self.assertFalse(evidence_path.exists())
+        self.assertEqual(plan["target_entry_count"], len(target_entries))
+
+        with patch.object(
+            atlas,
+            "verify_global_history_recovery_backup",
+            return_value=backup,
+        ):
+            applied = atlas.apply_global_history_recovery(
+                expected_head_sha256=source["anchor_sha256"],
+                expected_plan_sha256=plan["recovery_plan_sha256"],
+                backup_latest_path=self.runtime / "backups" / "latest.json",
+            )
+
+        self.assertTrue(applied["applied"])
+        self.assertEqual(applied["revision"], 2)
+        self.assertTrue(evidence_path.is_file())
+        self.assertEqual(old_version_path.read_bytes(), old_version)
+        self.assertTrue(atlas.audit_global_cycle_history()["passed"])
+        versions_before_retry = sorted(
+            atlas.monotonic_anchor_versions_path(anchor_path).glob("*.json")
+        )
+        pointer_before_retry = anchor_path.read_bytes()
+
+        retried = atlas.apply_global_history_recovery(
+            expected_head_sha256=source["anchor_sha256"],
+            expected_plan_sha256=plan["recovery_plan_sha256"],
+            backup_latest_path=self.runtime / "backups" / "latest.json",
+        )
+
+        self.assertEqual(retried["status"], "already_applied")
+        self.assertFalse(retried["applied"])
+        self.assertEqual(anchor_path.read_bytes(), pointer_before_retry)
+        self.assertEqual(
+            sorted(atlas.monotonic_anchor_versions_path(anchor_path).glob("*.json")),
+            versions_before_retry,
+        )
+
+    def test_global_history_recovery_wrong_plan_is_zero_write(self) -> None:
+        anchor_path, source = self._seed_polluted_global_history_anchor()
+        target_entries = self._seed_recovery_target_history()
+        backup = self._recovery_backup_evidence(target_entries)
+        pointer_before = anchor_path.read_bytes()
+        versions_before = {
+            path.name: path.read_bytes()
+            for path in atlas.monotonic_anchor_versions_path(anchor_path).glob("*.json")
+        }
+
+        with (
+            patch.object(
+                atlas,
+                "verify_global_history_recovery_backup",
+                return_value=backup,
+            ),
+            self.assertRaisesRegex(ValueError, "plan changed"),
+        ):
+            atlas.apply_global_history_recovery(
+                expected_head_sha256=source["anchor_sha256"],
+                expected_plan_sha256="0" * 64,
+                backup_latest_path=self.runtime / "backups" / "latest.json",
+            )
+
+        self.assertEqual(anchor_path.read_bytes(), pointer_before)
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in atlas.monotonic_anchor_versions_path(anchor_path).glob("*.json")
+            },
+            versions_before,
+        )
+        recovery_root = self.trust_root / atlas.GLOBAL_HISTORY_RECOVERY_EVIDENCE_DIRECTORY
+        self.assertFalse(recovery_root.exists())
+
+    def test_global_history_recovery_rejects_mismatched_bindings(self) -> None:
+        anchor_path, source = self._seed_polluted_global_history_anchor()
+        target_entries = self._seed_recovery_target_history()
+        backup = self._recovery_backup_evidence(target_entries)
+        with patch.object(
+            atlas,
+            "verify_global_history_recovery_backup",
+            return_value=backup,
+        ):
+            plan = atlas.build_global_history_recovery_plan(
+                expected_head_sha256=source["anchor_sha256"],
+                backup_latest_path=self.runtime / "backups" / "latest.json",
+            )
+        self.assertTrue(anchor_path.exists())
+        atlas.write_immutable_json(
+            atlas.global_history_recovery_evidence_path(
+                plan["recovery_evidence_sha256"]
+            ),
+            plan["_evidence"],
+        )
+        cases = {
+            "source_anchor_sha256": "source_anchor_sha256 mismatch",
+            "source_workspace_uuid": "source_workspace_uuid mismatch",
+            "target_entries_sha256": "target_entries_sha256 mismatch",
+            "daily_anchor_evidence_sha256": "daily-anchor evidence hash mismatch",
+            "backup_manifest_sha256": "backup_manifest_sha256 mismatch",
+        }
+        for field, expected_error in cases.items():
+            with self.subTest(field=field):
+                target = json.loads(json.dumps(plan["_target_payload"]))
+                target["workspace_migration"][field] = "0" * 64
+                errors = atlas.global_history_workspace_transition_errors(source, target)
+                self.assertIn(expected_error, "\n".join(errors))
+
+    def test_global_history_rejects_unbound_workspace_transition(self) -> None:
+        anchor_path, source = self._seed_polluted_global_history_anchor()
+        target_entries = self._seed_recovery_target_history()
+        target = {
+            "schema_version": atlas.GLOBAL_HISTORY_ANCHOR_SCHEMA_VERSION,
+            "history_root": atlas.relative_path(self.runtime / "run_audits" / "history"),
+            "entries": target_entries,
+            "entry_count": len(target_entries),
+            "workspace_uuid": atlas.workspace_project_uuid(),
+            "revision": 2,
+            "previous_head_sha256": source["anchor_sha256"],
+            **atlas.trust_scope_payload(),
+        }
+        target["anchor_sha256"] = atlas.history_anchor_hash(target)
+        target = atlas.sign_trust_anchor(target)
+        atlas.write_monotonic_anchor(
+            anchor_path,
+            target,
+            head_hash_field="anchor_sha256",
+        )
+
+        failed = atlas.audit_global_cycle_history()
+
+        self.assertFalse(failed["passed"])
+        self.assertIn(
+            "workspace migration metadata is missing or malformed",
+            "\n".join(failed["errors"]),
+        )
+        generic_errors = atlas.monotonic_anchor_errors(
+            anchor_path,
+            target,
+            label="generic anchor",
+            head_hash_field="anchor_sha256",
+        )
+        self.assertIn("generic anchor retained workspace UUID changed", generic_errors)
+
+    def test_global_history_recovery_requires_exact_backup_manifest(self) -> None:
+        _anchor_path, source = self._seed_polluted_global_history_anchor()
+        target_entries = self._seed_recovery_target_history()
+        backup = self._recovery_backup_evidence(target_entries[:-1])
+
+        with (
+            patch.object(
+                atlas,
+                "verify_global_history_recovery_backup",
+                return_value=backup,
+            ),
+            self.assertRaisesRegex(ValueError, "does not exactly match"),
+        ):
+            atlas.build_global_history_recovery_plan(
+                expected_head_sha256=source["anchor_sha256"],
+                backup_latest_path=self.runtime / "backups" / "latest.json",
+            )
+
+    def test_cycle_refuses_to_auto_bootstrap_global_history_anchor(self) -> None:
+        args = atlas.build_parser().parse_args(
+            [
+                "cycle",
+                "--date",
+                "2026-07-10",
+                "--skip-site",
+                "--skip-trading-core",
+                "--skip-publication",
+            ]
+        )
+        replay = {
+            "overall_passed": True,
+            "safety_gate_passed": True,
+            "strategy_evidence_passed": False,
+            "replay": {"passed": True, "strategy_evidence_passed": False},
+            "shadow_promotion_gate": {
+                "passed": True,
+                "evidence_passed": False,
+                "payload": {"auto_applied": False, "recommended_state": "shadow"},
+            },
+        }
+        with (
+            patch.object(
+                atlas,
+                "doctor_checks",
+                return_value=[atlas.Check("Python", "ok", "3.12")],
+            ),
+            patch.object(atlas, "command_sync", return_value=0),
+            patch.object(atlas, "run_replay_shadow_validation", return_value=replay),
+            patch.object(atlas, "command_test", return_value=0),
+            patch.object(
+                atlas,
+                "build_workspace_lock",
+                return_value={
+                    "content_sha256": "w" * 64,
+                    "release_reproducible": False,
+                    "repositories": [],
+                },
+            ),
+            patch.object(atlas, "write_global_cycle_history_anchor") as writer,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            self.assertEqual(atlas.command_cycle(args), 1)
+
+        writer.assert_not_called()
+        self.assertFalse(atlas.global_cycle_history_anchor_path().exists())
+        history = self.runtime / "run_audits" / "history" / "2026-07-10"
+        self.assertEqual(list(history.glob("*.json")) if history.exists() else [], [])
+
     def test_history_nonfinite_json_fails_closed_without_raising(self) -> None:
         history = self.runtime / "run_audits" / "history" / "2026-07-10"
         history.mkdir(parents=True, exist_ok=True)
@@ -919,6 +1601,7 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertTrue(any("unreadable audit JSON" in error for error in result["errors"]))
 
     def test_history_anchor_write_failure_rolls_back_new_record_and_retry_succeeds(self) -> None:
+        self._bootstrap_empty_global_history_anchor()
         args = argparse.Namespace(
             date="2026-07-10",
             dry_run=False,
@@ -1090,6 +1773,7 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertIn("--allow-empty", loader)
 
     def test_sync_failure_writes_audit_but_never_writes_canonical_ledger(self) -> None:
+        self._bootstrap_empty_global_history_anchor()
         args = argparse.Namespace(
             date="2026-07-10",
             dry_run=False,
@@ -1121,6 +1805,7 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertFalse((self.ledger_root / "atlas_virtual_execution_ledger.jsonl").exists())
 
     def test_skip_sync_blocks_operational_and_release_gates_and_persists_state(self) -> None:
+        self._bootstrap_empty_global_history_anchor()
         args = argparse.Namespace(
             date="2026-07-10",
             dry_run=False,
@@ -1233,7 +1918,7 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertTrue(fetchable_remote["release_ready"])
 
     def test_workspace_lock_hash_excludes_generated_at(self) -> None:
-        def provenance(name: str, path: Path) -> dict:
+        def provenance(name: str, path: Path, **_kwargs) -> dict:
             return {
                 "name": name,
                 "path": str(path),
@@ -1258,7 +1943,83 @@ class AtlasCycleTests(unittest.TestCase):
         self.assertNotEqual(first["generated_at"], second["generated_at"])
         self.assertEqual(first["content_sha256"], second["content_sha256"])
 
+    def test_explicit_workspace_root_is_absolute_and_structurally_validated(self) -> None:
+        with patch.dict(os.environ, {atlas.ATLAS_WORKSPACE_ROOT_ENV: "relative/path"}, clear=False):
+            with self.assertRaisesRegex(RuntimeError, "absolute path"):
+                atlas.resolve_workspace_root()
+
+        checkout = self.root / "checkout"
+        (checkout / "work" / "global-briefing").mkdir(parents=True)
+        (checkout / "work" / "trading-core").mkdir(parents=True)
+        (checkout / "src").mkdir()
+        (checkout / "atlas.py").write_text("# marker\n", encoding="utf-8")
+        with patch.dict(
+            os.environ,
+            {atlas.ATLAS_WORKSPACE_ROOT_ENV: str(checkout.resolve())},
+            clear=False,
+        ):
+            self.assertEqual(atlas.resolve_workspace_root(), checkout.resolve())
+
+    def test_daily_repository_provenance_skips_remote_network_probe(self) -> None:
+        repository = self.root / "daily-repository"
+        repository.mkdir()
+        git = atlas.shutil.which("git")
+        self.assertIsNotNone(git)
+        subprocess.run([str(git), "init"], cwd=repository, check=True, capture_output=True)
+        subprocess.run(
+            [str(git), "config", "user.name", "ATLAS Test"],
+            cwd=repository,
+            check=True,
+        )
+        subprocess.run(
+            [str(git), "config", "user.email", "atlas@example.invalid"],
+            cwd=repository,
+            check=True,
+        )
+        (repository / "tracked.txt").write_text("tracked\n", encoding="utf-8")
+        subprocess.run([str(git), "add", "tracked.txt"], cwd=repository, check=True)
+        subprocess.run(
+            [str(git), "commit", "-m", "initial"],
+            cwd=repository,
+            check=True,
+            capture_output=True,
+        )
+
+        with patch.object(
+            atlas,
+            "probe_git_remotes",
+            side_effect=AssertionError("daily operational provenance must not access remotes"),
+        ):
+            provenance = atlas.git_repository_provenance(
+                "daily",
+                repository,
+                probe_remotes=False,
+            )
+
+        self.assertTrue(provenance["available"])
+        self.assertEqual(provenance["remote_probe_status"], "not_requested_daily")
+        self.assertFalse(provenance["remote_fetchable"])
+        self.assertFalse(provenance["release_ready"])
+
+    def test_repository_provenance_collection_is_concurrent_and_ordered(self) -> None:
+        rendezvous = threading.Barrier(3)
+
+        def inspect(name: str, path: Path, *, probe_remotes: bool) -> dict:
+            self.assertFalse(probe_remotes)
+            rendezvous.wait(timeout=2)
+            return {"name": name, "path": str(path), "available": True}
+
+        repositories = [("one", self.root), ("two", self.site), ("three", self.trading)]
+        with patch.object(atlas, "git_repository_provenance", side_effect=inspect):
+            collected = atlas.collect_repository_provenance(
+                repositories,
+                probe_remotes=False,
+            )
+
+        self.assertEqual([item["name"] for item in collected], ["one", "two", "three"])
+
     def test_cycle_idempotency_is_bound_to_workspace_commits(self) -> None:
+        self._bootstrap_empty_global_history_anchor()
         args = argparse.Namespace(
             date="2026-07-10",
             dry_run=False,
@@ -1405,6 +2166,12 @@ class AtlasCycleTests(unittest.TestCase):
 
     def test_full_test_mode_runs_audited_trading_core_matrix(self) -> None:
         args = argparse.Namespace(skip_site=True, skip_trading_core=False, full=True)
+        root_tests = self.root / "tests"
+        briefing_tests = self.briefing / "tests"
+        root_tests.mkdir(parents=True)
+        briefing_tests.mkdir(parents=True)
+        (root_tests / "test_contract.py").write_text("# contract\n", encoding="utf-8")
+        (briefing_tests / "test_contract.py").write_text("# contract\n", encoding="utf-8")
         with patch.object(atlas, "run_command", return_value=0) as run:
             self.assertEqual(atlas.command_test(args), 0)
 
@@ -1418,6 +2185,97 @@ class AtlasCycleTests(unittest.TestCase):
             ],
         )
         self.assertEqual(core_call.kwargs["timeout"], 45 * 60)
+
+    def test_full_test_mode_runs_complete_site_quality_and_security_policy(self) -> None:
+        args = argparse.Namespace(skip_site=False, skip_trading_core=True, full=True)
+
+        site_gates = [gate for gate in atlas.build_test_plan(args) if gate.cwd == self.site]
+
+        self.assertEqual(
+            [gate.command[1:] for gate in site_gates],
+            [("run", "quality"), ("run", "audit:policy")],
+        )
+
+    def test_missing_required_test_sources_fail_before_subprocess_execution(self) -> None:
+        args = argparse.Namespace(skip_site=True, skip_trading_core=True, full=False)
+        with (
+            patch.object(
+                atlas,
+                "capture_command",
+                side_effect=AssertionError("missing test sources must fail before execution"),
+            ),
+            contextlib.redirect_stderr(io.StringIO()) as stderr,
+        ):
+            self.assertEqual(atlas.command_test(args), 1)
+
+        self.assertIn("test directory is missing", stderr.getvalue())
+
+    def test_daily_test_gates_run_concurrently_and_collect_all_failures(self) -> None:
+        rendezvous = threading.Barrier(2)
+        seen: list[tuple[str, ...]] = []
+        seen_lock = threading.Lock()
+
+        def capture(command, **_kwargs):
+            normalized = tuple(str(part) for part in command)
+            with seen_lock:
+                seen.append(normalized)
+            rendezvous.wait(timeout=2)
+            failed = normalized[0] == "briefing-gate"
+            return subprocess.CompletedProcess(
+                list(command),
+                1 if failed else 0,
+                stdout="",
+                stderr="expected failure\n" if failed else "",
+            )
+
+        with (
+            patch.object(atlas, "capture_command", side_effect=capture),
+            patch.object(
+                atlas,
+                "run_command",
+                side_effect=AssertionError("daily test gates must use the concurrent runner"),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+            contextlib.redirect_stderr(io.StringIO()),
+        ):
+            self.assertEqual(
+                atlas.run_daily_test_plan(
+                    [
+                        atlas.TestGate("root", ("root-gate",)),
+                        atlas.TestGate("briefing", ("briefing-gate",)),
+                    ]
+                ),
+                1,
+            )
+
+        self.assertEqual(len(seen), 2)
+        self.assertIn(("root-gate",), seen)
+        self.assertIn(("briefing-gate",), seen)
+
+    def test_daily_test_logs_tolerate_console_encoding_limits(self) -> None:
+        stdout_bytes = io.BytesIO()
+        stderr_bytes = io.BytesIO()
+        stdout = io.TextIOWrapper(stdout_bytes, encoding="ascii", errors="strict")
+        stderr = io.TextIOWrapper(stderr_bytes, encoding="ascii", errors="strict")
+        result = subprocess.CompletedProcess(
+            ["unicode-gate"],
+            0,
+            stdout="quality \u2713\n",
+            stderr="",
+        )
+
+        with (
+            patch.object(atlas, "capture_command", return_value=result),
+            contextlib.redirect_stdout(stdout),
+            contextlib.redirect_stderr(stderr),
+        ):
+            self.assertEqual(
+                atlas.run_daily_test_plan([atlas.TestGate("unicode", ("unicode-gate",))]),
+                0,
+            )
+        stdout.flush()
+
+        self.assertIn(b"quality ?", stdout_bytes.getvalue())
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import multiprocessing as mp
 import sys
 import time
@@ -51,7 +52,8 @@ def as_float(value: Any) -> float | None:
     if value is None:
         return None
     try:
-        return float(value)
+        number = float(value)
+        return number if math.isfinite(number) else None
     except (TypeError, ValueError):
         return None
 
@@ -69,9 +71,11 @@ def parse_close_series(data: Any, ticker: str) -> dict[str, Any]:
         closes = frame["Close"].dropna()
         if closes.empty:
             return {"ticker": ticker, "error": "no close data"}
-        last = float(closes.iloc[-1])
-        prev = float(closes.iloc[-2]) if len(closes) > 1 else None
-        change_pct = ((last / prev) - 1) * 100 if prev else None
+        last = as_float(closes.iloc[-1])
+        if last is None:
+            return {"ticker": ticker, "error": "latest close is not finite"}
+        prev = as_float(closes.iloc[-2]) if len(closes) > 1 else None
+        change_pct = as_float(((last / prev) - 1) * 100) if prev else None
         last_date = str(closes.index[-1].date()) if hasattr(closes.index[-1], "date") else str(closes.index[-1])
         return {
             "ticker": ticker,
@@ -152,7 +156,7 @@ def fetch_yahoo_chart(ticker: str, timeout: int) -> dict[str, Any]:
         "ticker": ticker,
         "last_close": last,
         "previous_close": prev,
-        "change_pct": ((last / prev) - 1) * 100 if prev else None,
+        "change_pct": as_float(((last / prev) - 1) * 100) if prev else None,
         "price_date": price_date,
         "source": "Yahoo Finance chart direct",
         "fetched_at": now_utc(),
@@ -188,7 +192,10 @@ def main(argv: list[str] | None = None) -> int:
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     result = snapshot(args.tickers, args.per_ticker_timeout)
     output_path = args.output or DATA_DIR / f"market-snapshot-{current_report_date()}.json"
-    output_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    output_path.write_text(
+        json.dumps(result, allow_nan=False, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
     print(output_path)
     error_count = sum(1 for item in result["items"] if item.get("last_close") is None)
     print(f"items={len(result['items'])} errors={error_count}")

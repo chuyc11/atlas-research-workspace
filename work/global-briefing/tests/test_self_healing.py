@@ -7,8 +7,11 @@ import sys
 import tempfile
 import threading
 import unittest
+from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
+
+import atlas as ATLAS
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "self_healing.py"
@@ -61,6 +64,92 @@ class SelfHealingTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temp.cleanup()
+
+    def seed_briefing_test_inputs(self) -> dict:
+        (self.root / "atlas.py").write_text("# control plane\n", encoding="utf-8")
+        briefing = self.root / "work" / "global-briefing"
+        (briefing / "scripts").mkdir(parents=True, exist_ok=True)
+        (briefing / "tests").mkdir(parents=True, exist_ok=True)
+        (briefing / "scripts" / "collector.py").write_text(
+            "VALUE = 1\n", encoding="utf-8"
+        )
+        (briefing / "tests" / "test_contract.py").write_text(
+            "# contract\n", encoding="utf-8"
+        )
+        (briefing / "requirements.txt").write_text("requests==1\n", encoding="utf-8")
+        site_payload = self.root / "src" / "app" / "briefing.generated.json"
+        site_payload.parent.mkdir(parents=True, exist_ok=True)
+        site_payload.write_text("{}\n", encoding="utf-8")
+        report = self.root / "outputs" / "每日全球晨间简报-2026-07-12.md"
+        report.parent.mkdir(parents=True, exist_ok=True)
+        report.write_text("# report\n", encoding="utf-8")
+        return MODULE.build_briefing_test_input_fingerprint(self.root)
+
+    def write_cycle_test_evidence(
+        self,
+        *,
+        date: str = "2026-07-12",
+        completed_at: str = "2026-07-12T02:15:00Z",
+        returncode: int = 0,
+        briefing_discovery: bool = True,
+        input_fingerprint: dict | None = None,
+    ) -> dict:
+        fingerprint = input_fingerprint or MODULE.build_briefing_test_input_fingerprint(
+            self.root
+        )
+        run_id = f"ATLAS-CYCLE-{date.replace('-', '')}-RUN-TEST"
+        payload = {
+            "schema_version": 1,
+            "run_id": run_id,
+            "date": date,
+            "overall_passed": returncode == 0,
+            "operational_gate_passed": returncode == 0,
+            "test_returncode": returncode,
+            "execution_profile": {"skip_tests": False},
+            "stages": [
+                {
+                    "name": "targeted_integration_tests",
+                    "status": "passed" if returncode == 0 else "failed",
+                    "detail": {
+                        "returncode": returncode,
+                        "scope": {
+                            "kind": "targeted_integration_suite",
+                            "briefing_unittest_discovery": briefing_discovery,
+                        },
+                        "briefing_test_evidence": {
+                            "schema_version": 1,
+                            "suite": "python_unittest_discovery",
+                            "discovery_root": "work/global-briefing/tests",
+                            "pattern": "test_*.py",
+                            "completed_at": completed_at,
+                            "returncode": returncode,
+                            "passed": returncode == 0,
+                            "input": fingerprint,
+                        },
+                    },
+                }
+            ],
+            "audit_chain": {
+                "schema_version": 1,
+                "sequence": 1,
+                "previous_audit_sha256": None,
+            },
+        }
+        payload["audit_chain"]["entry_sha256"] = MODULE.cycle_audit_record_hash(
+            payload
+        )
+        latest = (
+            self.root
+            / "work"
+            / "shared"
+            / "atlas"
+            / "run_audits"
+            / f"atlas-cycle-{date}.json"
+        )
+        history = latest.parent / "history" / date / f"{run_id}.json"
+        write_json(latest, payload)
+        write_json(history, payload)
+        return payload
 
     def test_fingerprint_is_stable_and_issue_resolves_when_probe_passes(self) -> None:
         failed = self.engine.result(
@@ -355,6 +444,139 @@ class SelfHealingTests(unittest.TestCase):
         self.assertFalse(eligible)
         self.assertIn("maximum repair attempts", reason)
 
+    def test_deep_probe_reuses_fresh_matching_cycle_briefing_tests_but_runs_site(self) -> None:
+        fingerprint = self.seed_briefing_test_inputs()
+        self.write_cycle_test_evidence(input_fingerprint=fingerprint)
+        calls = []
+
+        def runner(command, *, cwd, timeout):
+            calls.append((list(command), cwd, timeout))
+            return subprocess.CompletedProcess(command, 0, stdout="site ok", stderr="")
+
+        self.engine.runner = runner
+        results = self.engine.probe_deep(
+            "2026-07-12", now=datetime(2026, 7, 12, 2, 30, tzinfo=UTC)
+        )
+
+        briefing, site = results
+        self.assertEqual([item.check_id for item in results], ["briefing_tests", "site_quality"])
+        self.assertTrue(briefing.passed)
+        self.assertTrue(briefing.reused)
+        self.assertEqual(briefing.evidence["execution_mode"], "reused_cycle_evidence")
+        self.assertFalse(briefing.evidence["suite_executed_by_heal"])
+        self.assertTrue(site.passed)
+        self.assertFalse(site.reused)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][1], self.engine.site_root)
+
+    def test_briefing_input_fingerprint_matches_cycle_evidence_producer(self) -> None:
+        self.seed_briefing_test_inputs()
+
+        producer = ATLAS.build_briefing_test_input_fingerprint(
+            self.root, "2026-07-12"
+        )
+        verifier = MODULE.build_briefing_test_input_fingerprint(
+            self.root, "2026-07-12"
+        )
+
+        self.assertEqual(producer, verifier)
+
+    def test_briefing_test_reuse_fails_closed_for_invalid_cycle_evidence(self) -> None:
+        baseline = self.seed_briefing_test_inputs()
+        now = datetime(2026, 7, 12, 2, 30, tzinfo=UTC)
+        cases = (
+            {
+                "name": "stale",
+                "write": {"completed_at": "2026-07-12T00:00:00Z"},
+                "expected": "stale",
+            },
+            {
+                "name": "failed_returncode",
+                "write": {"returncode": 1},
+                "expected": "returncode",
+            },
+            {
+                "name": "insufficient_scope",
+                "write": {"briefing_discovery": False},
+                "expected": "scope",
+            },
+            {
+                "name": "fingerprint_mismatch",
+                "write": {
+                    "input_fingerprint": baseline
+                    | {"fingerprint_sha256": "f" * 64}
+                },
+                "expected": "fingerprint",
+            },
+        )
+        for case in cases:
+            with self.subTest(case=case["name"]):
+                self.write_cycle_test_evidence(**case["write"])
+                decision = self.engine.briefing_test_reuse_decision(
+                    "2026-07-12", now=now
+                )
+                self.assertFalse(decision["reused"])
+                self.assertTrue(
+                    any(case["expected"] in reason for reason in decision["reasons"]),
+                    decision["reasons"],
+                )
+
+    def test_deep_probe_executes_briefing_tests_when_input_changed_after_cycle(self) -> None:
+        fingerprint = self.seed_briefing_test_inputs()
+        self.write_cycle_test_evidence(input_fingerprint=fingerprint)
+        script = self.root / "work" / "global-briefing" / "scripts" / "collector.py"
+        script.write_text("VALUE = 2\n", encoding="utf-8")
+        calls = []
+
+        def runner(command, *, cwd, timeout):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
+
+        self.engine.runner = runner
+        results = self.engine.probe_deep(
+            "2026-07-12", now=datetime(2026, 7, 12, 2, 30, tzinfo=UTC)
+        )
+
+        briefing = results[0]
+        self.assertTrue(briefing.passed)
+        self.assertFalse(briefing.reused)
+        self.assertEqual(briefing.evidence["execution_mode"], "executed")
+        self.assertTrue(briefing.evidence["suite_executed_by_heal"])
+        self.assertTrue(any(command[0] == sys.executable for command in calls))
+
+    def test_briefing_test_reuse_requires_hashed_matching_history_record(self) -> None:
+        fingerprint = self.seed_briefing_test_inputs()
+        payload = self.write_cycle_test_evidence(input_fingerprint=fingerprint)
+        latest = (
+            self.root
+            / "work"
+            / "shared"
+            / "atlas"
+            / "run_audits"
+            / "atlas-cycle-2026-07-12.json"
+        )
+        history = latest.parent / "history" / "2026-07-12" / f"{payload['run_id']}.json"
+        history.unlink()
+
+        missing_history = self.engine.briefing_test_reuse_decision(
+            "2026-07-12", now=datetime(2026, 7, 12, 2, 30, tzinfo=UTC)
+        )
+        self.assertFalse(missing_history["reused"])
+        self.assertTrue(
+            any("history" in reason for reason in missing_history["reasons"])
+        )
+
+        write_json(history, payload)
+        payload["operational_gate_passed"] = False
+        write_json(latest, payload)
+        invalid_hash = self.engine.briefing_test_reuse_decision(
+            "2026-07-12", now=datetime(2026, 7, 12, 2, 30, tzinfo=UTC)
+        )
+        self.assertFalse(invalid_hash["reused"])
+        self.assertTrue(
+            any("content hash" in reason for reason in invalid_hash["reasons"])
+        )
+
     def test_independent_deep_checks_start_concurrently_and_keep_stable_order(self) -> None:
         site_started = threading.Event()
         briefing_observed_site = []
@@ -367,7 +589,7 @@ class SelfHealingTests(unittest.TestCase):
             return subprocess.CompletedProcess(command, 0, stdout="ok", stderr="")
 
         self.engine.runner = runner
-        results = self.engine.probe_deep()
+        results = self.engine.probe_deep("2026-07-12")
 
         self.assertEqual(briefing_observed_site, [True])
         self.assertEqual([item.check_id for item in results], ["briefing_tests", "site_quality"])

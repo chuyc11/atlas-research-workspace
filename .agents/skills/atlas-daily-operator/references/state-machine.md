@@ -33,7 +33,7 @@ python work\global-briefing\scripts\briefing_store.py write --date RUN_DATE --in
 python atlas.py quality --date RUN_DATE
 ```
 
-Use `RUN_DATE-ACCOUNT-ACTION-SYMBOL-PREDICTION_ID` as each stable order ID. A full liquidation must resolve the held quantity to a finite number; never write `ALL`. Skip `apply-orders` or `mark` when the intended stable IDs already exist with identical content. Stop on an identity/content conflict. A valid `HOLD` is preferable to a forced trade when configured blockers apply.
+Use `RUN_DATE-ACCOUNT-ACTION-SYMBOL-PREDICTION_ID` as each stable order ID. A full liquidation must resolve the held quantity to a finite number; never write `ALL`. For BUY orders at or after the configured strategy-context enforcement date, include the schema-v1 signal, intent, thesis, account-risk and confirming-evidence object required by `paper_trading.json`; percentages use decimal fractions. A-share priced actions at or after their configured enforcement date require finite, source-dated `previous_close`. Skip `apply-orders` or `mark` when the intended stable IDs already exist with identical content. Stop on an identity/content conflict. A valid `HOLD` is preferable to a forced trade when configured blockers apply.
 
 ## Closed loop
 
@@ -46,7 +46,6 @@ python atlas.py cycle --date RUN_DATE --skip-site --skip-publication
 Then execute the durable closed-loop stages:
 
 ```powershell
-python atlas.py backup --date RUN_DATE
 python atlas.py improvements --date RUN_DATE --apply-safe --strict
 python atlas.py heal --date RUN_DATE --apply-safe --deep --strict
 python atlas.py alerts --date RUN_DATE
@@ -55,7 +54,7 @@ python atlas.py alerts --date RUN_DATE
 python atlas.py backup --date RUN_DATE
 ```
 
-Read the date-aligned JSON artifacts under `work/shared/atlas/` after each command. The first backup makes recovery capability observable before strict controls are evaluated; the second retains the final post-verification state. If the bootstrap backup does not restore-verify, stop before `improvements --strict` and preserve the completed Phase A artifacts. An alert may be nonblocking only when its artifact explicitly classifies every finding and configured blocking severities remain absent.
+Read the date-aligned JSON artifacts under `work/shared/atlas/` after each command. A recent authenticated and restore-verified snapshot makes recovery capability observable before strict controls, so the daily path writes only the final post-verification checkpoint. If bootstrap readiness reports a stale or absent snapshot, create one daily checkpoint before strict controls and stop if it does not restore-verify. The daily checkpoint must reference a recent restore-verified full baseline; schedule `python atlas.py backup --date RUN_DATE --full` at the configured low frequency rather than embedding it in every run. An alert may be nonblocking only when its artifact explicitly classifies every finding and configured blocking severities remain absent.
 
 Do not infer success from a zero exit code alone. Verify the final self-healing counts/status, restore result, alert findings, cycle audit, and artifact dates directly. Proper-scoring sample insufficiency may remain shadow-only; operational, ledger, recovery, or publication failures do not.
 

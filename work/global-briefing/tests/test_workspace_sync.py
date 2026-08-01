@@ -598,6 +598,69 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertEqual(status["selfHealing"]["status"], "not_run")
         self.assertEqual(status["improvements"]["status"], "not_run")
 
+    def test_market_as_of_uses_selected_assets_actual_price_dates(self) -> None:
+        us = {
+            "items": [
+                {"ticker": "SPY", "price_date": "2026-07-31", "change_pct": 1.0},
+                {"ticker": "QQQ", "price_date": "2026-07-30", "change_pct": 2.0},
+                {"ticker": "OTHER", "price_date": "2026-08-01", "change_pct": 3.0},
+            ]
+        }
+        china = {
+            "generated_at": "2026-08-01T08:00:00+08:00",
+            "items": [
+                {"symbol": "000300.SH", "name": "沪深300指数", "price_date": "2026-07-31", "change_pct": 0.5},
+                {"symbol": "399006.SZ", "name": "创业板指数", "price_date": "2026-07-30", "change_pct": -0.5},
+            ],
+        }
+
+        with patch.object(SITE_SYNC, "latest_snapshot", side_effect=[us, china]):
+            markets = SITE_SYNC.parse_markets("2026-08-01")
+
+        self.assertEqual(markets["us"]["asOf"], "2026-07-30")
+        self.assertEqual(markets["us"]["priceDateRange"], ["2026-07-30", "2026-07-31"])
+        self.assertEqual(markets["china"]["asOf"], "2026-07-30")
+        self.assertEqual(markets["china"]["priceDateRange"], ["2026-07-30", "2026-07-31"])
+        self.assertTrue(markets["china"]["isStale"])
+        self.assertNotEqual(markets["china"]["asOf"], "2026-08-01")
+
+    def test_market_snapshot_rejects_future_invalid_and_nonfinite_rows(self) -> None:
+        us = {
+            "items": [
+                {"ticker": "SPY", "price_date": "2026-08-02", "change_pct": 1.0},
+                {"ticker": "QQQ", "price_date": "not-a-date", "change_pct": 2.0},
+                {"ticker": "SMH", "price_date": "2026-07-31", "change_pct": float("nan")},
+                {"ticker": "GLD", "price_date": "2026-07-30", "change_pct": -0.25},
+            ]
+        }
+
+        with patch.object(SITE_SYNC, "latest_snapshot", side_effect=[us, {"items": []}]):
+            markets = SITE_SYNC.parse_markets("2026-08-01")
+
+        self.assertEqual(markets["us"]["items"], [
+            {"label": "GLD", "change": "-0.25%", "direction": "down"}
+        ])
+        self.assertEqual(markets["us"]["asOf"], "2026-07-30")
+        self.assertEqual(markets["us"]["priceDateRange"], ["2026-07-30", "2026-07-30"])
+        self.assertNotIn("nan", json.dumps(markets, ensure_ascii=False).lower())
+
+    def test_market_snapshot_with_no_valid_prices_is_unknown_and_stale(self) -> None:
+        us = {
+            "items": [
+                {"ticker": "SPY", "price_date": "", "change_pct": 1.0},
+                {"ticker": "QQQ", "price_date": "2026-08-02", "change_pct": float("inf")},
+            ]
+        }
+
+        with patch.object(SITE_SYNC, "latest_snapshot", side_effect=[us, {"items": []}]):
+            markets = SITE_SYNC.parse_markets("2026-08-01")
+
+        self.assertEqual(markets["us"]["asOf"], "未知")
+        self.assertEqual(markets["us"]["priceDateRange"], [])
+        self.assertEqual(markets["us"]["items"], [])
+        self.assertTrue(markets["us"]["isStale"])
+        self.assertEqual(markets["us"]["freshness"], "行情日期未知")
+
     def test_system_status_never_leaks_future_self_healing_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             latest = Path(temporary) / "latest.json"
@@ -670,6 +733,7 @@ class WorkspaceSyncTests(unittest.TestCase):
             site_manifest = root / "publication.generated.json"
             report_path = root / "report.md"
             verification_path = root / "production-verification.json"
+            receipt_path = root / "deployment-receipt.json"
             content_hash = "a" * 64
             report_date = "2026-07-12"
             raw_report = b"report"
@@ -716,7 +780,7 @@ class WorkspaceSyncTests(unittest.TestCase):
                     {
                         "schema_version": 2,
                         "checked_at": verified_at,
-                        "deployment_url": "https://example.com",
+                        "deployment_url": SITE_SYNC.SITES_PRODUCTION_URL,
                         "expected": {
                             "content_hash": manifest["contentHash"],
                             "report_date": manifest["reportDate"],
@@ -743,16 +807,37 @@ class WorkspaceSyncTests(unittest.TestCase):
                             "connected_ip": "93.184.216.34",
                             "validated_addresses": ["93.184.216.34"],
                             "dns_pinned": True,
-                            "tls_server_name": "example.com",
-                            "host_header": "example.com",
+                            "tls_server_name": "atlas-global-brief-2026.poetic-kiwi-4295.chatgpt.site",
+                            "host_header": "atlas-global-brief-2026.poetic-kiwi-4295.chatgpt.site",
                         },
                         "passed": True,
                     }
                 ),
                 encoding="utf-8",
             )
+            receipt_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": SITE_SYNC.DEPLOYMENT_RECEIPT_SCHEMA_VERSION,
+                        "status": "succeeded",
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                        "project_id": SITE_SYNC.SITES_PROJECT_ID,
+                        "deployment_url": SITE_SYNC.SITES_PRODUCTION_URL,
+                        "source_base_commit": "1" * 40,
+                        "published_commit": "2" * 40,
+                        "artifact_sha256": "3" * 64,
+                        "artifact_size_bytes": 1234,
+                        "sites_version_id": "version-27",
+                        "sites_deployment_id": "deployment-27",
+                        "publication_manifest_sha256": manifest_sha,
+                        "content_hash": content_hash,
+                    }
+                ),
+                encoding="utf-8",
+            )
             with (
                 patch.object(SITE_SYNC, "STATE_FILE", state_path),
+                patch.object(SITE_SYNC, "DEPLOYMENT_RECEIPT_ARCHIVE_ROOT", root / "receipt-archive"),
                 patch.object(SITE_SYNC, "SITE_DATA", site_data),
                 patch.object(SITE_SYNC, "SITE_PUBLICATION_MANIFEST", site_manifest),
                 patch.object(SITE_SYNC, "report_for_date", return_value=(report_path, "2026-07-12")),
@@ -768,16 +853,18 @@ class WorkspaceSyncTests(unittest.TestCase):
                         "--mark-deployed",
                         content_hash,
                         "--deployment-url",
-                        "https://example.com",
+                        SITE_SYNC.SITES_PRODUCTION_URL,
                         "--verification-artifact",
                         str(verification_path),
+                        "--deployment-receipt",
+                        str(receipt_path),
                     ],
                 ),
                 redirect_stdout(StringIO()),
             ):
                 self.assertEqual(SITE_SYNC.main(), 0)
 
-            refresh.assert_called_once_with("https://example.com", verification_path)
+            refresh.assert_called_once_with(SITE_SYNC.SITES_PRODUCTION_URL, verification_path)
 
             state = json.loads(state_path.read_text(encoding="utf-8"))
 
@@ -790,6 +877,10 @@ class WorkspaceSyncTests(unittest.TestCase):
         self.assertNotIn("pending_report", state)
         self.assertNotIn("pending_date", state)
         self.assertEqual(state["last_deployment_verified_at"], verified_at)
+        self.assertEqual(state["last_deployment_published_commit"], "2" * 40)
+        self.assertEqual(state["last_deployment_artifact_sha256"], "3" * 64)
+        self.assertEqual(state["last_sites_version_id"], "version-27")
+        self.assertEqual(state["last_sites_deployment_id"], "deployment-27")
 
     def test_mark_deployed_rejects_missing_production_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -834,7 +925,7 @@ class WorkspaceSyncTests(unittest.TestCase):
                         "--mark-deployed",
                         content_hash,
                         "--deployment-url",
-                        "https://example.com",
+                        SITE_SYNC.SITES_PRODUCTION_URL,
                         "--verification-artifact",
                         str(Path(temporary) / "missing.json"),
                     ],
@@ -1800,6 +1891,7 @@ class WorkspaceSyncTests(unittest.TestCase):
                         "id": "ATLAS-IMP-NONBLOCKING",
                         "severity": "medium",
                         "status": "regressed",
+                        "summary": "External delivery receipt remains unavailable",
                     }
                 ],
                 "requires_acknowledgement": False,
@@ -1825,6 +1917,25 @@ class WorkspaceSyncTests(unittest.TestCase):
 
         self.assertTrue(result["ready"])
         self.assertEqual(result["reasons"], [])
+
+        artifacts["alerts"]["findings"][0]["severity"] = "critical"
+        blocked = SITE_SYNC._publication_snapshot_status_checks(
+            report_date,
+            artifacts=artifacts,
+        )
+        self.assertFalse(blocked["ready"])
+        self.assertIn(
+            "date-aligned alerts are missing or still require attention",
+            blocked["reasons"],
+        )
+
+        artifacts["alerts"]["findings"][0]["severity"] = "medium"
+        artifacts["alerts"]["finding_count"] = 2
+        malformed = SITE_SYNC._publication_snapshot_status_checks(
+            report_date,
+            artifacts=artifacts,
+        )
+        self.assertFalse(malformed["ready"])
 
     @requires_runtime_report("2026-07-12")
     def test_frozen_publication_snapshot_is_retry_stable_and_rejects_silent_report_drift(self) -> None:

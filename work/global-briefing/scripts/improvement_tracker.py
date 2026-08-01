@@ -29,6 +29,7 @@ OUTPUTS_ROOT = ROOT / "outputs"
 SITE_DATA = ROOT / "src" / "app" / "briefing.generated.json"
 CONFIG_PATH = BRIEFING_ROOT / "config" / "improvement_tracking.json"
 RUNTIME_ROOT = ROOT / "work" / "shared" / "atlas" / "improvements"
+_DISASTER_RECOVERY_MODULE: Any | None = None
 
 
 def utc_now() -> str:
@@ -44,6 +45,32 @@ def stable_hash(value: Any) -> str:
         separators=(",", ":"),
     )
     return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def stable_evaluation_value(value: Any) -> Any:
+    """Remove observation-clock noise while retaining decision semantics."""
+
+    if isinstance(value, dict):
+        normalized: dict[str, Any] = {}
+        for raw_key, item in value.items():
+            key = str(raw_key)
+            is_dynamic_age = key == "age_hours" or (
+                key.endswith("_age_hours")
+                and "maximum" not in key
+                and not key.startswith("max_")
+            )
+            if is_dynamic_age or key in {"observed_at", "evaluated_at", "checked_at"}:
+                continue
+            normalized[key] = stable_evaluation_value(item)
+        return normalized
+    if isinstance(value, list):
+        return [stable_evaluation_value(item) for item in value]
+    return value
+
+
+def evaluation_semantic_fingerprint(value: Evaluation | dict[str, Any]) -> str:
+    payload = asdict(value) if isinstance(value, Evaluation) else value
+    return stable_hash(stable_evaluation_value(payload))
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -104,6 +131,23 @@ def append_jsonl(path: Path, payload: Any) -> None:
         os.fsync(handle.fileno())
 
 
+def disaster_recovery_module() -> Any:
+    """Load the sibling verifier without trusting duplicate status parsing here."""
+
+    global _DISASTER_RECOVERY_MODULE
+    if _DISASTER_RECOVERY_MODULE is not None:
+        return _DISASTER_RECOVERY_MODULE
+    module_path = SCRIPT_PATH.with_name("disaster_recovery.py")
+    spec = importlib.util.spec_from_file_location("atlas_improvement_disaster_recovery", module_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("disaster-recovery verifier is unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    _DISASTER_RECOVERY_MODULE = module
+    return module
+
+
 def valid_date(value: str) -> str:
     try:
         canonical = Date.fromisoformat(value).isoformat()
@@ -146,6 +190,7 @@ class ImprovementTracker:
         self.briefing_root = root / "work" / "global-briefing"
         self.outputs_root = root / "outputs"
         self.site_data = root / "src" / "app" / "briefing.generated.json"
+        self.config_path = config_path
         self.config = read_json(config_path, {})
         if not isinstance(self.config, dict) or self.config.get("schema_version") != 1:
             raise ValueError(f"invalid improvement tracking config: {config_path}")
@@ -154,6 +199,15 @@ class ImprovementTracker:
         self.latest_path = runtime_root / "latest.json"
         self.latest_markdown_path = runtime_root / "LATEST_IMPROVEMENT_REPORT.md"
         self.audit_path = runtime_root / "audit.jsonl"
+
+    def verify_disaster_recovery_snapshot(self) -> dict[str, Any]:
+        verifier = disaster_recovery_module()
+        return verifier.verify_latest_snapshot(
+            root=self.root,
+            config_path=self.config_path,
+            latest_path=self.root / "work" / "shared" / "atlas" / "backups" / "latest.json",
+            quick=True,
+        )
 
     def retrospective_specs(self) -> list[ActionSpec]:
         evolution = read_json(self.briefing_root / "data" / "evolution_state.json", {})
@@ -621,6 +675,12 @@ class ImprovementTracker:
         if spec.acceptance_key == "disaster_recovery":
             config = self.config.get("disaster_recovery", {})
             manifest = read_json(self.root / "work" / "shared" / "atlas" / "backups" / "latest.json", {})
+            verification: dict[str, Any] | None = None
+            verification_error: str | None = None
+            try:
+                verification = self.verify_disaster_recovery_snapshot()
+            except (OSError, RuntimeError, ValueError) as exc:
+                verification_error = type(exc).__name__
             archive = Path(str(manifest.get("archive") or "")) if isinstance(manifest, dict) else Path()
             encryption = config.get("encryption", {}) if isinstance(config, dict) else {}
             encryption = encryption if isinstance(encryption, dict) else {}
@@ -642,14 +702,68 @@ class ImprovementTracker:
             age_hours: float | None = None
             try:
                 created = datetime.fromisoformat(str(manifest.get("created_at")).replace("Z", "+00:00"))
-                age_hours = max(0.0, (datetime.now(UTC) - created.astimezone(UTC)).total_seconds() / 3600)
+                if created.tzinfo is None:
+                    raise ValueError
+                candidate_age = (datetime.now(UTC) - created.astimezone(UTC)).total_seconds() / 3600
+                if candidate_age < 0:
+                    raise ValueError
+                age_hours = candidate_age
             except (TypeError, ValueError):
                 pass
-            maximum_age = float(config.get("maximum_backup_age_hours") or 24) if isinstance(config, dict) else 24
+            maximum_age = (
+                float(
+                    config.get("bootstrap_maximum_backup_age_hours")
+                    or config.get("maximum_backup_age_hours")
+                    or 24
+                )
+                if isinstance(config, dict)
+                else 24
+            )
+            snapshot_profile = manifest.get("snapshot_profile", "full")
+            full_snapshot = manifest.get("full_snapshot")
+            full_baseline_age_hours: float | None = None
+            maximum_full_age = float(
+                config.get("full_snapshot_maximum_age_hours") or maximum_age
+            )
+            if snapshot_profile == "daily" and isinstance(full_snapshot, dict):
+                try:
+                    full_created = datetime.fromisoformat(
+                        str(full_snapshot.get("created_at")).replace("Z", "+00:00")
+                    )
+                    if full_created.tzinfo is None:
+                        raise ValueError
+                    candidate_full_age = (
+                        datetime.now(UTC) - full_created.astimezone(UTC)
+                    ).total_seconds() / 3600
+                    if candidate_full_age < 0:
+                        raise ValueError
+                    full_baseline_age_hours = candidate_full_age
+                except (TypeError, ValueError):
+                    pass
+            full_baseline_valid = bool(
+                snapshot_profile == "full"
+                or (
+                    snapshot_profile == "daily"
+                    and isinstance(verification, dict)
+                    and verification.get("full_baseline_authenticated") is True
+                    and full_baseline_age_hours is not None
+                    and full_baseline_age_hours <= maximum_full_age
+                )
+            )
+            cryptographically_verified = bool(
+                isinstance(verification, dict)
+                and verification.get("verified") is True
+                and verification.get("archive_integrity_verified") is True
+                and verification.get("restore_verified") is True
+                and verification.get("verification_mode") == "authenticated_archive"
+                and verification.get("archive_sha256") == manifest.get("archive_sha256")
+                and verification.get("snapshot_profile") == snapshot_profile
+            )
             passed = bool(
                 isinstance(config, dict)
                 and isinstance(manifest, dict)
                 and config.get("enabled") is True
+                and cryptographically_verified
                 and encryption_verified
                 and manifest.get("archive_integrity_verified") is True
                 and manifest.get("restore_verified") is True
@@ -658,6 +772,7 @@ class ImprovementTracker:
                 and outside_workspace
                 and age_hours is not None
                 and age_hours <= maximum_age
+                and full_baseline_valid
             )
             return Evaluation(
                 "pass" if passed else "fail",
@@ -677,6 +792,17 @@ class ImprovementTracker:
                     "restore_verified": manifest.get("restore_verified"),
                     "restore_scope": manifest.get("restore_scope"),
                     "full_runtime_restore_verified": manifest.get("full_runtime_restore_verified"),
+                    "snapshot_profile": snapshot_profile,
+                    "full_baseline_valid": full_baseline_valid,
+                    "full_baseline_age_hours": full_baseline_age_hours,
+                    "maximum_full_baseline_age_hours": maximum_full_age,
+                    "cryptographically_verified": cryptographically_verified,
+                    "verification_error": verification_error,
+                    "verification_mode": (
+                        verification.get("verification_mode")
+                        if isinstance(verification, dict)
+                        else None
+                    ),
                 },
             )
         return Evaluation("manual", "需要人工提供执行证据")
@@ -735,17 +861,78 @@ class ImprovementTracker:
             else:
                 action["spec"] = asdict(spec)
 
+            last_checked_date = action.get("last_checked_date")
+            if isinstance(last_checked_date, str) and date < last_checked_date:
+                raise ValueError(
+                    f"action {action_id} cannot be evaluated earlier than its last check "
+                    f"({date} < {last_checked_date})"
+                )
+
             evaluation = self.evaluate(spec, action, date)
-            if evaluation.outcome == "fail" and apply_safe and spec.auto_fixer and spec.risk in set(self.config.get("auto_fix_risks", [])):
+            previous_evaluation = action.get("last_evaluation")
+            previous_fingerprint = action.get("last_evaluation_fingerprint")
+            if not isinstance(previous_fingerprint, str) and isinstance(previous_evaluation, dict):
+                previous_fingerprint = evaluation_semantic_fingerprint(previous_evaluation)
+            evaluation_fingerprint = evaluation_semantic_fingerprint(evaluation)
+            fixer_idempotency_key = stable_hash(
+                {
+                    "action_id": action_id,
+                    "date": date,
+                    "evaluation_fingerprint": evaluation_fingerprint,
+                    "fixer": spec.auto_fixer,
+                }
+            )
+            last_fixer_attempt = action.get("last_fixer_attempt")
+            fixer_already_attempted = bool(
+                isinstance(last_fixer_attempt, dict)
+                and last_fixer_attempt.get("idempotency_key") == fixer_idempotency_key
+            )
+            if (
+                evaluation.outcome == "fail"
+                and apply_safe
+                and spec.auto_fixer
+                and spec.risk in set(self.config.get("auto_fix_risks", []))
+                and not fixer_already_attempted
+            ):
                 fixed, detail = self.apply_fixer(spec, date)
-                repairs.append({"action_id": action_id, "fixer": spec.auto_fixer, "applied": fixed, "detail": detail})
+                repair = {
+                    "action_id": action_id,
+                    "fixer": spec.auto_fixer,
+                    "applied": fixed,
+                    "detail": detail,
+                    "idempotency_key": fixer_idempotency_key,
+                }
+                repairs.append(repair)
+                action["last_fixer_attempt"] = {
+                    **repair,
+                    "attempted_at": now,
+                    "date": date,
+                }
                 if fixed:
                     evaluation = self.evaluate(spec, action, date)
+                    evaluation_fingerprint = evaluation_semantic_fingerprint(evaluation)
+
+            evaluation_payload = asdict(evaluation)
+            if (
+                action.get("last_checked_date") == date
+                and previous_fingerprint == evaluation_fingerprint
+            ):
+                action["last_checked_at"] = now
+                action["last_evaluation"] = evaluation_payload
+                action["last_evaluation_fingerprint"] = evaluation_fingerprint
+                continue
 
             previous_status = str(action.get("status") or "open")
+            overdue_now = date > str(action.get("due_date") or date)
             if evaluation.outcome == "pass":
                 action["status"] = "verified"
                 action["verified_at"] = now
+            elif previous_status in {"verified", "regressed"}:
+                action["occurrences"] = int(action.get("occurrences", 0)) + 1
+                action["status"] = "regressed"
+            elif overdue_now:
+                action["occurrences"] = int(action.get("occurrences", 0)) + 1
+                action["status"] = "overdue"
             elif evaluation.outcome in {"not_due", "manual"}:
                 action["status"] = "monitoring" if evaluation.outcome == "not_due" else "requires_evidence"
             else:
@@ -759,7 +946,8 @@ class ImprovementTracker:
                 )
             action["last_checked_date"] = date
             action["last_checked_at"] = now
-            action["last_evaluation"] = asdict(evaluation)
+            action["last_evaluation"] = evaluation_payload
+            action["last_evaluation_fingerprint"] = evaluation_fingerprint
             history = action.setdefault("verification_history", [])
             history.append({"date": date, "checked_at": now, **asdict(evaluation), "status_after": action["status"]})
             action["verification_history"] = history[-30:]

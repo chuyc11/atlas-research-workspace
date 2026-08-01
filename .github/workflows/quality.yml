@@ -39,7 +39,12 @@ jobs:
         run: bandit -q -r atlas.py work/global-briefing/scripts -ll
       - name: Detect committed secrets
         shell: bash
-        run: git ls-files -z | grep -zv '^skills-lock.json$' | xargs -0 detect-secrets-hook
+        run: |
+          git ls-files -z | grep -zv '^skills-lock.json$' | xargs -0 detect-secrets-hook
+          detect-secrets-hook \
+            --disable-plugin HexHighEntropyString \
+            --disable-plugin Base64HighEntropyString \
+            skills-lock.json
       - name: Audit Python dependency manifests
         run: |
           pip-audit --strict -r requirements-dev.lock --progress-spinner off
@@ -48,12 +53,16 @@ jobs:
         run: python -m pytest --cov=atlas --cov=work/global-briefing/scripts --cov-report=term-missing --cov-fail-under=60 -q
       - name: Verify package entry point
         run: |
-          python -m pip install -e . --no-deps
-          atlas --help
+          python -m pip wheel --no-deps --wheel-dir dist .
+          python -m venv "${RUNNER_TEMP}/atlas-wheel"
+          "${RUNNER_TEMP}/atlas-wheel/bin/python" -m pip install --no-deps dist/*.whl
+          cd "${RUNNER_TEMP}"
+          "${RUNNER_TEMP}/atlas-wheel/bin/python" -c "import atlas; assert 'site-packages' in atlas.__file__; print(atlas.__file__)"
+          "${RUNNER_TEMP}/atlas-wheel/bin/atlas" --help
 
   composed-workspace:
     runs-on: ubuntu-latest
-    timeout-minutes: 35
+    timeout-minutes: 60
     steps:
       - name: Require private submodule credential
         shell: bash
@@ -93,4 +102,102 @@ jobs:
           git submodule status --recursive
           python -m unittest -v tests.test_repository_layout
       - name: Run cross-repository integration gate
-        run: python atlas.py test
+        run: python atlas.py test --full
+      - name: Run exact trading-core security evidence gate
+        working-directory: work/trading-core
+        run: python -m trading_core.security.v36_evidence
+      - name: Verify the exact trading-core gitlink as a clean wheel
+        shell: bash
+        run: |
+          wheel_dir="${RUNNER_TEMP}/trading-wheel-dist"
+          wheel_env="${RUNNER_TEMP}/trading-wheel"
+          python -m pip wheel --no-deps --wheel-dir "${wheel_dir}" work/trading-core
+          python -m venv "${wheel_env}"
+          "${wheel_env}/bin/python" -m pip install "${wheel_dir}"/*.whl
+          "${wheel_env}/bin/trading-core" --version
+          workspace="${RUNNER_TEMP}/trading-wheel-workspace"
+          mkdir -p "${workspace}/work/global-briefing/data"
+          : > "${workspace}/work/global-briefing/data/macro_signals-2026-08-01.jsonl"
+          "${wheel_env}/bin/trading-core" load-macro \
+            --workspace-root "${workspace}" \
+            --date 2026-08-01 \
+            --dry-run \
+            --allow-empty
+          ATLAS_WHEEL_ENV="${wheel_env}" "${wheel_env}/bin/python" - <<'PY'
+          from pathlib import Path
+          import os
+          import pandas as pd
+          from trading_core.config_loader import load_all_configs
+
+          assert len(load_all_configs()) == 8
+          target = Path(os.environ["ATLAS_WHEEL_ENV"]) / "roundtrip.parquet"
+          expected = pd.DataFrame({"symbol": ["510300.SH"], "close": [4.2]})
+          expected.to_parquet(target, index=False)
+          assert pd.read_parquet(target).to_dict("records") == expected.to_dict("records")
+          PY
+  release-evidence:
+    needs: [briefing-control-plane, composed-workspace]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - name: Build commit-bound full-suite evidence
+        shell: bash
+        env:
+          ATLAS_REPOSITORY: ${{ github.repository }}
+          ATLAS_RUN_ID: ${{ github.run_id }}
+          ATLAS_RUN_ATTEMPT: ${{ github.run_attempt }}
+          ATLAS_SOURCE_REF: ${{ github.ref }}
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import subprocess
+          from pathlib import Path
+
+          def output(*command: str) -> str:
+              return subprocess.check_output(command, text=True, encoding="utf-8").strip()
+
+          def gitlink(path: str) -> str:
+              parts = output("git", "ls-tree", "HEAD", "--", path).split()
+              if len(parts) < 3 or parts[1] != "commit":
+                  raise SystemExit(f"missing gitlink: {path}")
+              return parts[2]
+
+          payload = {
+              "schema_version": 1,
+              "provider": "github-actions",
+              "repository": os.environ["ATLAS_REPOSITORY"],
+              "workflow": ".github/workflows/quality.yml",
+              "source_ref": os.environ["ATLAS_SOURCE_REF"],
+              "run_id": os.environ["ATLAS_RUN_ID"],
+              "run_attempt": os.environ["ATLAS_RUN_ATTEMPT"],
+              "test_profile": "full",
+              "required_jobs": ["briefing-control-plane", "composed-workspace"],
+              "repository_commits": {
+                  "root": output("git", "rev-parse", "HEAD"),
+                  "site": gitlink("src"),
+                  "trading-core": gitlink("work/trading-core"),
+              },
+          }
+          Path("atlas-release-evidence.json").write_text(
+              json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n",
+              encoding="utf-8",
+          )
+          PY
+      - name: Create Sigstore build provenance
+        id: attest
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4
+        with:
+          subject-path: atlas-release-evidence.json
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: atlas-release-evidence
+          path: atlas-release-evidence.json

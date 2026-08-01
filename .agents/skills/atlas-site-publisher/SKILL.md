@@ -46,13 +46,13 @@ Install from the existing lockfile only when dependencies are absent. Set `WRANG
 
 ## Deploy and Verify
 
-Package the exact successful build, save one Sites version, deploy it to the existing project, and poll to a terminal state. Do not create a new Sites project.
+Package the exact successful build, save one Sites version, deploy it to the existing project, and poll to a terminal state. Do not create a new Sites project. Persist a credential-free `DEPLOYMENT_RECEIPT` JSON outside the isolated worktree with schema version 1, status `succeeded`, UTC `created_at`, the existing project ID, production URL, fetched Sites-main base commit, pushed commit, exact package SHA-256 and byte size, Sites version ID, Sites deployment ID, frozen publication-manifest SHA-256, and pending content hash. Values must come from the build and hosting tool results; never invent them. This caller-produced receipt is audit metadata, not cryptographic provider proof; only the fresh fixed-origin live verifier authorizes the deployed marker.
 
 After a successful deployment, run the independent live verifier. Mark deployed only with its fresh passing artifact:
 
 ```powershell
 python work\global-briefing\scripts\verify_production_site.py --url PRODUCTION_URL --output VERIFICATION_ARTIFACT
-python work\global-briefing\scripts\sync_briefing_site.py --mark-deployed PENDING_SHA --deployment-url PRODUCTION_URL --verification-artifact VERIFICATION_ARTIFACT
+python work\global-briefing\scripts\sync_briefing_site.py --mark-deployed PENDING_SHA --deployment-url PRODUCTION_URL --verification-artifact VERIFICATION_ARTIFACT --deployment-receipt DEPLOYMENT_RECEIPT
 ```
 
 If build, tests, push, version save, deployment, polling, or live verification fails, do not mark deployed. Keep the pending candidate for an idempotent retry.
@@ -62,6 +62,8 @@ If build, tests, push, version save, deployment, polling, or live verification f
 - Never copy the whole dirty `src` tree.
 - Never expose a credential in output, Git config, a remote URL, or durable logs.
 - Never mark deployed from user-supplied or stale verification JSON.
+- Never mark deployed without exact-schema credential-free publisher metadata; do not describe it as provider-authenticated proof.
+- Treat the fresh verifier against the fixed production origin as deployment authority.
 - Never let site publication change research, prediction, or paper-trading artifacts.
 - Verify the resolved temporary path is under the system temporary root before cleanup.
 - Stop and disclose any disagreement between control-plane and site publication gates; never choose the more permissive result merely to deploy.

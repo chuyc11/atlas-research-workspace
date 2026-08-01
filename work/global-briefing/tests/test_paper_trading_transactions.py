@@ -424,6 +424,28 @@ class PaperTradingTransactionTests(unittest.TestCase):
                 self.fail("incomplete lock was stolen")
         self.assertTrue(path.exists())
 
+    def test_os_guard_blocks_takeover_even_when_metadata_owner_looks_dead(self) -> None:
+        config = MODULE.account_config(self.config, "US")
+        path = MODULE.lock_path(config)
+        path.write_text(
+            json.dumps(
+                {
+                    "pid": 2147483647,
+                    "hostname": socket.gethostname(),
+                    "created_at": "2000-01-01T00:00:00",
+                    "token": "dead-looking-owner",
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        with mock.patch.object(MODULE, "acquire_account_lock_guard", return_value=None):
+            with self.assertRaisesRegex(RuntimeError, "is locked"):
+                with MODULE.account_lock(config):
+                    self.fail("contending process must not steal an OS-held account lock")
+
+        self.assertEqual(json.loads(path.read_text(encoding="utf-8"))["token"], "dead-looking-owner")
+
     def test_pending_orders_count_toward_batch_turnover_limit(self) -> None:
         path = self.write_orders([
             self.order("ORDER-A", symbol="AAA", notional=10000.0),
@@ -1345,6 +1367,299 @@ class PaperTradingTransactionTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "Order price.*stale.*business_day_age=1"):
             MODULE.apply_orders(self.write_orders([stale]), "2026-07-13", account="US")
+
+    def enable_strategy_control_contract(self, *, maximum_adds: int = 2) -> None:
+        self.config["max_position_pct"] = 1.0
+        self.config["max_daily_turnover_pct"] = 1.0
+        self.config["min_cash_pct"] = 0.0
+        self.config["order_contract"] = {
+            "strategy_controls_required_from_date": "2026-08-02",
+        }
+        self.config["strategy_profile"] = {
+            "enabled": True,
+            "target_invested_pct": {"minimum": 0.0, "preferred": 0.5, "maximum": 1.0},
+            "target_cash_pct": {"hard_minimum": 0.0, "preferred_minimum": 0.1, "preferred_maximum": 0.5},
+            "position_sizing": {"maximum_adds_per_position": maximum_adds},
+            "signal_score": {
+                "exit_threshold": 38,
+                "reduce_threshold": 48,
+                "buy_threshold": 70,
+                "add_threshold": 82,
+                "components": {"evidence": 25, "trend": 25, "breadth": 20, "catalyst": 15, "liquidity": 15},
+            },
+            "decision_policy": {
+                "maximum_actions_per_account_per_day": 20,
+                "hold_requires_explicit_blocker": False,
+            },
+            "risk_overlays": {
+                "daily_loss_circuit_breaker_pct": 0.04,
+                "portfolio_drawdown_derisk_pct": 0.08,
+                "thesis_failure_requires_reduce_or_exit": True,
+                "no_averaging_down_without_new_confirming_evidence": True,
+            },
+        }
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+
+    @staticmethod
+    def strategy_context(
+        *,
+        score: float,
+        intent: str,
+        thesis_status: str = "intact",
+        daily_return_pct: float = 0.0,
+        drawdown_pct: float = 0.0,
+        confirming_evidence: list[dict] | None = None,
+    ) -> dict:
+        return {
+            "schema_version": 1,
+            "signal_score": score,
+            "intent": intent,
+            "thesis_status": thesis_status,
+            "account_risk": {
+                "as_of_date": "2026-08-02",
+                "daily_return_pct": daily_return_pct,
+                "portfolio_drawdown_pct": drawdown_pct,
+            },
+            "confirming_evidence": confirming_evidence or [],
+        }
+
+    def test_strategy_control_contract_is_forward_only_and_buy_fails_closed(self) -> None:
+        self.enable_strategy_control_contract()
+        legacy = self.order("LEGACY-BUY", symbol="LEGACY", notional=1000)
+        applied = MODULE.apply_orders(self.write_orders([legacy]), "2026-08-01", account="US")
+        self.assertEqual(applied[0]["action"], "BUY")
+
+        missing = self.order("MISSING-STRATEGY", symbol="MISSING", notional=1000)
+        with self.assertRaisesRegex(ValueError, "strategy_context"):
+            MODULE.apply_orders(self.write_orders([missing]), "2026-08-02", account="US")
+
+        low_signal = self.order("LOW-SIGNAL", symbol="LOW", notional=1000)
+        low_signal["strategy_context"] = self.strategy_context(score=69, intent="OPEN")
+        with self.assertRaisesRegex(ValueError, "buy threshold"):
+            MODULE.apply_orders(self.write_orders([low_signal]), "2026-08-02", account="US")
+
+        qualified = self.order("QUALIFIED", symbol="QUAL", notional=1000)
+        qualified["strategy_context"] = self.strategy_context(score=70, intent="OPEN")
+        applied = MODULE.apply_orders(self.write_orders([qualified]), "2026-08-02", account="US")
+        self.assertEqual(applied[0]["strategy_context"]["signal_score"], 70)
+        self.assertEqual(applied[0]["strategy_context"]["intent"], "OPEN")
+        self.assertEqual(
+            applied[0]["strategy_context"]["canonical_account_risk"]["calculation"],
+            "canonical_valuation_ledger_and_locked_portfolio_state",
+        )
+
+    def test_strategy_add_threshold_count_and_averaging_down_evidence_are_enforced(self) -> None:
+        self.enable_strategy_control_contract(maximum_adds=1)
+        opened = self.order("OPEN", notional=1000)
+        opened["strategy_context"] = self.strategy_context(score=75, intent="OPEN")
+        MODULE.apply_orders(self.write_orders([opened]), "2026-08-02", account="US")
+
+        weak_add = self.order("WEAK-ADD", notional=1000)
+        weak_add["price"] = 110
+        weak_add["strategy_context"] = self.strategy_context(score=81, intent="ADD")
+        with self.assertRaisesRegex(ValueError, "add threshold"):
+            MODULE.apply_orders(self.write_orders([weak_add]), "2026-08-02", account="US")
+
+        averaging_down = self.order("AVERAGE-DOWN", notional=1000)
+        averaging_down["price"] = 90
+        averaging_down["strategy_context"] = self.strategy_context(score=90, intent="ADD")
+        with self.assertRaisesRegex(ValueError, "confirming evidence"):
+            MODULE.apply_orders(self.write_orders([averaging_down]), "2026-08-02", account="US")
+
+        averaging_down["strategy_context"]["confirming_evidence"] = [{
+            "source": "https://example.test/primary",
+            "as_of_date": "2026-08-02",
+            "summary": "New independently dated primary evidence confirms the thesis.",
+        }]
+        MODULE.apply_orders(self.write_orders([averaging_down]), "2026-08-02", account="US")
+
+        excess_add = self.order("EXCESS-ADD", notional=1000)
+        excess_add["price"] = 110
+        excess_add["strategy_context"] = self.strategy_context(score=90, intent="ADD")
+        with self.assertRaisesRegex(ValueError, "maximum adds"):
+            MODULE.apply_orders(self.write_orders([excess_add]), "2026-08-02", account="US")
+
+    def test_strategy_loss_drawdown_and_failed_thesis_block_buy_only(self) -> None:
+        self.enable_strategy_control_contract()
+        cases = [
+            ("DAILY-LOSS", self.strategy_context(score=90, intent="OPEN", daily_return_pct=-0.04), "daily loss circuit breaker"),
+            ("DRAWDOWN", self.strategy_context(score=90, intent="OPEN", drawdown_pct=0.08), "drawdown derisk"),
+            ("FAILED-THESIS", self.strategy_context(score=90, intent="OPEN", thesis_status="failed"), "thesis failure"),
+        ]
+        for order_id, context, message in cases:
+            order = self.order(order_id, symbol=order_id, notional=1000)
+            order["strategy_context"] = context
+            with self.subTest(order_id=order_id), self.assertRaisesRegex(ValueError, message):
+                MODULE.apply_orders(self.write_orders([order]), "2026-08-02", account="US")
+
+        legacy_open = self.order("RISK-REDUCTION-SEED", symbol="SEED", notional=1000)
+        MODULE.apply_orders(self.write_orders([legacy_open]), "2026-08-01", account="US")
+        sell = self.order("RISK-REDUCTION-SELL", symbol="SEED", notional=500)
+        sell.update({"action": "SELL", "quantity": 5, "notional": None})
+        sold = MODULE.apply_orders(self.write_orders([sell]), "2026-08-02", account="US")
+        self.assertEqual(sold[0]["action"], "SELL")
+        hold = self.order("RISK-REDUCTION-HOLD", symbol="SEED", notional=0)
+        hold.update({"action": "HOLD", "notional": None})
+        held = MODULE.apply_orders(self.write_orders([hold]), "2026-08-02", account="US")
+        self.assertEqual(held[0]["action"], "HOLD")
+
+    def test_strategy_risk_cannot_understate_canonical_valuation_loss(self) -> None:
+        self.enable_strategy_control_contract()
+        state = MODULE.load_state("US")
+        state["cash"] = 95000.0
+        MODULE.atomic_write_json(self.root / "data" / "portfolio.json", state)
+        MODULE.atomic_write_text(
+            self.root / "data" / "valuations.jsonl",
+            "\n".join([
+                json.dumps({"date": "2026-07-31", "equity": 100000.0, "valuation_id": "V1"}),
+                json.dumps({"date": "2026-08-01", "equity": 95000.0, "valuation_id": "V2"}),
+            ]) + "\n",
+        )
+        understated = self.order("UNDERSTATED-RISK", notional=1000)
+        understated["strategy_context"] = self.strategy_context(
+            score=90,
+            intent="OPEN",
+            daily_return_pct=0.0,
+            drawdown_pct=0.0,
+        )
+        with self.assertRaisesRegex(ValueError, "daily loss circuit breaker"):
+            MODULE.apply_orders(self.write_orders([understated]), "2026-08-02", account="US")
+
+    def write_market_calendar_contracts(self) -> None:
+        calendar_dir = self.root / "calendar"
+        calendar_dir.mkdir(parents=True, exist_ok=True)
+        (calendar_dir / "us.json").write_text(json.dumps({
+            "schema_version": 1,
+            "market": "US",
+            "coverage_start": "2026-01-01",
+            "coverage_end": "2026-12-31",
+            "closed_dates": ["2026-07-03"],
+        }), encoding="utf-8")
+        (calendar_dir / "exchange-contract.json").write_text(json.dumps({
+            "calendar_version": "test-v1",
+            "explicit_holiday_list": {
+                "SSE": ["2026-05-01", "2026-05-04", "2026-05-05"],
+                "SZSE": ["2026-05-01", "2026-05-04", "2026-05-05"],
+                "BSE": ["2026-05-01", "2026-05-04", "2026-05-05"],
+                "HKEX": ["2026-07-01"],
+            },
+            "coverage": {
+                exchange: {"start": "2026-01-01", "end": "2026-12-31"}
+                for exchange in ("SSE", "SZSE", "BSE", "HKEX")
+            },
+        }), encoding="utf-8")
+        (calendar_dir / "sessions.json").write_text("[]", encoding="utf-8")
+        self.config["market_calendar"] = {
+            "a_share_sessions_file": "calendar/sessions.json",
+            "exchange_holiday_contract_file": "calendar/exchange-contract.json",
+            "us_calendar_file": "calendar/us.json",
+        }
+
+    def test_session_age_uses_each_exchange_calendar_and_missing_calendar_fails_closed(self) -> None:
+        self.write_market_calendar_contracts()
+        self.assertEqual(MODULE.market_session_age(
+            "2026-07-02", "2026-07-06", market_type="US", exchange="NASDAQ", config=self.config
+        ), 1)
+        self.assertEqual(MODULE.market_session_age(
+            "2026-04-30", "2026-05-06", market_type="A_SHARE", exchange="SH", config=self.config
+        ), 1)
+        self.assertEqual(MODULE.market_session_age(
+            "2026-06-30", "2026-07-02", market_type="HK", exchange="HK", config=self.config
+        ), 1)
+        self.assertEqual(MODULE.market_session_age(
+            "2026-07-31", "2026-08-02", market_type="US", exchange="NASDAQ", config=self.config
+        ), 0)
+
+        (self.root / "calendar" / "us.json").unlink()
+        with self.assertRaisesRegex(ValueError, "market calendar.*unavailable"):
+            MODULE.market_session_age(
+                "2026-07-31", "2026-08-03", market_type="US", exchange="NASDAQ", config=self.config
+            )
+
+    def test_order_staleness_uses_session_age_after_calendar_contract_date(self) -> None:
+        self.write_market_calendar_contracts()
+        self.config["order_contract"] = {
+            "max_price_age_business_days": 1,
+            "session_calendar_required_from_date": "2026-07-01",
+        }
+        MODULE.CONFIG_PATH.write_text(json.dumps(self.config), encoding="utf-8")
+        holiday_spanning = self.order("HOLIDAY-SPAN")
+        holiday_spanning["price_date"] = "2026-07-02"
+        applied = MODULE.apply_orders(self.write_orders([holiday_spanning]), "2026-07-06", account="US")
+        self.assertEqual(applied[0]["price_date"], "2026-07-02")
+
+    def test_valuation_staleness_uses_session_age_after_calendar_contract_date(self) -> None:
+        self.write_market_calendar_contracts()
+        state = {
+            "positions": {
+                "NASDAQ:AAA": {
+                    "symbol": "AAA",
+                    "exchange": "NASDAQ",
+                    "market_type": "US",
+                    "quantity": 10,
+                    "avg_cost": 100,
+                }
+            },
+            "last_prices": {
+                "NASDAQ:AAA": {
+                    "symbol": "AAA",
+                    "exchange": "NASDAQ",
+                    "market_type": "US",
+                    "price": 100,
+                    "price_date": "2026-07-02",
+                }
+            },
+        }
+        issues = MODULE.valuation_price_issues(
+            state,
+            "2026-07-06",
+            maximum_age_business_days=1,
+            config=self.config,
+            session_calendar_required_from_date="2026-07-01",
+        )
+        self.assertEqual(issues, [])
+
+        issues = MODULE.valuation_price_issues(
+            state,
+            "2026-07-07",
+            maximum_age_business_days=1,
+            config=self.config,
+            session_calendar_required_from_date="2026-07-01",
+        )
+        self.assertEqual(issues[0]["session_age"], 2)
+
+    def test_a_share_price_limit_categories_and_previous_close_contract(self) -> None:
+        rules = {
+            "default_price_limit_pct": 0.1,
+            "star_market_price_limit_pct": 0.2,
+            "chinext_price_limit_pct": 0.2,
+            "beijing_price_limit_pct": 0.3,
+            "st_price_limit_pct": 0.05,
+        }
+        self.assertEqual(MODULE.price_limit_for_symbol("920001.BJ", {"exchange": "BJ"}, rules), 0.3)
+        self.assertEqual(MODULE.price_limit_for_symbol("*ST TEST.SH", {"name": "*ST测试"}, rules), 0.05)
+        self.assertEqual(MODULE.price_limit_for_symbol("688001.SH", {}, rules), 0.2)
+        self.assertEqual(MODULE.price_limit_for_symbol("301001.SZ", {}, rules), 0.2)
+
+        contract = {"a_share_previous_close_required_from_date": "2026-08-02"}
+        with self.assertRaisesRegex(ValueError, "requires previous_close"):
+            MODULE.validate_price_limit(
+                "600000.SH", 10.0, {}, "A_SHARE", rules,
+                decision_date="2026-08-02", contract=contract,
+            )
+        MODULE.validate_price_limit(
+            "600000.SH", 10.0, {}, "A_SHARE", rules,
+            decision_date="2026-08-01", contract=contract,
+        )
+        MODULE.validate_price_limit(
+            "920001.BJ", 130.0, {"exchange": "BJ", "previous_close": 100}, "A_SHARE", rules,
+            decision_date="2026-08-02", contract=contract,
+        )
+        with self.assertRaisesRegex(ValueError, "breaches configured price limit"):
+            MODULE.validate_price_limit(
+                "920001.BJ", 130.01, {"exchange": "BJ", "previous_close": 100}, "A_SHARE", rules,
+                decision_date="2026-08-02", contract=contract,
+            )
 
 
 if __name__ == "__main__":

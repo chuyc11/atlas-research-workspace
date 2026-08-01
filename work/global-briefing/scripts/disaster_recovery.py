@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import base64
 import contextlib
+import errno
 import fnmatch
 import hashlib
 import hmac
@@ -13,12 +14,14 @@ import json
 import os
 import re
 import shutil
+import socket
 import stat
 import struct
 import subprocess
 import tempfile
 import time
 import unicodedata
+import uuid
 import zipfile
 from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
@@ -32,6 +35,7 @@ SCRIPT_PATH = Path(__file__).resolve()
 ROOT = SCRIPT_PATH.parents[3]
 CONFIG_PATH = ROOT / "work" / "global-briefing" / "config" / "improvement_tracking.json"
 LATEST_PATH = ROOT / "work" / "shared" / "atlas" / "backups" / "latest.json"
+FULL_LATEST_PATH = ROOT / "work" / "shared" / "atlas" / "backups" / "full-latest.json"
 DEFAULT_INCLUDES = (
     ".github",
     "atlas.py",
@@ -147,7 +151,22 @@ MANIFEST_REQUIRED_KEYS = {
     "previous_manifest_sha256",
     "files",
 }
-MANIFEST_OPTIONAL_KEYS = {"legacy_migration_genesis", "metadata_authentication"}
+MANIFEST_OPTIONAL_KEYS = {
+    "full_snapshot",
+    "legacy_migration_genesis",
+    "metadata_authentication",
+    "previous_head_sha256",
+    "revision",
+    "snapshot_profile",
+    "workspace_uuid",
+}
+FULL_SNAPSHOT_REFERENCE_KEYS = {
+    "archive_sha256",
+    "created_at",
+    "date",
+    "manifest_sha256",
+    "restore_verified",
+}
 LEGACY_MIGRATION_KEYS = {
     "reason",
     "legacy_schema_version",
@@ -354,6 +373,299 @@ def atomic_text(path: Path, value: str, *, encoding: str = "utf-8") -> None:
     atomic_bytes(path, value.encode(encoding))
 
 
+def backup_lock_metadata_path(target: Path) -> Path:
+    return target / "atlas-backup.lock"
+
+
+def backup_lock_guard_path(target: Path) -> Path:
+    return target / "atlas-backup.lock.guard"
+
+
+def _lock_contention(exc: OSError) -> bool:
+    return exc.errno in {errno.EACCES, errno.EAGAIN} or getattr(exc, "winerror", None) in {
+        32,
+        33,
+    }
+
+
+def acquire_backup_lock_guard(path: Path) -> int | None:
+    """Acquire the OS-held disaster-recovery writer lock."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_BINARY"):
+        flags |= os.O_BINARY
+    descriptor = os.open(path, flags, 0o600)
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            if os.fstat(descriptor).st_size == 0:
+                os.write(descriptor, b"\0")
+                os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        os.close(descriptor)
+        if _lock_contention(exc):
+            return None
+        raise RuntimeError(f"unable to acquire disaster-recovery OS lock: {path}") from exc
+    return descriptor
+
+
+def release_backup_lock_guard(descriptor: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            msvcrt.locking(descriptor, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+    finally:
+        os.close(descriptor)
+
+
+@contextlib.contextmanager
+def disaster_recovery_lock(target: Path) -> Iterator[None]:
+    """Serialize snapshot creation without stale-file unlink races."""
+
+    target.mkdir(parents=True, exist_ok=True)
+    metadata_path = backup_lock_metadata_path(target)
+    descriptor = acquire_backup_lock_guard(backup_lock_guard_path(target))
+    if descriptor is None:
+        raise RuntimeError("disaster-recovery snapshot creation is already running")
+    token = hashlib.sha256(os.urandom(32)).hexdigest()
+    payload = {
+        "pid": os.getpid(),
+        "hostname": socket.gethostname(),
+        "created_at": utc_now(),
+        "token": token,
+    }
+    try:
+        atomic_json(metadata_path, payload)
+        yield
+    finally:
+        try:
+            current = read_json(metadata_path) if metadata_path.exists() else {}
+        except (OSError, ValueError):
+            current = {}
+        if current.get("token") == token:
+            metadata_path.unlink(missing_ok=True)
+        release_backup_lock_guard(descriptor)
+
+
+DR_HEAD_SCHEMA_VERSION = 1
+TRUST_ANCHOR_ROOT_ENV = "ATLAS_TRUST_ANCHOR_ROOT"
+TRUST_ANCHOR_NAMESPACE_ENV = "ATLAS_TRUST_ANCHOR_NAMESPACE"
+
+
+def dr_integrity_enabled(root: Path) -> bool:
+    """Production checkouts require a local independent monotonic DR head."""
+
+    return (root / "atlas.py").is_file()
+
+
+def configured_environment_value(name: str) -> str | None:
+    if name in os.environ:
+        return os.environ.get(name)
+    return persistent_user_environment_value(name)
+
+
+def dr_workspace_uuid(root: Path) -> str:
+    namespace = str(configured_environment_value(TRUST_ANCHOR_NAMESPACE_ENV) or "").strip()
+    identity = f"{namespace}:{str(root.resolve()).casefold()}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"atlas-workspace:{identity}"))
+
+
+def dr_trust_root(root: Path) -> Path:
+    configured = configured_environment_value(TRUST_ANCHOR_ROOT_ENV)
+    candidate = Path(configured).expanduser() if configured else Path.home() / ".atlas-trust"
+    resolved = candidate.resolve()
+    try:
+        resolved.relative_to(root.resolve())
+    except ValueError:
+        return resolved
+    raise ValueError("disaster-recovery trust root must be outside the workspace")
+
+
+def dr_head_path(root: Path, snapshot_profile: str) -> Path:
+    return dr_trust_root(root) / "dr-heads" / (
+        f"{dr_workspace_uuid(root)}-{snapshot_profile}.json"
+    )
+
+
+def dr_head_versions_path(path: Path) -> Path:
+    return path.with_name(f"{path.name}.versions")
+
+
+def dr_head_hash(payload: dict[str, Any]) -> str:
+    unsigned = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"head_sha256", "metadata_authentication"}
+    }
+    return stable_json_sha256(unsigned)
+
+
+def dr_latest_binding(latest: dict[str, Any]) -> str:
+    return stable_json_sha256(
+        {
+            key: latest.get(key)
+            for key in (
+                "archive_sha256",
+                "created_at",
+                "date",
+                "manifest_sha256",
+                "previous_head_sha256",
+                "previous_manifest_sha256",
+                "revision",
+                "snapshot_profile",
+                "workspace_uuid",
+            )
+        }
+    )
+
+
+def verify_dr_integrity_head(
+    latest: dict[str, Any],
+    *,
+    root: Path,
+    snapshot_profile: str,
+    encryption_key: bytes | None,
+) -> dict[str, Any] | None:
+    """Authenticate the external high-water mark and exact latest binding."""
+
+    if not dr_integrity_enabled(root):
+        return None
+    if encryption_key is None:
+        raise ValueError("disaster-recovery monotonic head requires an encryption key")
+    path = dr_head_path(root, snapshot_profile)
+    if not path.is_file():
+        if latest.get("workspace_uuid") is not None:
+            raise ValueError("disaster-recovery monotonic head is missing")
+        return None
+    head = read_json(path)
+    authenticate_metadata(head, encryption_key, "dr-monotonic-head")
+    if head.get("schema_version") != DR_HEAD_SCHEMA_VERSION:
+        raise ValueError("disaster-recovery monotonic head schema is invalid")
+    if head.get("head_sha256") != dr_head_hash(head):
+        raise ValueError("disaster-recovery monotonic head hash mismatch")
+    if head.get("workspace_uuid") != dr_workspace_uuid(root):
+        raise ValueError("disaster-recovery workspace UUID mismatch")
+    if head.get("snapshot_profile") != snapshot_profile:
+        raise ValueError("disaster-recovery monotonic head profile mismatch")
+    if head.get("latest_binding_sha256") != dr_latest_binding(latest):
+        raise ValueError("disaster-recovery latest was rolled back or replaced")
+    if latest.get("workspace_uuid") != head.get("workspace_uuid"):
+        raise ValueError("disaster-recovery latest workspace UUID mismatch")
+    if latest.get("revision") != head.get("revision"):
+        raise ValueError("disaster-recovery latest revision mismatch")
+    versions: list[dict[str, Any]] = []
+    for version_path in sorted(dr_head_versions_path(path).glob("*.json")):
+        version = read_json(version_path)
+        authenticate_metadata(version, encryption_key, "dr-monotonic-head")
+        if version.get("head_sha256") != dr_head_hash(version):
+            raise ValueError("disaster-recovery retained head hash mismatch")
+        versions.append(version)
+    if not versions:
+        raise ValueError("disaster-recovery retained head history is missing")
+    versions.sort(key=lambda item: int(item.get("revision") or -1))
+    for previous, current in zip(versions, versions[1:], strict=False):
+        if current.get("revision") != previous.get("revision") + 1:
+            raise ValueError("disaster-recovery retained revisions are not contiguous")
+        if current.get("previous_head_sha256") != previous.get("head_sha256"):
+            raise ValueError("disaster-recovery retained predecessor hash mismatch")
+    if (
+        versions[-1].get("revision") != head.get("revision")
+        or versions[-1].get("head_sha256") != head.get("head_sha256")
+    ):
+        raise ValueError("disaster-recovery head pointer was rolled back")
+    return head
+
+
+def next_dr_integrity_fields(
+    previous: dict[str, Any],
+    *,
+    date: str,
+    root: Path,
+    snapshot_profile: str,
+    encryption_key: bytes | None,
+) -> dict[str, Any]:
+    if dr_integrity_enabled(root) and not previous and dr_head_path(root, snapshot_profile).exists():
+        raise ValueError("disaster-recovery latest is missing below its authenticated high-water mark")
+    head = verify_dr_integrity_head(
+        previous,
+        root=root,
+        snapshot_profile=snapshot_profile,
+        encryption_key=encryption_key,
+    ) if previous else None
+    if head is not None and date < str(head.get("date") or ""):
+        raise ValueError("disaster-recovery date is below its authenticated high-water mark")
+    return {
+        "workspace_uuid": dr_workspace_uuid(root),
+        "revision": int(head.get("revision") or 0) + 1 if head else 1,
+        "previous_head_sha256": head.get("head_sha256") if head else None,
+    }
+
+
+def commit_dr_integrity_head(
+    latest: dict[str, Any],
+    *,
+    root: Path,
+    snapshot_profile: str,
+    encryption_key: bytes | None,
+) -> dict[str, Any] | None:
+    if not dr_integrity_enabled(root):
+        return None
+    if encryption_key is None:
+        raise ValueError("disaster-recovery monotonic head requires an encryption key")
+    path = dr_head_path(root, snapshot_profile)
+    current = read_json(path) if path.exists() else None
+    if current is None:
+        if latest.get("previous_head_sha256") is not None:
+            raise ValueError("disaster-recovery head CAS predecessor disappeared")
+    else:
+        authenticate_metadata(current, encryption_key, "dr-monotonic-head")
+        if current.get("head_sha256") != latest.get("previous_head_sha256"):
+            raise ValueError("disaster-recovery head CAS predecessor changed")
+    payload = {
+        "schema_version": DR_HEAD_SCHEMA_VERSION,
+        "workspace_uuid": latest["workspace_uuid"],
+        "revision": latest["revision"],
+        "previous_head_sha256": latest.get("previous_head_sha256"),
+        "date": latest["date"],
+        "snapshot_profile": snapshot_profile,
+        "manifest_sha256": latest["manifest_sha256"],
+        "archive_sha256": latest["archive_sha256"],
+        "latest_binding_sha256": dr_latest_binding(latest),
+        "trust_scope": "local-only",
+        "witness": {"status": "unavailable", "verified": False},
+    }
+    payload["head_sha256"] = dr_head_hash(payload)
+    head = signed_metadata(payload, encryption_key, "dr-monotonic-head")
+    version_path = dr_head_versions_path(path) / (
+        f"{latest['revision']:020d}-{head['head_sha256']}.json"
+    )
+    atomic_json(version_path, head)
+    atomic_json(path, head)
+    return head
+
+
+def full_latest_path_for(latest_path: Path) -> Path:
+    """Keep the heavyweight recovery baseline separate from daily checkpoints."""
+
+    if latest_path.resolve() == LATEST_PATH.resolve():
+        return FULL_LATEST_PATH
+    return latest_path.with_name("full-latest.json")
+
+
 def read_json(path: Path) -> dict[str, Any]:
     payload = strict_json_loads(path.read_text(encoding="utf-8-sig"))
     if not isinstance(payload, dict):
@@ -376,6 +688,23 @@ def load_config(path: Path) -> dict[str, Any]:
         value = config.get(name)
         if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
             raise ValueError(f"disaster_recovery.{name} must be a positive integer")
+    for name in (
+        "maximum_backup_age_hours",
+        "bootstrap_maximum_backup_age_hours",
+        "full_snapshot_maximum_age_hours",
+    ):
+        value = config.get(name)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int | float) or value <= 0
+        ):
+            raise ValueError(f"disaster_recovery.{name} must be a positive number")
+    for name in ("include_paths", "daily_include_paths", "git_repositories", "daily_git_repositories"):
+        value = config.get(name)
+        if value is not None and (
+            not isinstance(value, list | tuple)
+            or not all(isinstance(item, str) and item.strip() for item in value)
+        ):
+            raise ValueError(f"disaster_recovery.{name} must be a list of non-empty strings")
     encryption = config.get("encryption", {})
     if not isinstance(encryption, dict):
         raise ValueError("disaster_recovery.encryption must be a JSON object")
@@ -631,6 +960,29 @@ def validate_legacy_migration_genesis(value: Any) -> dict[str, Any]:
     return value
 
 
+def validate_full_snapshot_reference(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != FULL_SNAPSHOT_REFERENCE_KEYS:
+        raise ValueError("full snapshot reference is missing or malformed")
+    for name in ("archive_sha256", "manifest_sha256"):
+        if not isinstance(value.get(name), str) or not HEX_SHA256.fullmatch(value[name]):
+            raise ValueError(f"full snapshot reference {name} is invalid")
+    try:
+        if datetime.strptime(str(value.get("date")), "%Y-%m-%d").strftime("%Y-%m-%d") != value["date"]:
+            raise ValueError
+    except ValueError as exc:
+        raise ValueError("full snapshot reference date is invalid") from exc
+    try:
+        created_at = str(value.get("created_at"))
+        if not created_at.endswith("Z"):
+            raise ValueError
+        datetime.fromisoformat(created_at.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError("full snapshot reference timestamp is invalid") from exc
+    if value.get("restore_verified") is not True:
+        raise ValueError("full snapshot reference was not restore-verified")
+    return value
+
+
 def validate_manifest_files(files: Any) -> list[dict[str, Any]]:
     if not isinstance(files, list) or not files:
         raise ValueError("backup manifest files must be a non-empty list")
@@ -746,6 +1098,21 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         or not Path(workspace).is_absolute()
     ):
         raise ValueError("backup manifest workspace must be an absolute path")
+    workspace_uuid = manifest.get("workspace_uuid")
+    revision = manifest.get("revision")
+    previous_head = manifest.get("previous_head_sha256")
+    if any(value is not None for value in (workspace_uuid, revision, previous_head)):
+        try:
+            if str(uuid.UUID(str(workspace_uuid))) != workspace_uuid:
+                raise ValueError
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("backup manifest workspace UUID is invalid") from exc
+        if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+            raise ValueError("backup manifest monotonic revision is invalid")
+        if previous_head is not None and (
+            not isinstance(previous_head, str) or not HEX_SHA256.fullmatch(previous_head)
+        ):
+            raise ValueError("backup manifest previous head hash is invalid")
     encrypted = manifest.get("encrypted")
     if not isinstance(encrypted, bool):
         raise ValueError("backup manifest encrypted must be boolean")
@@ -754,6 +1121,14 @@ def validate_manifest(manifest: dict[str, Any]) -> list[dict[str, Any]]:
         raise ValueError("backup manifest encryption algorithm is inconsistent")
     if manifest.get("restore_scope") != RESTORE_SCOPE or manifest.get("full_runtime_restore_expected") is not False:
         raise ValueError("backup manifest restore scope is invalid")
+    snapshot_profile = manifest.get("snapshot_profile", "full")
+    if snapshot_profile not in {"daily", "full"}:
+        raise ValueError("backup manifest snapshot profile is invalid")
+    full_snapshot = manifest.get("full_snapshot")
+    if full_snapshot is not None:
+        if snapshot_profile != "daily":
+            raise ValueError("only daily snapshots may reference a full snapshot")
+        validate_full_snapshot_reference(full_snapshot)
     patterns = manifest.get("excluded_sensitive_file_patterns")
     if not isinstance(patterns, list) or not all(
         isinstance(pattern, str) and pattern.strip() for pattern in patterns
@@ -1199,7 +1574,13 @@ def create_git_bundles(
     return entries
 
 
-def verify_previous_snapshot(previous: dict[str, Any], encryption_key: bytes | None) -> str:
+def verify_previous_snapshot(
+    previous: dict[str, Any],
+    encryption_key: bytes | None,
+    *,
+    deep_restore: bool = True,
+    expected_workspace: Path | None = None,
+) -> str:
     schema_version = previous.get("schema_version")
     if type(schema_version) is not int or schema_version != MANIFEST_SCHEMA_VERSION:
         raise ValueError(
@@ -1245,12 +1626,21 @@ def verify_previous_snapshot(previous: dict[str, Any], encryption_key: bytes | N
     if stable_json_sha256(previous_manifest) != manifest_hash:
         raise ValueError("previous disaster-recovery manifest integrity check failed")
     previous_items = validate_manifest(previous_manifest)
+    if expected_workspace is not None and Path(str(previous_manifest.get("workspace"))).resolve() != expected_workspace.resolve():
+        raise ValueError("previous disaster-recovery snapshot belongs to a different workspace")
     if expected_digest.read_text(encoding="ascii").strip() != manifest_hash:
         raise ValueError("previous disaster-recovery manifest digest sidecar is invalid")
     if bool(previous_manifest["encrypted"]) != previous_encrypted:
         raise ValueError("previous disaster-recovery metadata encryption state is inconsistent")
     if previous.get("date") != previous_manifest.get("date"):
         raise ValueError("previous disaster-recovery metadata date is inconsistent")
+    if previous.get("snapshot_profile", "full") != previous_manifest.get("snapshot_profile", "full"):
+        raise ValueError("previous disaster-recovery snapshot profile is inconsistent")
+    if previous.get("full_snapshot") != previous_manifest.get("full_snapshot"):
+        raise ValueError("previous disaster-recovery full snapshot reference is inconsistent")
+    for field in ("workspace_uuid", "revision", "previous_head_sha256"):
+        if previous.get(field) != previous_manifest.get(field):
+            raise ValueError(f"previous disaster-recovery {field} is inconsistent")
     expected_bundle_count = sum(item["kind"] == "git_bundle" for item in previous_items)
     expected_total_bytes = sum(item["size"] for item in previous_items)
     if (
@@ -1267,17 +1657,98 @@ def verify_previous_snapshot(previous: dict[str, Any], encryption_key: bytes | N
         or previous.get("encrypted_container_authenticated") is not True
     ):
         raise ValueError("previous disaster-recovery latest metadata is inconsistent")
-    verification = verify_archive_detailed(
-        previous_archive,
-        previous_manifest,
-        encryption_key=encryption_key,
-    )
-    if not verification["verified"]:
-        raise ValueError(
-            "previous disaster-recovery restore verification failed: "
-            + "; ".join(verification["verification_errors"])
+    if deep_restore:
+        verification = verify_archive_detailed(
+            previous_archive,
+            previous_manifest,
+            encryption_key=encryption_key,
         )
+        if not verification["verified"]:
+            raise ValueError(
+                "previous disaster-recovery restore verification failed: "
+                + "; ".join(verification["verification_errors"])
+            )
     return manifest_hash
+
+
+def resolve_full_snapshot_reference(
+    reference_value: Any,
+    *,
+    root: Path,
+    config: dict[str, Any],
+    encryption_key: bytes | None,
+) -> dict[str, Any]:
+    """Resolve an immutable full baseline by its signed content hashes.
+
+    ``full-latest.json`` is only the current head. A daily checkpoint must keep
+    referring to the exact full archive it was created against even after a newer
+    periodic full snapshot advances that head.
+    """
+
+    reference = validate_full_snapshot_reference(reference_value)
+    if encryption_key is None:
+        raise ValueError("referenced full snapshot requires its encryption key")
+    target = resolve_target(str(config["target_directory"]), root)
+    matching_digests: list[Path] = []
+    for digest_path in sorted(target.glob("atlas-backup-*.manifest.sha256")):
+        try:
+            digest = digest_path.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if digest == reference["manifest_sha256"]:
+            matching_digests.append(digest_path)
+    if not matching_digests:
+        raise ValueError("referenced full snapshot manifest is missing")
+
+    matches: list[dict[str, Any]] = []
+    for digest_path in matching_digests:
+        manifest_path = digest_path.with_suffix(".json")
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = read_json(manifest_path)
+            validate_manifest(manifest)
+            authenticate_metadata(manifest, encryption_key, "manifest")
+        except (OSError, ValueError):
+            continue
+        if (
+            stable_json_sha256(manifest) != reference["manifest_sha256"]
+            or manifest.get("snapshot_profile", "full") != "full"
+            or manifest.get("full_snapshot") is not None
+            or manifest.get("encrypted") is not True
+            or manifest.get("date") != reference["date"]
+            or manifest.get("created_at") != reference["created_at"]
+        ):
+            continue
+        base_name = digest_path.name.removesuffix(".manifest.sha256")
+        for suffix in (".atlasdr", ".zip"):
+            archive = (target / f"{base_name}{suffix}").resolve()
+            if not archive.is_file():
+                continue
+            try:
+                archive.relative_to(root.resolve())
+            except ValueError:
+                pass
+            else:
+                continue
+            if sha256(archive) != reference["archive_sha256"]:
+                continue
+            matches.append(
+                {
+                    "archive": archive,
+                    "archive_sha256": reference["archive_sha256"],
+                    "manifest": manifest,
+                    "manifest_path": manifest_path.resolve(),
+                    "manifest_sha256": reference["manifest_sha256"],
+                    "reference": reference,
+                }
+            )
+    if not matches:
+        raise ValueError("referenced full snapshot archive is missing or changed")
+    unique_archives = {str(item["archive"]) for item in matches}
+    if len(unique_archives) != 1:
+        raise ValueError("referenced full snapshot resolves ambiguously")
+    return matches[0]
 
 
 def create_snapshot(
@@ -1286,7 +1757,33 @@ def create_snapshot(
     root: Path = ROOT,
     config_path: Path = CONFIG_PATH,
     latest_path: Path = LATEST_PATH,
+    snapshot_profile: str = "daily",
 ) -> dict[str, Any]:
+    """Create a snapshot while one OS-held writer lock protects its CAS boundary."""
+
+    config = load_config(config_path)
+    target = resolve_target(str(config["target_directory"]), root)
+    with disaster_recovery_lock(target):
+        return _create_snapshot_locked(
+            date=date,
+            root=root,
+            config_path=config_path,
+            latest_path=latest_path,
+            snapshot_profile=snapshot_profile,
+        )
+
+
+def _create_snapshot_locked(
+    *,
+    date: str,
+    root: Path = ROOT,
+    config_path: Path = CONFIG_PATH,
+    latest_path: Path = LATEST_PATH,
+    snapshot_profile: str = "daily",
+) -> dict[str, Any]:
+    started_monotonic = time.monotonic()
+    if snapshot_profile not in {"daily", "full"}:
+        raise ValueError("snapshot_profile must be daily or full")
     config = load_config(config_path)
     encryption = config.get("encryption", {})
     encryption = encryption if isinstance(encryption, dict) else {}
@@ -1306,12 +1803,20 @@ def create_snapshot(
     ):
         raise ValueError("sensitive_exclude_patterns must be a list of non-empty strings")
     sensitive_patterns = (*SENSITIVE_FILE_PATTERNS, *extra_sensitive_patterns)
-    include_paths = config.get("include_paths") or DEFAULT_INCLUDES
+    include_paths = (
+        config.get("daily_include_paths")
+        if snapshot_profile == "daily" and config.get("daily_include_paths") is not None
+        else config.get("include_paths")
+    ) or DEFAULT_INCLUDES
     if not isinstance(include_paths, list | tuple) or not all(
         isinstance(value, str) and value.strip() for value in include_paths
     ):
         raise ValueError("include_paths must be a list of non-empty strings")
-    git_repositories = config.get("git_repositories", [])
+    git_repositories = (
+        config.get("daily_git_repositories")
+        if snapshot_profile == "daily" and config.get("daily_git_repositories") is not None
+        else config.get("git_repositories", [])
+    )
     if not isinstance(git_repositories, list) or not all(
         isinstance(value, str) and value.strip() for value in git_repositories
     ):
@@ -1323,8 +1828,13 @@ def create_snapshot(
     )
     if not files:
         raise ValueError("no disaster-recovery files selected")
+    selection_finished = time.monotonic()
     created_at = utc_now()
-    previous = read_json(latest_path) if latest_path.exists() else {}
+    effective_latest_path = (
+        full_latest_path_for(latest_path) if snapshot_profile == "full" else latest_path
+    )
+    expected_latest_sha256 = sha256(effective_latest_path) if effective_latest_path.exists() else None
+    previous = read_json(effective_latest_path) if effective_latest_path.exists() else {}
     previous_manifest_sha256: str | None = None
     legacy_migration_genesis: dict[str, Any] | None = None
     legacy_source_latest_path: Path | None = None
@@ -1333,7 +1843,19 @@ def create_snapshot(
         if type(previous_schema) is not int:
             raise ValueError(f"unsupported previous disaster-recovery schema: {previous_schema!r}")
         if previous_schema == MANIFEST_SCHEMA_VERSION:
-            previous_manifest_sha256 = verify_previous_snapshot(previous, encryption_key)
+            previous_manifest_sha256 = verify_previous_snapshot(
+                previous,
+                encryption_key,
+                deep_restore=False,
+                expected_workspace=root,
+            )
+            if (
+                snapshot_profile == "daily"
+                and previous.get("snapshot_profile", "full") == "full"
+            ):
+                baseline_path = full_latest_path_for(latest_path)
+                if not baseline_path.exists():
+                    atomic_json(baseline_path, previous)
             inherited_migration = previous.get("legacy_migration_genesis")
             if inherited_migration is not None:
                 legacy_migration_genesis = validate_legacy_migration_genesis(inherited_migration)
@@ -1341,11 +1863,60 @@ def create_snapshot(
         elif previous_schema == LEGACY_MANIFEST_SCHEMA_VERSION:
             if encryption_key is None:
                 raise ValueError("legacy schema-2 migration requires a valid AES-256-GCM backup key")
-            legacy_migration_genesis = verify_legacy_snapshot_v2(previous, latest_path)
-            preserve_legacy_latest_manifest(latest_path, legacy_migration_genesis)
-            legacy_source_latest_path = latest_path
+            legacy_migration_genesis = verify_legacy_snapshot_v2(previous, effective_latest_path)
+            preserve_legacy_latest_manifest(effective_latest_path, legacy_migration_genesis)
+            legacy_source_latest_path = effective_latest_path
         else:
             raise ValueError(f"unsupported previous disaster-recovery schema: {previous_schema!r}")
+    integrity_fields = (
+        next_dr_integrity_fields(
+            previous,
+            date=date,
+            root=root,
+            snapshot_profile=snapshot_profile,
+            encryption_key=encryption_key,
+        )
+        if dr_integrity_enabled(root)
+        else {}
+    )
+    full_snapshot_reference: dict[str, Any] | None = None
+    if snapshot_profile == "daily" and config.get("full_snapshot_maximum_age_hours") is not None:
+        baseline_path = full_latest_path_for(latest_path)
+        if not baseline_path.is_file():
+            raise ValueError("daily snapshot requires a verified full recovery baseline")
+        baseline = read_json(baseline_path)
+        baseline_manifest_hash = verify_previous_snapshot(
+            baseline,
+            encryption_key,
+            deep_restore=False,
+            expected_workspace=root,
+        )
+        if baseline.get("snapshot_profile", "full") != "full":
+            raise ValueError("daily snapshot recovery baseline is not a full snapshot")
+        try:
+            baseline_created = datetime.fromisoformat(
+                str(baseline.get("created_at")).replace("Z", "+00:00")
+            )
+            if baseline_created.tzinfo is None:
+                raise ValueError
+            baseline_age_hours = (
+                datetime.now(UTC) - baseline_created.astimezone(UTC)
+            ).total_seconds() / 3600
+        except (TypeError, ValueError) as exc:
+            raise ValueError("full recovery baseline timestamp is invalid") from exc
+        maximum_full_age = float(config["full_snapshot_maximum_age_hours"])
+        if baseline_age_hours < 0 or baseline_age_hours > maximum_full_age:
+            raise ValueError("full recovery baseline is outside the configured freshness window")
+        full_snapshot_reference = validate_full_snapshot_reference(
+            {
+                "archive_sha256": baseline["archive_sha256"],
+                "created_at": baseline["created_at"],
+                "date": baseline["date"],
+                "manifest_sha256": baseline_manifest_hash,
+                "restore_verified": baseline.get("restore_verified") is True,
+            }
+        )
+    predecessor_finished = time.monotonic()
     with private_staging_directory(target, prefix=".atlas-create-") as staging:
         bundle_entries = create_git_bundles(
             root,
@@ -1366,10 +1937,13 @@ def create_snapshot(
             "date": date,
             "created_at": created_at,
             "workspace": str(root.resolve()),
+            **integrity_fields,
             "encrypted": encryption_required,
             "encryption_algorithm": "AES-256-GCM" if encryption_required else None,
             "restore_scope": RESTORE_SCOPE,
             "full_runtime_restore_expected": False,
+            "snapshot_profile": snapshot_profile,
+            **({"full_snapshot": full_snapshot_reference} if full_snapshot_reference is not None else {}),
             "excluded_sensitive_file_patterns": list(sensitive_patterns),
             "previous_manifest_sha256": previous_manifest_sha256,
             **({"legacy_migration_genesis": legacy_migration_genesis} if legacy_migration_genesis is not None else {}),
@@ -1409,8 +1983,11 @@ def create_snapshot(
             temporary_archive.replace(archive)
         finally:
             temporary_archive.unlink(missing_ok=True)
+    archive_finished = time.monotonic()
     archive_sha256 = sha256(archive)
+    verification_started = time.monotonic()
     verification = verify_archive_detailed(archive, manifest, encryption_key=encryption_key)
+    verification_finished = time.monotonic()
     if not archive.is_file() or sha256(archive) != archive_sha256:
         verification["verified"] = False
         verification["archive_integrity_verified"] = False
@@ -1445,6 +2022,9 @@ def create_snapshot(
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "date": date,
         "created_at": created_at,
+        **integrity_fields,
+        "snapshot_profile": snapshot_profile,
+        **({"full_snapshot": full_snapshot_reference} if full_snapshot_reference is not None else {}),
         "archive": str(archive.resolve()),
         "archive_sha256": archive_sha256,
         "archive_format": "atlas-aes-gcm-v1" if encryption_required else "zip",
@@ -1472,9 +2052,34 @@ def create_snapshot(
         "retention_days": int(config.get("retention_days") or 14),
         "target_outside_workspace": True,
         "target_on_different_volume": different_volume,
+        "timings_seconds": {
+            "selection": round(selection_finished - started_monotonic, 3),
+            "predecessor_authentication": round(predecessor_finished - selection_finished, 3),
+            "archive_build_and_encryption": round(archive_finished - predecessor_finished, 3),
+            "archive_hash": round(verification_started - archive_finished, 3),
+            "restore_verification": round(verification_finished - verification_started, 3),
+            "total": round(verification_finished - started_monotonic, 3),
+        },
     }
     result = signed_metadata(result_payload, encryption_key, "latest")
-    atomic_json(latest_path, result)
+    actual_latest_sha256 = sha256(effective_latest_path) if effective_latest_path.exists() else None
+    if actual_latest_sha256 != expected_latest_sha256:
+        raise RuntimeError("disaster-recovery latest CAS failed: latest changed during snapshot creation")
+    previous_latest_bytes = effective_latest_path.read_bytes() if effective_latest_path.exists() else None
+    atomic_json(effective_latest_path, result)
+    try:
+        commit_dr_integrity_head(
+            result,
+            root=root,
+            snapshot_profile=snapshot_profile,
+            encryption_key=encryption_key,
+        )
+    except Exception:
+        if previous_latest_bytes is None:
+            effective_latest_path.unlink(missing_ok=True)
+        else:
+            atomic_bytes(effective_latest_path, previous_latest_bytes)
+        raise
     cutoff = datetime.now(UTC).timestamp() - result["retention_days"] * 86400
     minimum_snapshots = int(config.get("minimum_snapshots_to_keep") or 3)
     archives = sorted(
@@ -1482,11 +2087,44 @@ def create_snapshot(
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
+    full_latest_path = full_latest_path_for(latest_path)
+    full_latest = read_json(full_latest_path) if full_latest_path.exists() else {}
+    full_archive_value = full_latest.get("archive") if isinstance(full_latest, dict) else None
+    protected_archives = {
+        Path(full_archive_value).resolve()
+        for full_archive_value in [full_archive_value]
+        if isinstance(full_archive_value, str) and full_archive_value
+    }
+    retention_cleanup_allowed = True
+    if latest_path.is_file():
+        try:
+            daily_latest = read_json(latest_path)
+            if daily_latest.get("snapshot_profile", "full") == "daily" and daily_latest.get(
+                "full_snapshot"
+            ) is not None:
+                authenticate_metadata(daily_latest, encryption_key, "latest")
+                resolved_baseline = resolve_full_snapshot_reference(
+                    daily_latest["full_snapshot"],
+                    root=root,
+                    config=config,
+                    encryption_key=encryption_key,
+                )
+                protected_archives.add(resolved_baseline["archive"])
+        except (KeyError, OSError, TypeError, ValueError):
+            # Retention must never delete through an unresolved dependency. The
+            # newly verified snapshot remains usable; cleanup waits for repair.
+            retention_cleanup_allowed = False
     for old in archives[minimum_snapshots:]:
         protected_legacy_archive = (
             Path(legacy_migration_genesis["legacy_archive"]).resolve() if legacy_migration_genesis is not None else None
         )
-        if old != archive and old.resolve() != protected_legacy_archive and old.stat().st_mtime < cutoff:
+        if (
+            retention_cleanup_allowed
+            and old != archive
+            and old.resolve() != protected_legacy_archive
+            and old.resolve() not in protected_archives
+            and old.stat().st_mtime < cutoff
+        ):
             old.unlink()
             for suffix in (".manifest.json", ".manifest.sha256"):
                 old.with_suffix(suffix).unlink(missing_ok=True)
@@ -1498,8 +2136,14 @@ def verify_latest_snapshot(
     root: Path = ROOT,
     config_path: Path = CONFIG_PATH,
     latest_path: Path = LATEST_PATH,
+    quick: bool = False,
 ) -> dict[str, Any]:
-    """Re-authenticate and restore-check the exact archive selected by latest.json."""
+    """Authenticate latest.json, optionally re-running the full restore drill.
+
+    Quick verification still hashes the exact encrypted archive and authenticates
+    both metadata layers.  It reuses the signed restore result produced when the
+    snapshot was created; it never upgrades an unverified snapshot to a pass.
+    """
 
     config = load_config(config_path)
     encryption_key = encryption_key_for_config(config)
@@ -1528,6 +2172,8 @@ def verify_latest_snapshot(
         raise ValueError("latest backup manifest sidecar is missing")
     manifest = read_json(manifest_path)
     validate_manifest(manifest)
+    if Path(str(manifest.get("workspace"))).resolve() != root.resolve():
+        raise ValueError("latest backup belongs to a different workspace")
     authenticate_metadata(manifest, encryption_key, "manifest")
     manifest_hash = stable_json_sha256(manifest)
     if manifest_hash != latest.get("manifest_sha256"):
@@ -1536,11 +2182,75 @@ def verify_latest_snapshot(
     if not digest_path.is_file() or digest_path.read_text(encoding="ascii").strip() != manifest_hash:
         raise ValueError("latest backup manifest digest sidecar mismatch")
 
-    verification = verify_archive_detailed(
-        archive,
-        manifest,
+    if manifest.get("snapshot_profile", "full") != latest.get("snapshot_profile", "full"):
+        raise ValueError("latest backup snapshot profile is inconsistent")
+    if manifest.get("full_snapshot") != latest.get("full_snapshot"):
+        raise ValueError("latest backup full snapshot reference is inconsistent")
+    for field in ("workspace_uuid", "revision", "previous_head_sha256"):
+        if manifest.get(field) != latest.get(field):
+            raise ValueError(f"latest backup {field} is inconsistent")
+    verify_dr_integrity_head(
+        latest,
+        root=root,
+        snapshot_profile=str(latest.get("snapshot_profile", "full")),
         encryption_key=encryption_key,
     )
+    full_baseline_authenticated = False
+    if (
+        latest.get("snapshot_profile", "full") == "daily"
+        and latest.get("full_snapshot") is not None
+    ):
+        try:
+            reference = validate_full_snapshot_reference(latest.get("full_snapshot"))
+            resolved_baseline = resolve_full_snapshot_reference(
+                reference,
+                root=root,
+                config=config,
+                encryption_key=encryption_key,
+            )
+            authenticated_reference = validate_full_snapshot_reference(
+                {
+                    "archive_sha256": resolved_baseline["archive_sha256"],
+                    "created_at": resolved_baseline["manifest"].get("created_at"),
+                    "date": resolved_baseline["manifest"].get("date"),
+                    "manifest_sha256": resolved_baseline["manifest_sha256"],
+                    "restore_verified": reference["restore_verified"],
+                }
+            )
+            if authenticated_reference != reference:
+                raise ValueError("daily reference does not match the authenticated full snapshot")
+            maximum_age = config.get("full_snapshot_maximum_age_hours")
+            if maximum_age is not None:
+                baseline_created = datetime.fromisoformat(
+                    authenticated_reference["created_at"].replace("Z", "+00:00")
+                )
+                baseline_age_hours = (
+                    datetime.now(UTC) - baseline_created.astimezone(UTC)
+                ).total_seconds() / 3600
+                if baseline_age_hours < 0 or baseline_age_hours > float(maximum_age):
+                    raise ValueError("authenticated full snapshot is outside the freshness window")
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            raise ValueError("full recovery baseline authentication failed") from exc
+        full_baseline_authenticated = True
+    elif (
+        latest.get("snapshot_profile", "full") == "daily"
+        and config.get("full_snapshot_maximum_age_hours") is not None
+    ):
+        raise ValueError("full recovery baseline authentication failed")
+    if quick:
+        verification = {
+            "verified": latest.get("verified") is True,
+            "archive_integrity_verified": latest.get("archive_integrity_verified") is True,
+            "restore_verified": latest.get("restore_verified") is True,
+            "encrypted_container_authenticated": latest.get("encrypted_container_authenticated") is True,
+            "restore_scope": latest.get("restore_scope"),
+        }
+    else:
+        verification = verify_archive_detailed(
+            archive,
+            manifest,
+            encryption_key=encryption_key,
+        )
     if verification.get("verified") is not True:
         raise ValueError("latest backup restore verification failed")
     return {
@@ -1553,6 +2263,10 @@ def verify_latest_snapshot(
         "restore_verified": verification.get("restore_verified") is True,
         "encrypted_container_authenticated": verification.get("encrypted_container_authenticated") is True,
         "restore_scope": verification.get("restore_scope"),
+        "snapshot_profile": latest.get("snapshot_profile", "full"),
+        "full_snapshot": latest.get("full_snapshot"),
+        "full_baseline_authenticated": full_baseline_authenticated,
+        "verification_mode": "authenticated_archive" if quick else "full_restore",
     }
 
 
@@ -1593,14 +2307,32 @@ def main() -> int:
     parser.add_argument("--date")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--verify-existing", action="store_true")
+    parser.add_argument(
+        "--quick",
+        action="store_true",
+        help="Authenticate and hash the existing archive without repeating its restore drill.",
+    )
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="Create the periodic full-history snapshot instead of the daily publication checkpoint.",
+    )
     args = parser.parse_args()
     try:
         if args.verify_existing:
-            result = verify_latest_snapshot()
+            result = verify_latest_snapshot(
+                latest_path=FULL_LATEST_PATH if args.full else LATEST_PATH,
+                quick=args.quick,
+            )
         else:
             if not args.date:
                 raise ValueError("--date is required unless --verify-existing is used")
-            result = create_snapshot(date=args.date)
+            if args.quick:
+                raise ValueError("--quick requires --verify-existing")
+            result = create_snapshot(
+                date=args.date,
+                snapshot_profile="full" if args.full else "daily",
+            )
     except (OSError, RuntimeError, ValueError) as exc:
         # A nonzero exit is important: callers must not infer a passing backup
         # from this diagnostic payload.  Do not write ``latest.json`` here;
@@ -1610,7 +2342,10 @@ def main() -> int:
     if args.json or args.verify_existing:
         print(json.dumps(result, ensure_ascii=False, indent=2))
     else:
-        print(f"backup={result['archive']} files={result['file_count']} restore_verified={result['restore_verified']}")
+        print(
+            f"backup={result['archive']} profile={result.get('snapshot_profile', 'full')} "
+            f"files={result['file_count']} restore_verified={result['restore_verified']}"
+        )
     return 0
 
 

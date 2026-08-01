@@ -57,6 +57,14 @@ class ProjectSkillContractTests(unittest.TestCase):
             runbook.index("briefing_store.py record"),
             runbook.index("research_quality.py"),
         )
+        for required_order_contract in (
+            "strategy_context",
+            "signal_score",
+            "account_risk",
+            "confirming_evidence",
+            "previous_close",
+        ):
+            self.assertIn(required_order_contract, runbook)
 
     def test_daily_cycle_defers_publication_until_closed_loop_finishes(self) -> None:
         operator = (SKILLS_ROOT / "atlas-daily-operator" / "SKILL.md").read_text(
@@ -76,6 +84,14 @@ class ProjectSkillContractTests(unittest.TestCase):
         self.assertIn("src/app/briefing.generated.json", contract)
         self.assertIn("src/app/publication.generated.json", contract)
         self.assertIn("fresh passing verifier artifact", contract)
+        self.assertIn("artifact_sha256", contract)
+        self.assertIn("sites_version_id", contract)
+        self.assertIn("sites_deployment_id", contract)
+
+        publisher = (SKILLS_ROOT / "atlas-site-publisher" / "SKILL.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("--deployment-receipt DEPLOYMENT_RECEIPT", publisher)
 
 
 if __name__ == "__main__":

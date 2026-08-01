@@ -40,6 +40,7 @@ LOCK_PATH = RUNTIME_ROOT / "self_healing.lock"
 
 SEVERITY_ORDER = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
 RISK_ORDER = {"low": 0, "medium": 1, "high": 2}
+BRIEFING_TEST_INPUT_SCHEMA_VERSION = 1
 
 
 def utc_now() -> str:
@@ -62,6 +63,109 @@ def file_hash(path: Path) -> str | None:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def build_briefing_test_input_fingerprint(
+    root: Path = ROOT,
+    date: str | None = None,
+) -> dict[str, Any]:
+    """Independently fingerprint the inputs to briefing unittest discovery."""
+
+    resolved_root = root.resolve()
+    briefing_root = resolved_root / "work" / "global-briefing"
+    entries: list[dict[str, Any]] = []
+    unsafe_paths: list[str] = []
+
+    def add_file(path: Path) -> None:
+        if path.is_symlink():
+            unsafe_paths.append(str(path))
+            return
+        try:
+            resolved = path.resolve()
+            relative = resolved.relative_to(resolved_root).as_posix()
+        except (OSError, ValueError):
+            unsafe_paths.append(str(path))
+            return
+        if not resolved.is_file():
+            return
+        entries.append(
+            {
+                "path": relative,
+                "bytes": resolved.stat().st_size,
+                "sha256": file_hash(resolved),
+            }
+        )
+
+    required_files = [
+        resolved_root / "atlas.py",
+        briefing_root / "requirements.txt",
+        resolved_root / "src" / "app" / "briefing.generated.json",
+    ]
+    if date:
+        required_files.append(
+            resolved_root / "outputs" / f"每日全球晨间简报-{date}.md"
+        )
+    missing_required = [
+        path.relative_to(resolved_root).as_posix()
+        for path in required_files
+        if not path.is_file()
+    ]
+    for path in required_files:
+        add_file(path)
+
+    ignored_parts = {"__pycache__", ".pytest_cache", ".ruff_cache"}
+    for directory in (
+        briefing_root / "scripts",
+        briefing_root / "config",
+        briefing_root / "tests",
+    ):
+        if not directory.is_dir():
+            missing_required.append(directory.relative_to(resolved_root).as_posix())
+            continue
+        for path in sorted(directory.rglob("*")):
+            if any(part in ignored_parts for part in path.parts) or path.suffix == ".pyc":
+                continue
+            if path.is_file():
+                add_file(path)
+
+    outputs_root = resolved_root / "outputs"
+    for path in sorted(outputs_root.glob("每日全球晨间简报-*.md")):
+        if path.is_file():
+            add_file(path)
+
+    entries = sorted(
+        {entry["path"]: entry for entry in entries}.values(),
+        key=lambda item: item["path"],
+    )
+    test_file_count = sum(
+        entry["path"].startswith("work/global-briefing/tests/test_")
+        and entry["path"].endswith(".py")
+        for entry in entries
+    )
+    contract = {
+        "schema_version": BRIEFING_TEST_INPUT_SCHEMA_VERSION,
+        "files": entries,
+        "missing_required": sorted(set(missing_required)),
+        "unsafe_paths": sorted(set(unsafe_paths)),
+    }
+    return {
+        "schema_version": BRIEFING_TEST_INPUT_SCHEMA_VERSION,
+        "fingerprint_sha256": stable_hash(contract),
+        "file_count": len(entries),
+        "test_file_count": test_file_count,
+        "missing_required": contract["missing_required"],
+        "unsafe_paths": contract["unsafe_paths"],
+    }
+
+
+def cycle_audit_record_hash(payload: dict[str, Any]) -> str:
+    normalized = dict(payload)
+    chain = normalized.get("audit_chain")
+    if isinstance(chain, dict):
+        normalized["audit_chain"] = {
+            key: value for key, value in chain.items() if key != "entry_sha256"
+        }
+    return stable_hash(normalized)
 
 
 def read_json(path: Path, default: Any = None) -> Any:
@@ -142,6 +246,7 @@ class ProbeResult:
     evidence: dict[str, Any] = field(default_factory=dict)
     fixer: str | None = None
     executed: bool = True
+    reused: bool = False
 
     @property
     def fingerprint(self) -> str:
@@ -215,6 +320,7 @@ class SelfHealingEngine:
         *,
         evidence: dict[str, Any] | None = None,
         fixer: str | None = None,
+        reused: bool = False,
     ) -> ProbeResult:
         self.executed_checks.add(check_id)
         severity, risk = self.check_policy(check_id)
@@ -231,6 +337,7 @@ class SelfHealingEngine:
             summary=summary,
             evidence=evidence or {},
             fixer=fixer,
+            reused=reused,
         )
 
     def command_json(
@@ -604,11 +711,233 @@ class SelfHealingEngine:
             fixer="refresh_improvement_tracker",
         )
 
-    def probe_deep(self) -> list[ProbeResult]:
+    def briefing_test_reuse_decision(
+        self,
+        date: str,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Validate cycle-produced briefing test evidence without trusting flags alone."""
+
+        reasons: list[str] = []
+        audit_path = (
+            self.root
+            / "work"
+            / "shared"
+            / "atlas"
+            / "run_audits"
+            / f"atlas-cycle-{date}.json"
+        )
+        audit = read_json(audit_path, {})
+        current_input = build_briefing_test_input_fingerprint(self.root, date)
+        max_age_value = self.policy.get("briefing_test_reuse_max_age_minutes", 60)
+        if (
+            isinstance(max_age_value, bool)
+            or not isinstance(max_age_value, int)
+            or not 1 <= max_age_value <= 240
+        ):
+            reasons.append("briefing test reuse freshness policy is invalid")
+            max_age_minutes = 60
+        else:
+            max_age_minutes = max_age_value
+
+        stage: dict[str, Any] | None = None
+        detail: dict[str, Any] = {}
+        scope: dict[str, Any] = {}
+        evidence: dict[str, Any] = {}
+        recorded_input: dict[str, Any] = {}
+        completed_at: str | None = None
+        age_seconds: float | None = None
+        audit_hash_valid = False
+        history_matched = False
+
+        if not isinstance(audit, dict) or not audit:
+            reasons.append("same-day cycle audit is missing or invalid")
+        else:
+            if audit.get("date") != date:
+                reasons.append("cycle audit date does not match the requested date")
+            if audit.get("overall_passed") is not True or audit.get(
+                "operational_gate_passed"
+            ) is not True:
+                reasons.append("cycle audit operational gate did not pass")
+            if audit.get("test_returncode") != 0:
+                reasons.append("cycle audit test returncode is not zero")
+            profile = audit.get("execution_profile")
+            if not isinstance(profile, dict) or profile.get("skip_tests") is not False:
+                reasons.append("cycle audit does not prove tests were enabled")
+
+            chain = audit.get("audit_chain")
+            audit_hash_valid = bool(
+                isinstance(chain, dict)
+                and chain.get("entry_sha256") == cycle_audit_record_hash(audit)
+            )
+            if not audit_hash_valid:
+                reasons.append("cycle audit content hash is invalid")
+
+            run_id = str(audit.get("run_id") or "")
+            if not run_id or any(character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_." for character in run_id):
+                reasons.append("cycle audit run_id is invalid")
+            else:
+                history_path = audit_path.parent / "history" / date / f"{run_id}.json"
+                history = read_json(history_path, {})
+                history_matched = bool(isinstance(history, dict) and history == audit)
+                if not history_matched:
+                    reasons.append("cycle audit does not match its same-day history record")
+
+            stages = audit.get("stages")
+            matching_stages = (
+                [
+                    item
+                    for item in stages
+                    if isinstance(item, dict)
+                    and item.get("name") == "targeted_integration_tests"
+                ]
+                if isinstance(stages, list)
+                else []
+            )
+            if len(matching_stages) != 1:
+                reasons.append("cycle audit has no unique integration test stage")
+            else:
+                stage = matching_stages[0]
+                if stage.get("status") != "passed":
+                    reasons.append("cycle integration test stage did not pass")
+                raw_detail = stage.get("detail")
+                if isinstance(raw_detail, dict):
+                    detail = raw_detail
+                else:
+                    reasons.append("cycle integration test detail is invalid")
+                if detail.get("returncode") != 0:
+                    reasons.append("cycle integration test returncode is not zero")
+                raw_scope = detail.get("scope")
+                if isinstance(raw_scope, dict):
+                    scope = raw_scope
+                else:
+                    reasons.append("cycle integration test scope is invalid")
+                if (
+                    scope.get("briefing_unittest_discovery") is not True
+                    or scope.get("kind")
+                    not in {"targeted_integration_suite", "full_regression_suite"}
+                ):
+                    reasons.append("cycle briefing test scope is insufficient")
+                raw_evidence = detail.get("briefing_test_evidence")
+                if isinstance(raw_evidence, dict):
+                    evidence = raw_evidence
+                else:
+                    reasons.append("cycle briefing test evidence is missing")
+
+        if evidence:
+            if evidence.get("schema_version") != 1:
+                reasons.append("cycle briefing test evidence schema is unsupported")
+            if (
+                evidence.get("suite") != "python_unittest_discovery"
+                or evidence.get("discovery_root") != "work/global-briefing/tests"
+                or evidence.get("pattern") != "test_*.py"
+            ):
+                reasons.append("cycle briefing test discovery contract is insufficient")
+            if evidence.get("returncode") != 0 or evidence.get("passed") is not True:
+                reasons.append("cycle briefing test evidence did not pass")
+            raw_recorded_input = evidence.get("input")
+            if isinstance(raw_recorded_input, dict):
+                recorded_input = raw_recorded_input
+            else:
+                reasons.append("cycle briefing test input fingerprint is missing")
+            completed_at = (
+                str(evidence.get("completed_at"))
+                if evidence.get("completed_at") is not None
+                else None
+            )
+
+        if current_input.get("missing_required"):
+            reasons.append("current briefing test inputs are incomplete")
+        if current_input.get("unsafe_paths"):
+            reasons.append("current briefing test inputs contain unsafe paths")
+        if int(current_input.get("test_file_count") or 0) < 1:
+            reasons.append("current briefing unittest discovery would be empty")
+        if recorded_input:
+            if recorded_input.get("schema_version") != BRIEFING_TEST_INPUT_SCHEMA_VERSION:
+                reasons.append("recorded briefing test input schema is unsupported")
+            if recorded_input.get("missing_required"):
+                reasons.append("recorded briefing test inputs were incomplete")
+            if recorded_input.get("unsafe_paths"):
+                reasons.append("recorded briefing test inputs contained unsafe paths")
+            if int(recorded_input.get("test_file_count") or 0) < 1:
+                reasons.append("recorded briefing unittest discovery was empty")
+            if (
+                recorded_input.get("fingerprint_sha256")
+                != current_input.get("fingerprint_sha256")
+                or recorded_input.get("file_count") != current_input.get("file_count")
+                or recorded_input.get("test_file_count")
+                != current_input.get("test_file_count")
+            ):
+                reasons.append("briefing test input fingerprint changed after cycle")
+
+        current_time = now or datetime.now(UTC)
+        if current_time.tzinfo is None or current_time.utcoffset() is None:
+            raise ValueError("briefing test reuse clock must be timezone-aware")
+        if not completed_at:
+            reasons.append("cycle briefing test completion time is missing")
+        else:
+            try:
+                observed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+                if observed.tzinfo is None or observed.utcoffset() is None:
+                    raise ValueError("timestamp has no timezone")
+                age_seconds = (current_time.astimezone(UTC) - observed.astimezone(UTC)).total_seconds()
+                if age_seconds < -300:
+                    reasons.append("cycle briefing test evidence is from the future")
+                elif age_seconds > max_age_minutes * 60:
+                    reasons.append("cycle briefing test evidence is stale")
+            except ValueError:
+                reasons.append("cycle briefing test completion time is invalid")
+
+        return {
+            "reused": not reasons,
+            "reasons": reasons,
+            "execution_mode": "reused_cycle_evidence" if not reasons else "executed",
+            "suite_executed_by_heal": False if not reasons else True,
+            "cycle_audit": str(audit_path),
+            "cycle_run_id": audit.get("run_id") if isinstance(audit, dict) else None,
+            "completed_at": completed_at,
+            "age_seconds": age_seconds,
+            "max_age_minutes": max_age_minutes,
+            "audit_hash_valid": audit_hash_valid,
+            "history_matched": history_matched,
+            "scope": scope,
+            "recorded_input_fingerprint": recorded_input.get("fingerprint_sha256"),
+            "current_input_fingerprint": current_input.get("fingerprint_sha256"),
+            "current_input_file_count": current_input.get("file_count"),
+            "current_test_file_count": current_input.get("test_file_count"),
+        }
+
+    def probe_deep(
+        self,
+        date: str | None = None,
+        *,
+        now: datetime | None = None,
+    ) -> list[ProbeResult]:
         probes: list[Callable[[], ProbeResult]] = []
         deep_config = self.policy.get("deep_checks", {})
         if deep_config.get("briefing_tests", True):
+            reuse = (
+                self.briefing_test_reuse_decision(date, now=now)
+                if date is not None
+                else {
+                    "reused": False,
+                    "reasons": ["run date was not provided"],
+                    "execution_mode": "executed",
+                    "suite_executed_by_heal": True,
+                }
+            )
+
             def probe_briefing_tests() -> ProbeResult:
+                if reuse["reused"]:
+                    return self.result(
+                        "briefing_tests",
+                        True,
+                        self.briefing_root / "tests",
+                        "briefing test suite passed using fresh matching cycle evidence",
+                        evidence=reuse,
+                        reused=True,
+                    )
                 completed = self.runner(
                     [sys.executable, "-m", "unittest", "discover", str(self.briefing_root / "tests"), "-p", "test_*.py"],
                     cwd=self.root,
@@ -619,7 +948,14 @@ class SelfHealingEngine:
                     completed.returncode == 0,
                     self.briefing_root / "tests",
                     "briefing test suite passed" if completed.returncode == 0 else "briefing test suite failed",
-                    evidence={"returncode": completed.returncode, "stdout_tail": completed.stdout[-2000:], "stderr_tail": completed.stderr[-2000:]},
+                    evidence={
+                        "returncode": completed.returncode,
+                        "stdout_tail": completed.stdout[-2000:],
+                        "stderr_tail": completed.stderr[-2000:],
+                        "execution_mode": "executed",
+                        "suite_executed_by_heal": True,
+                        "reuse_rejected_reasons": reuse.get("reasons", []),
+                    },
                 )
 
             probes.append(probe_briefing_tests)
@@ -660,7 +996,7 @@ class SelfHealingEngine:
         results.append(self.probe_cycle_audit(date))
         results.append(self.probe_improvement_tracker(date))
         if deep:
-            results.extend(self.probe_deep())
+            results.extend(self.probe_deep(date))
         return results
 
     def repair_targets(self, finding: ProbeResult) -> list[Path]:

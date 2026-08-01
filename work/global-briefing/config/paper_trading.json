@@ -21,12 +21,36 @@
     "price_date_must_not_follow_decision_date": true,
     "prediction_reference_required_from_date": "2026-07-17",
     "prediction_lifecycle_required_from_date": "2026-07-30",
+    "strategy_controls_required_from_date": "2026-08-02",
+    "session_calendar_required_from_date": "2026-08-02",
+    "a_share_previous_close_required_from_date": "2026-08-02",
     "buy_requires_v2_active_prediction": true,
     "buy_requires_matching_market_mapping": true,
     "theme_required_from_date": "2026-07-14",
     "maximum_theme_exposure_enforce_from_date": "2026-07-14",
     "theme_registry_history_required_from_date": "2026-07-14",
     "explicit_theme_gate_mode": "enforced_after_verified_registry_reaches_full_open-position_coverage"
+  },
+  "valuation_policy": {
+    "stale_price_policy": "fail",
+    "max_price_age_business_days": 1,
+    "session_calendar_required_from_date": "2026-08-02"
+  },
+  "market_calendar": {
+    "a_share_sessions_file": "work/trading-core/data/equity_universe/trading_calendar.json",
+    "exchange_holiday_contract_file": "work/trading-core/data/system/ashare_trading_calendar_contract.json",
+    "us_calendar_file": "work/global-briefing/config/us_market_calendar.json"
+  },
+  "strategy_context_contract": {
+    "schema_version": 1,
+    "required_for_actions": ["BUY"],
+    "effective_from_date": "2026-08-02",
+    "intent_values": ["OPEN", "ADD"],
+    "thesis_status_values": ["intact", "strengthening", "watch", "failed"],
+    "account_risk_fields": ["as_of_date", "daily_return_pct", "portfolio_drawdown_pct"],
+    "confirming_evidence_fields": ["source", "as_of_date", "summary"],
+    "percent_encoding": "decimal_fraction",
+    "legacy_compatibility": "Orders before effective_from_date remain readable and replayable without strategy_context."
   },
   "strategy_profile": {
     "name": "aggressive_event_momentum_v1",
@@ -126,6 +150,7 @@
       "default_price_limit_pct": 0.1,
       "star_market_price_limit_pct": 0.2,
       "chinext_price_limit_pct": 0.2,
+      "beijing_price_limit_pct": 0.3,
       "st_price_limit_pct": 0.05,
       "commission_rate": 0.0003,
       "min_commission": 5.0,
@@ -166,6 +191,9 @@
     "Every BUY on or after the registry-history enforcement date must embed the current audited registry revision ID and SHA-256; unrecorded registry changes fail closed while SELL and HOLD remain available.",
     "Every new BUY, SELL, or HOLD on or after the prediction-reference enforcement date must reference an original prediction record dated no later than the order; exact idempotent replays remain recoverable.",
     "Every new BUY on or after the prediction-lifecycle enforcement date must reference an open schema-v2 prediction before its event deadline, without an already-recorded event or combined terminal review, and must match an unexpired pre-registered market mapping; SELL and HOLD remain available for risk reduction and monitoring.",
+    "Every BUY on or after the strategy-control enforcement date must carry a structured strategy_context and pass the open/add signal threshold, add-count, daily-loss, drawdown, thesis-status, and averaging-down evidence gates; SELL and HOLD remain available for risk reduction.",
+    "On or after the calendar enforcement date, price age is measured in the instrument exchange's trading sessions and missing calendar coverage fails closed.",
+    "On or after the A-share previous-close enforcement date, every A-share BUY or SELL must include previous_close so the 5%, 10%, 20%, or 30% price-limit band can be verified.",
     "Keep at least min_cash_pct of initial capital as cash unless the user explicitly changes the rule.",
     "When strategy_profile.enabled is true, use the configured signal score and target exposure to favor qualified virtual BUY, ADD, REDUCE, or SELL decisions over passive HOLD.",
     "HOLD is not the default in aggressive mode and must name an allowed blocker from strategy_profile.decision_policy.",

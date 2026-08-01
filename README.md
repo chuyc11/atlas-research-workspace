@@ -66,7 +66,7 @@ python atlas.py sync --date 2026-07-10 --dry-run
 python atlas.py test
 ```
 
-默认命令运行根层全部测试、global-briefing 全部测试、trading-core 的跨项目集成门禁，以及前端构建测试。
+默认命令并发运行彼此隔离的根层测试、global-briefing 测试、trading-core 跨项目集成门禁和单个前端构建测试，日志按声明顺序稳定汇总且任一失败都会关闭门禁。`--full` 路径保持流式串行；trading-core 的全量矩阵继续使用其自身受控分片，避免多个全量运行争用审计产物。
 发布候选可运行完整 trading-core 回归（耗时明显更长）：
 
 ```powershell
@@ -133,8 +133,8 @@ cycle 通过 `work/shared/atlas/cycle.lock` 阻止并发运行；doctor 或 sync
 
 ### 发布闭环
 
-普通非 dry-run `cycle` 会在核心审计锚定后自动执行 Phase B：必要时先生成引导灾备，随后按
-improvements → deep/strict heal → final alert → encrypted backup/restore → staged-candidate retry
+普通非 dry-run `cycle` 会在核心审计锚定后自动执行 Phase B：先用认证归档快速核验复用最近7天内已恢复验证的灾备能力；只有快照缺失或过期才生成引导检查点。正常路径随后按
+improvements → deep/strict heal → final alert → one encrypted daily checkpoint/restore → staged-candidate retry
 的顺序完成发布前证据。它不会重复报告、预测、虚拟订单或估值；失败结果写入独立发布审计，
 不会改写已锚定的基础 cycle 结果。
 
@@ -150,7 +150,9 @@ python atlas.py publish --date YYYY-MM-DD
 显式使用 `--skip-publication` 时才仅按基础周期结果退出。
 
 cycle 的 `overall_passed` 仅为向后兼容字段，语义等同 `operational_gate_passed`。`release_candidate_passed`
-还要求 `--full-tests`、同一 workspace-lock 上输入不变的幂等复跑、三仓干净且每个当前 commit 都被至少一个远端 ref 明确发布；
+还要求 `--full-tests`、同一 workspace-lock 上输入不变的幂等复跑、三仓干净且每个当前 commit 都被至少一个远端 ref 明确发布，
+并通过 `--release-evidence atlas-release-evidence.json` 验证 GitHub Actions 对精确三仓提交、主分支来源及完整测试工作流的 Sigstore 证明；
+没有外部证明或证明校验失败时只影响发布资格，不拖慢日常 operational gate。可用 `--release-repository OWNER/REPO` 在无法从 origin 推断仓库时显式指定。
 `research_promotion_passed` 单独表示研究证据门禁，三者不能互相替代。普通站点同步在门禁或冻结证据不足时只写 staging，
 不会覆盖可部署 JSON；只有与当前报告、输入、载荷、门禁 artifact 和三仓 commit 统一绑定的冻结快照才能进入站点。
 
@@ -198,6 +200,7 @@ atlas doctor
 `atlas doctor` 会报告根仓与两个子仓的 commit、分支、工作树状态，并用只读远端探测验证当前完整 commit SHA
 确实出现在至少一个远端 ref 中，而不只验证远端地址可连通。
 缺少远端或存在未提交改动会显示警告：这不影响本地研究，但会阻断可重复发布。三个仓库必须分别通过自己的质量门禁。
+普通日常 `cycle --skip-publication` 会并发读取三个仓库的本地 HEAD/状态，但跳过不参与操作门的远端网络探测；`--full-tests` 或请求发布时仍要求精确 HEAD 的远端证明。cycle 末重新读取工作树状态，因此早期检查不会掩盖 sync 后出现的脏文件。
 
 ## 虚拟执行与自我进化边界
 
@@ -219,7 +222,7 @@ atlas doctor
 
 - Node 审计固定使用 npm 官方安全端点；当前策略不保留漏洞例外，未来例外必须有责任人、理由和到期日，high/critical 永不豁免。
 - 根 CI 固定 GitHub Action 提交，执行 Ruff、Bandit、秘密扫描、Python 依赖审计、60% 覆盖率及 Python 3.11/3.12 矩阵。组合工作区 checkout 对私有子仓要求仓库 secret `ATLAS_SUBMODULE_TOKEN`；缺失时明确失败，不会降级成缺子仓的假绿。
-- 灾备写入 `D:/ATLAS-Backups`，要求与工作区不同卷；生产配置强制使用 AES-256-GCM。32 字节密钥以 Base64 放入密钥管理器提供的 `ATLAS_BACKUP_ENCRYPTION_KEY` 环境变量，不得写入仓库。schema 4 快照使用分用途 HMAC 认证 manifest sidecar 与 latest 索引，前序介质必须先通过 AEAD、逐文件哈希以及 Git `bundle verify → mirror clone → fsck` 才能接链；明文 staging 仅位于受保护的备份目标并可靠清理。旧 schema 2 `latest.json` 必须由运维显式归档后建立新的加密 genesis，系统不会静默信任迁移。该证据不宣称操作系统凭据等完整运行时已恢复。
+- 灾备写入 `D:/ATLAS-Backups`，要求与工作区不同卷；生产配置强制使用 AES-256-GCM。32 字节密钥以 Base64 放入密钥管理器提供的 `ATLAS_BACKUP_ENCRYPTION_KEY` 环境变量，不得写入仓库。日常 `python atlas.py backup --date YYYY-MM-DD` 创建紧凑发布检查点，创建时仍执行 AEAD、逐文件哈希与完整恢复验证，并签名绑定最近7天内的全量基线；`python atlas.py backup --date YYYY-MM-DD --full` 才执行包含三仓 Git bundle 和完整历史数据的低频深灾备。启动快速预检不会重复解密恢复，但会重新认证 daily 与 full 两层 latest/manifest、哈希两个加密归档并严格核对基线引用；全量基线丢失、被替换或过期都会失败关闭。改进验收复用同一加密验证器，不再信任 latest 中自声明的布尔字段。schema 4 快照使用分用途 HMAC 认证 manifest sidecar 与 latest 索引，明文 staging 仅位于受保护的备份目标并可靠清理。旧 schema 2 `latest.json` 必须由运维显式归档后建立新的加密 genesis，系统不会静默信任迁移。该证据不宣称操作系统凭据等完整运行时已恢复。
 - 高/严重改进项需要确认；告警具备稳定 ID、重试上限、确认超时和升级状态。仅生成路由文件不算送达，每个目的地必须记录不可变回执后才能确认：`python atlas.py alerts --date YYYY-MM-DD --receipt-destination DESTINATION --receipt-id RECEIPT_ID`。真实 connector 回执还会更新独立、带新鲜度约束的 `channel_health.json`，使健康日能力验收保持幂等；需确认告警只有到 `acknowledged` 才通过。Slack 连接器未返回回执时不得宣称已送达。
 - 如需消费已持久化的 retry/ack deadline，可在正常维护时按需执行 `python atlas.py alerts --process-due --json`。项目默认不注册高频计划任务；该命令只创建 `pending_handoff` 或 `escalation_required` 状态，绝不伪造 connector 的送达回执；已升级告警必须由人工处置，不能通过 retry 降级。
 

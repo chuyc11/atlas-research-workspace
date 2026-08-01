@@ -15,19 +15,60 @@ import re
 import shutil
 import subprocess
 import sys
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, date as Date, datetime
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 
-ROOT = Path(__file__).resolve().parent
+ATLAS_WORKSPACE_ROOT_ENV = "ATLAS_WORKSPACE_ROOT"
+
+
+def resolve_workspace_root() -> Path:
+    """Resolve an explicit checkout for installed operational CLI commands.
+
+    A wheel must never guess a workspace from ``site-packages``.  Source-tree
+    execution keeps the historical default; an explicit override is accepted
+    only when it is absolute and contains every governed component.
+    """
+
+    configured = os.environ.get(ATLAS_WORKSPACE_ROOT_ENV)
+    if configured is None:
+        return Path(__file__).resolve().parent
+    candidate = Path(configured).expanduser()
+    if not candidate.is_absolute():
+        raise RuntimeError(f"{ATLAS_WORKSPACE_ROOT_ENV} must be an absolute path")
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError as exc:
+        raise RuntimeError(f"{ATLAS_WORKSPACE_ROOT_ENV} cannot be resolved: {exc}") from exc
+    required = (
+        resolved / "atlas.py",
+        resolved / "work" / "global-briefing",
+        resolved / "work" / "trading-core",
+        resolved / "src",
+    )
+    missing = [str(path) for path in required if not path.exists()]
+    if missing:
+        raise RuntimeError(
+            f"{ATLAS_WORKSPACE_ROOT_ENV} is not an ATLAS checkout; missing: "
+            + ", ".join(missing)
+        )
+    return resolved
+
+
+ROOT = resolve_workspace_root()
 BRIEFING_ROOT = ROOT / "work" / "global-briefing"
 TRADING_ROOT = ROOT / "work" / "trading-core"
 SITE_ROOT = ROOT / "src"
 BRIEFING_SETTINGS_PATH = BRIEFING_ROOT / "config" / "settings.json"
+PAPER_TRADING_CONFIG_PATH = BRIEFING_ROOT / "config" / "paper_trading.json"
+PREDICTION_LEDGER_PATH = BRIEFING_ROOT / "data" / "predictions.jsonl"
 IMPROVEMENT_TRACKING_CONFIG_PATH = BRIEFING_ROOT / "config" / "improvement_tracking.json"
 OUTPUTS_ROOT = ROOT / "outputs"
 ATLAS_RUNTIME_ROOT = ROOT / "work" / "shared" / "atlas"
@@ -35,6 +76,8 @@ VIRTUAL_LEDGER_ROOT = ATLAS_RUNTIME_ROOT / "virtual_execution"
 VIRTUAL_LEDGER_PATH = VIRTUAL_LEDGER_ROOT / "atlas_virtual_execution_ledger.jsonl"
 VIRTUAL_LEDGER_STATE_PATH = VIRTUAL_LEDGER_ROOT / "atlas_virtual_execution_state.json"
 VIRTUAL_LEDGER_AUDIT_PATH = VIRTUAL_LEDGER_ROOT / "atlas_virtual_execution_audit.json"
+VIRTUAL_LEDGER_HEAD_PATH = VIRTUAL_LEDGER_ROOT / "current.json"
+VIRTUAL_LEDGER_GENERATIONS_ROOT = VIRTUAL_LEDGER_ROOT / "generations"
 RUN_AUDIT_ROOT = ATLAS_RUNTIME_ROOT / "run_audits"
 CYCLE_STATE_PATH = ATLAS_RUNTIME_ROOT / "cycle_state.json"
 REPORT_PATTERN = re.compile(r"每日全球晨间简报-(\d{4}-\d{2}-\d{2})\.md$")
@@ -46,11 +89,59 @@ LEDGER_SCHEMA_VERSION = 1
 GIT_REMOTE_PROBE_TIMEOUT_SECONDS = 5
 COMMAND_TIMEOUT_SECONDS = 30 * 60
 COMMAND_TIMEOUT_RETURN_CODE = 124
-HISTORY_ANCHOR_SCHEMA_VERSION = 1
-LEDGER_ANCHOR_SCHEMA_VERSION = 1
+HISTORY_ANCHOR_SCHEMA_VERSION = 2
+GLOBAL_HISTORY_ANCHOR_SCHEMA_VERSION = 3
+GLOBAL_HISTORY_MIGRATION_SCHEMA_VERSION = 1
+GLOBAL_HISTORY_RECOVERY_EVIDENCE_SCHEMA_VERSION = 1
+GLOBAL_HISTORY_RECOVERY_PLAN_SCHEMA_VERSION = 1
+GLOBAL_HISTORY_MIGRATION_KIND = "unit_test_trust_root_contamination"
+LEDGER_ANCHOR_SCHEMA_VERSION = 2
+LEGACY_ANCHOR_SCHEMA_VERSION = 1
 TRUST_ANCHOR_ROOT_ENV = "ATLAS_TRUST_ANCHOR_ROOT"
 TRUST_ANCHOR_HMAC_KEY_ENV = "ATLAS_TRUST_ANCHOR_HMAC_KEY"
 TRUST_ANCHOR_NAMESPACE_ENV = "ATLAS_TRUST_ANCHOR_NAMESPACE"
+TRUST_ANCHOR_WITNESS_ENV = "ATLAS_TRUST_ANCHOR_WITNESS"
+GLOBAL_HISTORY_RECOVERY_EVIDENCE_DIRECTORY = "recovery-evidence"
+GLOBAL_HISTORY_RECOVERY_TEST_FILE = "tests/test_atlas_publication_orchestration.py"
+GLOBAL_HISTORY_RECOVERY_TEST_CASE = (
+    "AtlasPublicationOrchestrationTests."
+    "test_default_cli_cycle_returns_blocked_phase_b_without_rewriting_core_success"
+)
+GLOBAL_HISTORY_MIGRATION_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "source_revision",
+        "source_anchor_sha256",
+        "source_workspace_uuid",
+        "source_entries_sha256",
+        "source_entry_count",
+        "target_workspace_uuid",
+        "target_entries_sha256",
+        "target_entry_count",
+        "daily_anchor_evidence_sha256",
+        "backup_latest_file_sha256",
+        "backup_manifest_file_sha256",
+        "backup_manifest_sha256",
+        "backup_entry_manifest_sha256",
+        "backup_archive_sha256",
+        "backup_created_at",
+        "recovery_evidence_path",
+        "recovery_evidence_sha256",
+        "recovery_plan_sha256",
+    }
+)
+GLOBAL_HISTORY_RECOVERY_EVIDENCE_KEYS = frozenset(
+    {
+        "schema_version",
+        "kind",
+        "cause",
+        "source_anchor",
+        "target_history",
+        "daily_anchors",
+        "backup",
+    }
+)
 MINIMUM_NODE_VERSION = (22, 15, 0)
 RELEASE_REQUIRED_STAGES = (
     "doctor",
@@ -60,6 +151,15 @@ RELEASE_REQUIRED_STAGES = (
     "targeted_integration_tests",
     "canonical_virtual_ledger_commit",
 )
+RELEASE_EVIDENCE_SCHEMA_VERSION = 1
+RELEASE_EVIDENCE_WORKFLOW = ".github/workflows/quality.yml"
+RELEASE_EVIDENCE_SOURCE_REF = "refs/heads/main"
+RELEASE_EVIDENCE_REQUIRED_JOBS = (
+    "briefing-control-plane",
+    "composed-workspace",
+)
+RELEASE_EVIDENCE_MAX_BYTES = 64 * 1024
+BRIEFING_TEST_INPUT_SCHEMA_VERSION = 1
 PUBLICATION_ORCHESTRATION_SCHEMA_VERSION = 1
 PUBLICATION_BLOCKED_RETURN_CODE = 3
 PUBLICATION_NO_CANDIDATE_RETURN_CODE = 4
@@ -124,6 +224,15 @@ class Check:
     status: str
     detail: str
     required: bool = True
+
+
+@dataclass(frozen=True)
+class TestGate:
+    name: str
+    command: tuple[str, ...]
+    cwd: Path = ROOT
+    trading_core: bool = False
+    timeout: float | None = COMMAND_TIMEOUT_SECONDS
 
 
 def command_env(*, trading_core: bool = False) -> dict[str, str]:
@@ -252,7 +361,12 @@ def probe_git_remotes(
     }
 
 
-def component_repository_check(name: str, path: Path) -> Check:
+def component_repository_check(
+    name: str,
+    path: Path,
+    *,
+    probe_remotes: bool = True,
+) -> Check:
     """Report whether a separately governed workspace component is reproducible."""
     git = shutil.which("git")
     if not path.exists():
@@ -277,7 +391,19 @@ def component_repository_check(name: str, path: Path) -> Check:
     dirty_count = len([line for line in status.stdout.splitlines() if line.strip()])
     remote_names = [line.strip() for line in remotes.stdout.splitlines() if line.strip()]
     head_commit = head.stdout.strip()
-    remote_status = probe_git_remotes(git, path, remote_names, head_commit=head_commit)
+    remote_status = (
+        {
+            **probe_git_remotes(git, path, remote_names, head_commit=head_commit),
+            "remote_probe_status": "completed",
+        }
+        if probe_remotes
+        else {
+            "remote_fetchable": False,
+            "fetchable_remote_names": [],
+            "remote_probes": [],
+            "remote_probe_status": "not_requested_daily",
+        }
+    )
     details = [
         f"commit={head_commit[:12] or 'unknown'}",
         f"branch={branch.stdout.strip() or 'detached'}",
@@ -291,6 +417,7 @@ def component_repository_check(name: str, path: Path) -> Check:
                 else "none"
             )
         ),
+        f"remote_probe={remote_status['remote_probe_status']}",
     ]
     repository_ready = dirty_count == 0 and remote_status["remote_fetchable"]
     return Check(
@@ -301,7 +428,101 @@ def component_repository_check(name: str, path: Path) -> Check:
     )
 
 
-def git_repository_provenance(name: str, path: Path) -> dict[str, Any]:
+def relevant_provenance_path(repository: str, relative: str) -> bool:
+    """Select producer source while excluding mutable derived datasets."""
+
+    normalized = relative.replace("\\", "/").lstrip("./")
+    if not normalized or normalized.startswith("../"):
+        return False
+    if repository == "root":
+        excluded = (
+            "outputs/",
+            "work/global-briefing/data/",
+            "work/global-briefing/tmp/",
+            "work/shared/atlas/",
+        )
+        if normalized in {"src", "work/trading-core"}:
+            return False
+        return not normalized.startswith(excluded)
+    if repository == "site":
+        return normalized not in {
+            "app/briefing.generated.json",
+            "app/publication.generated.json",
+        } and not normalized.startswith((".wrangler/", ".next/", "dist/", "node_modules/"))
+    if repository == "trading-core":
+        return not normalized.startswith(
+            ("data/", "outputs/", "artifacts/", ".pytest_cache/", ".ruff_cache/")
+        )
+    return True
+
+
+def repository_dirty_source_manifest(git: str, repository: str, path: Path) -> dict[str, Any]:
+    """Hash dirty source paths without persisting their potentially sensitive bytes."""
+
+    tracked = capture_command(
+        [git, "diff", "--name-only", "--diff-filter=ACDMRTUXB", "HEAD", "--"],
+        cwd=path,
+    )
+    untracked = capture_command(
+        [git, "ls-files", "--others", "--exclude-standard"],
+        cwd=path,
+    )
+    if tracked.returncode != 0 or untracked.returncode != 0:
+        return {"available": False, "entries": [], "content_sha256": None}
+    tracked_names = {line.strip() for line in tracked.stdout.splitlines() if line.strip()}
+    untracked_names = {line.strip() for line in untracked.stdout.splitlines() if line.strip()}
+    entries: list[dict[str, Any]] = []
+    for relative in sorted(tracked_names | untracked_names):
+        if not relevant_provenance_path(repository, relative):
+            continue
+        candidate = (path / relative).resolve()
+        try:
+            candidate.relative_to(path.resolve())
+        except ValueError:
+            continue
+        kind = "untracked" if relative in untracked_names else "tracked"
+        if not candidate.is_file():
+            entries.append({"path": relative.replace("\\", "/"), "kind": kind, "deleted": True})
+            continue
+        entries.append(
+            {
+                "path": relative.replace("\\", "/"),
+                "kind": kind,
+                "bytes": candidate.stat().st_size,
+                "sha256": file_sha256(candidate),
+            }
+        )
+    return {
+        "available": True,
+        "entries": entries,
+        "entry_count": len(entries),
+        "content_sha256": stable_hash(entries),
+    }
+
+
+def repository_derived_artifacts(repository: str, path: Path) -> list[dict[str, Any]]:
+    if repository != "site":
+        return []
+    artifacts = []
+    for relative in ("app/briefing.generated.json", "app/publication.generated.json"):
+        candidate = path / relative
+        if candidate.is_file():
+            artifacts.append(
+                {
+                    "path": relative,
+                    "bytes": candidate.stat().st_size,
+                    "sha256": file_sha256(candidate),
+                }
+            )
+    return artifacts
+
+
+def git_repository_provenance(
+    name: str,
+    path: Path,
+    *,
+    probe_remotes: bool = True,
+) -> dict[str, Any]:
     git = shutil.which("git")
     if not git or not (path / ".git").exists():
         return {"name": name, "path": relative_path(path), "available": False, "release_ready": False}
@@ -313,7 +534,21 @@ def git_repository_provenance(name: str, path: Path) -> dict[str, Any]:
     dirty_paths = [line for line in status.stdout.splitlines() if line.strip()] if status.returncode == 0 else []
     remote_names = sorted(line.strip() for line in remotes.stdout.splitlines() if line.strip()) if remotes.returncode == 0 else []
     head_commit = head.stdout.strip() if head.returncode == 0 else ""
-    remote_status = probe_git_remotes(git, path, remote_names, head_commit=head_commit)
+    remote_status = (
+        {
+            **probe_git_remotes(git, path, remote_names, head_commit=head_commit),
+            "remote_probe_status": "completed",
+        }
+        if probe_remotes
+        else {
+            "remote_fetchable": False,
+            "fetchable_remote_names": [],
+            "remote_probes": [],
+            "remote_probe_status": "not_requested_daily",
+        }
+    )
+    dirty_source = repository_dirty_source_manifest(git, name, path)
+    derived_artifacts = repository_derived_artifacts(name, path)
     payload = {
         "name": name,
         "path": relative_path(path),
@@ -324,6 +559,9 @@ def git_repository_provenance(name: str, path: Path) -> dict[str, Any]:
         "dirty_path_count": len(dirty_paths),
         "remote_names": remote_names,
         "remote_count": len(remote_names),
+        "dirty_source": dirty_source,
+        "derived_artifacts": derived_artifacts,
+        "derived_artifacts_sha256": stable_hash(derived_artifacts),
         **remote_status,
     }
     payload["release_ready"] = bool(
@@ -335,12 +573,63 @@ def git_repository_provenance(name: str, path: Path) -> dict[str, Any]:
     return payload
 
 
-def build_workspace_lock() -> dict[str, Any]:
-    repositories = [
-        git_repository_provenance("root", ROOT),
-        git_repository_provenance("site", SITE_ROOT),
-        git_repository_provenance("trading-core", TRADING_ROOT),
-    ]
+def collect_repository_provenance(
+    repositories: Sequence[tuple[str, Path]],
+    *,
+    probe_remotes: bool,
+) -> list[dict[str, Any]]:
+    """Inspect independent repositories concurrently while preserving declaration order."""
+
+    if not repositories:
+        return []
+
+    def inspect(item: tuple[str, Path]) -> dict[str, Any]:
+        name, path = item
+        return git_repository_provenance(name, path, probe_remotes=probe_remotes)
+
+    workers = min(3, len(repositories))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="atlas-repo") as pool:
+        return list(pool.map(inspect, repositories))
+
+
+def repository_check_from_provenance(name: str, payload: dict[str, Any]) -> Check:
+    if payload.get("available") is not True:
+        return Check(
+            f"{name} repository",
+            "warn",
+            "git metadata could not be inspected",
+            required=False,
+        )
+    dirty_count = int(payload.get("dirty_path_count") or 0)
+    remote_names = [str(value) for value in payload.get("remote_names", [])]
+    fetchable = [str(value) for value in payload.get("fetchable_remote_names", [])]
+    detail = "; ".join(
+        [
+            f"commit={str(payload.get('commit') or '')[:12] or 'unknown'}",
+            f"branch={payload.get('branch') or 'detached'}",
+            f"worktree={'clean' if dirty_count == 0 else f'dirty({dirty_count})'}",
+            f"remotes={','.join(remote_names) if remote_names else 'missing'}",
+            f"fetchable_remotes={','.join(fetchable) if fetchable else 'none'}",
+            f"remote_probe={payload.get('remote_probe_status', 'unknown')}",
+        ]
+    )
+    return Check(
+        f"{name} repository",
+        "ok" if payload.get("release_ready") is True else "warn",
+        detail,
+        required=False,
+    )
+
+
+def build_workspace_lock(*, probe_remotes: bool = True) -> dict[str, Any]:
+    repositories = collect_repository_provenance(
+        [
+            ("root", ROOT),
+            ("site", SITE_ROOT),
+            ("trading-core", TRADING_ROOT),
+        ],
+        probe_remotes=probe_remotes,
+    )
     payload = {
         "schema_version": 1,
         "generated_at": utc_now(),
@@ -351,6 +640,197 @@ def build_workspace_lock() -> dict[str, Any]:
         {key: value for key, value in payload.items() if key != "generated_at"}
     )
     return payload
+
+
+def github_repository_from_origin() -> str | None:
+    """Return ``owner/repository`` for the root GitHub origin, if unambiguous."""
+
+    git = shutil.which("git")
+    if not git:
+        return None
+    result = capture_command([git, "remote", "get-url", "origin"], cwd=ROOT, timeout=10)
+    if result.returncode != 0:
+        return None
+    remote = result.stdout.strip()
+    match = re.fullmatch(
+        r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/\s]+)/([^/\s]+?)(?:\.git)?/?",
+        remote,
+        flags=re.IGNORECASE,
+    )
+    if not match:
+        return None
+    slug = f"{match.group(1)}/{match.group(2)}"
+    return slug if re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", slug) else None
+
+
+def verify_release_evidence(
+    evidence_path: Path,
+    *,
+    workspace_lock: dict[str, Any],
+    expected_repository: str,
+    expected_source_ref: str,
+) -> dict[str, Any]:
+    """Verify commit-bound CI evidence with GitHub's Sigstore trust root.
+
+    The JSON payload is intentionally small and user-readable.  Its contents do
+    not become trusted until ``gh attestation verify`` authenticates the exact
+    file, signer workflow, source commit/ref, and hosted-runner policy.
+    """
+
+    resolved = evidence_path.expanduser().resolve()
+    result: dict[str, Any] = {
+        "requested": True,
+        "verified": False,
+        "artifact_path": str(resolved),
+        "artifact_sha256": None,
+        "artifact_bytes": None,
+        "repository": expected_repository,
+        "source_ref": expected_source_ref,
+        "workflow": RELEASE_EVIDENCE_WORKFLOW,
+        "run_id": None,
+        "run_attempt": None,
+        "verification_count": 0,
+        "errors": [],
+    }
+    errors: list[str] = result["errors"]
+    if not resolved.is_file():
+        errors.append("release evidence file is missing")
+        return result
+    try:
+        size = resolved.stat().st_size
+    except OSError:
+        errors.append("release evidence metadata could not be read")
+        return result
+    result["artifact_bytes"] = size
+    if size <= 0 or size > RELEASE_EVIDENCE_MAX_BYTES:
+        errors.append("release evidence file size is outside the allowed range")
+        return result
+    try:
+        before_hash = file_sha256(resolved)
+        payload = json.loads(resolved.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        errors.append("release evidence is not readable UTF-8 JSON")
+        return result
+    result["artifact_sha256"] = before_hash
+    if not isinstance(payload, dict):
+        errors.append("release evidence must be a JSON object")
+        return result
+
+    expected_repository = expected_repository.strip()
+    expected_source_ref = expected_source_ref.strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", expected_repository):
+        errors.append("expected GitHub repository is invalid")
+    if expected_source_ref != RELEASE_EVIDENCE_SOURCE_REF:
+        errors.append("expected source ref must be refs/heads/main")
+    scalar_requirements = {
+        "schema_version": RELEASE_EVIDENCE_SCHEMA_VERSION,
+        "provider": "github-actions",
+        "workflow": RELEASE_EVIDENCE_WORKFLOW,
+        "source_ref": expected_source_ref,
+        "test_profile": "full",
+    }
+    for field, expected in scalar_requirements.items():
+        if payload.get(field) != expected:
+            errors.append(f"release evidence {field} does not match policy")
+    repository = payload.get("repository")
+    if not isinstance(repository, str) or repository.casefold() != expected_repository.casefold():
+        errors.append("release evidence repository does not match policy")
+    run_id = str(payload.get("run_id") or "")
+    run_attempt = str(payload.get("run_attempt") or "")
+    if not run_id.isdigit() or int(run_id) <= 0:
+        errors.append("release evidence run_id is invalid")
+    if not run_attempt.isdigit() or int(run_attempt) <= 0:
+        errors.append("release evidence run_attempt is invalid")
+    result["run_id"] = run_id or None
+    result["run_attempt"] = run_attempt or None
+    jobs = payload.get("required_jobs")
+    if not isinstance(jobs, list) or set(jobs) != set(RELEASE_EVIDENCE_REQUIRED_JOBS):
+        errors.append("release evidence required jobs do not match policy")
+
+    repositories = workspace_lock.get("repositories")
+    lock_commits = {
+        str(item.get("name")): str(item.get("commit") or "").lower()
+        for item in repositories
+        if isinstance(item, dict)
+    } if isinstance(repositories, list) else {}
+    evidence_commits = payload.get("repository_commits")
+    normalized_evidence_commits = {
+        str(name): str(commit).lower()
+        for name, commit in evidence_commits.items()
+    } if isinstance(evidence_commits, dict) else {}
+    required_names = {"root", "site", "trading-core"}
+    commits_well_formed = all(
+        re.fullmatch(r"[0-9a-f]{40}", lock_commits.get(name, ""))
+        and re.fullmatch(r"[0-9a-f]{40}", normalized_evidence_commits.get(name, ""))
+        for name in required_names
+    )
+    if (
+        not commits_well_formed
+        or set(normalized_evidence_commits) != required_names
+        or any(normalized_evidence_commits.get(name) != lock_commits.get(name) for name in required_names)
+    ):
+        errors.append("repository commits do not match workspace lock")
+    if errors:
+        return result
+
+    gh = shutil.which("gh")
+    if not gh:
+        errors.append("GitHub CLI is unavailable for attestation verification")
+        return result
+    verification = capture_command(
+        [
+            gh,
+            "attestation",
+            "verify",
+            str(resolved),
+            "--repo",
+            expected_repository,
+            "--source-digest",
+            lock_commits["root"],
+            "--source-ref",
+            expected_source_ref,
+            "--signer-workflow",
+            f"{expected_repository}/{RELEASE_EVIDENCE_WORKFLOW}",
+            "--signer-digest",
+            lock_commits["root"],
+            "--deny-self-hosted-runners",
+            "--format",
+            "json",
+        ],
+        cwd=ROOT,
+        timeout=120,
+    )
+    if verification.returncode != 0:
+        errors.append(
+            "GitHub artifact attestation verification timed out"
+            if verification.returncode == COMMAND_TIMEOUT_RETURN_CODE
+            else "GitHub artifact attestation verification failed"
+        )
+        return result
+    try:
+        verified = json.loads(verification.stdout)
+    except json.JSONDecodeError:
+        errors.append("GitHub attestation verifier returned invalid JSON")
+        return result
+    valid_results = [
+        item
+        for item in verified
+        if isinstance(item, dict) and isinstance(item.get("verificationResult"), dict)
+    ] if isinstance(verified, list) else []
+    if not valid_results:
+        errors.append("GitHub attestation verifier returned no verified statements")
+        return result
+    try:
+        after_hash = file_sha256(resolved)
+    except OSError:
+        errors.append("release evidence could not be re-hashed after verification")
+        return result
+    if after_hash != before_hash:
+        errors.append("release evidence changed during verification")
+        return result
+    result["verification_count"] = len(valid_results)
+    result["verified"] = True
+    return result
 
 
 def latest_report() -> tuple[str, Path]:
@@ -415,6 +895,107 @@ def stable_hash(payload: Any) -> str:
     return hashlib.sha256(stable_json(payload).encode("utf-8")).hexdigest()
 
 
+def build_briefing_test_input_fingerprint(
+    root: Path = ROOT,
+    date: str | None = None,
+) -> dict[str, Any]:
+    """Bind the inputs exercised by global-briefing unittest discovery.
+
+    The daily cycle records this before executing tests.  Deep self-healing may
+    reuse the result only when it independently rebuilds the same fingerprint.
+    Runtime ledgers are deliberately excluded; the suite's checked-in source,
+    config, tests, report fixtures, and generated site fixture are included.
+    """
+
+    resolved_root = root.resolve()
+    briefing_root = resolved_root / "work" / "global-briefing"
+    entries: list[dict[str, Any]] = []
+    unsafe_paths: list[str] = []
+
+    def add_file(path: Path) -> None:
+        if path.is_symlink():
+            unsafe_paths.append(str(path))
+            return
+        try:
+            resolved = path.resolve()
+            relative = resolved.relative_to(resolved_root).as_posix()
+        except (OSError, ValueError):
+            unsafe_paths.append(str(path))
+            return
+        if not resolved.is_file():
+            return
+        entries.append(
+            {
+                "path": relative,
+                "bytes": resolved.stat().st_size,
+                "sha256": file_sha256(resolved),
+            }
+        )
+
+    required_files = [
+        resolved_root / "atlas.py",
+        briefing_root / "requirements.txt",
+        resolved_root / "src" / "app" / "briefing.generated.json",
+    ]
+    if date:
+        required_files.append(
+            resolved_root / "outputs" / f"每日全球晨间简报-{date}.md"
+        )
+    missing_required = [
+        path.relative_to(resolved_root).as_posix()
+        for path in required_files
+        if not path.is_file()
+    ]
+    for path in required_files:
+        add_file(path)
+
+    ignored_parts = {"__pycache__", ".pytest_cache", ".ruff_cache"}
+    for directory in (
+        briefing_root / "scripts",
+        briefing_root / "config",
+        briefing_root / "tests",
+    ):
+        if not directory.is_dir():
+            missing_required.append(directory.relative_to(resolved_root).as_posix())
+            continue
+        for path in sorted(directory.rglob("*")):
+            if any(part in ignored_parts for part in path.parts) or path.suffix == ".pyc":
+                continue
+            if path.is_file():
+                add_file(path)
+
+    # Some unittest contracts deliberately inspect older dated reports.  Their
+    # presence and bytes therefore belong to the exercised runtime fixture.
+    outputs_root = resolved_root / "outputs"
+    for path in sorted(outputs_root.glob("每日全球晨间简报-*.md")):
+        if path.is_file():
+            add_file(path)
+
+    entries = sorted(
+        {entry["path"]: entry for entry in entries}.values(),
+        key=lambda item: item["path"],
+    )
+    test_file_count = sum(
+        entry["path"].startswith("work/global-briefing/tests/test_")
+        and entry["path"].endswith(".py")
+        for entry in entries
+    )
+    contract = {
+        "schema_version": BRIEFING_TEST_INPUT_SCHEMA_VERSION,
+        "files": entries,
+        "missing_required": sorted(set(missing_required)),
+        "unsafe_paths": sorted(set(unsafe_paths)),
+    }
+    return {
+        "schema_version": BRIEFING_TEST_INPUT_SCHEMA_VERSION,
+        "fingerprint_sha256": stable_hash(contract),
+        "file_count": len(entries),
+        "test_file_count": test_file_count,
+        "missing_required": contract["missing_required"],
+        "unsafe_paths": contract["unsafe_paths"],
+    }
+
+
 def configured_trust_anchor_value(name: str) -> str | None:
     """Read an explicit process setting, or Windows' current-user fallback.
 
@@ -473,9 +1054,7 @@ def trust_anchor_path(kind: str, subject: str) -> Path:
         raise RuntimeError(error or "external trust-anchor root is unavailable")
     namespace = str(configured_trust_anchor_value(TRUST_ANCHOR_NAMESPACE_ENV) or "").strip()
     if not namespace:
-        raise RuntimeError(
-            f"{TRUST_ANCHOR_NAMESPACE_ENV} is required to select a stable external trust anchor"
-        )
+        namespace = workspace_project_uuid()
     identity = stable_hash(
         {
             "namespace": namespace,
@@ -486,12 +1065,67 @@ def trust_anchor_path(kind: str, subject: str) -> Path:
     return root / "anchors" / f"{kind}-{identity}.json"
 
 
-def trust_anchor_hmac_key() -> bytes | None:
-    """Read, but never persist, the external trust-anchor signing key."""
+def workspace_project_uuid() -> str:
+    """Return a stable project UUID without guessing identity from Git state."""
+
+    namespace = str(configured_trust_anchor_value(TRUST_ANCHOR_NAMESPACE_ENV) or "").strip()
+    identity = f"{namespace}:{str(ROOT.resolve()).casefold()}"
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, f"atlas-workspace:{identity}"))
+
+
+def local_trust_key_path() -> Path:
+    root, error = configured_trust_anchor_root()
+    if root is None:
+        raise RuntimeError(error or "external trust-anchor root is unavailable")
+    return root / "local-only-hmac.key"
+
+
+def trust_anchor_hmac_key(*, create: bool = False) -> bytes | None:
+    """Read the configured key or a local-only key outside the workspace.
+
+    An explicitly empty environment value still disables signing for fail-closed
+    testing and emergency operation.  When no external key is configured, writes
+    may create a mode-0600 local key; resulting evidence is labelled local-only
+    and never represented as an independent witness.
+    """
+
     raw = configured_trust_anchor_value(TRUST_ANCHOR_HMAC_KEY_ENV)
-    if raw is None or not raw.strip():
+    if raw is not None:
+        return raw.encode("utf-8") if raw.strip() else None
+    try:
+        path = local_trust_key_path()
+    except RuntimeError:
         return None
-    return raw.encode("utf-8")
+    if path.is_file():
+        try:
+            key = path.read_bytes()
+        except OSError:
+            return None
+        return key if len(key) >= 32 else None
+    if not create:
+        return None
+    path.parent.mkdir(parents=True, exist_ok=True)
+    key = os.urandom(32)
+    try:
+        descriptor = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return trust_anchor_hmac_key(create=False)
+    with os.fdopen(descriptor, "wb") as handle:
+        handle.write(key)
+        handle.flush()
+        os.fsync(handle.fileno())
+    return key
+
+
+def trust_scope_payload() -> dict[str, Any]:
+    witness = str(configured_trust_anchor_value(TRUST_ANCHOR_WITNESS_ENV) or "").strip()
+    return {
+        "trust_scope": "local-only",
+        "witness": {
+            "status": "configured-unverified" if witness else "unavailable",
+            "verified": False,
+        },
+    }
 
 
 def trust_anchor_key_id(key: bytes) -> str:
@@ -507,7 +1141,7 @@ def trust_anchor_signature(payload: dict[str, Any], key: bytes) -> str:
 
 def sign_trust_anchor(payload: dict[str, Any]) -> dict[str, Any]:
     """Authenticate an anchor with an externally supplied HMAC key."""
-    key = trust_anchor_hmac_key()
+    key = trust_anchor_hmac_key(create=True)
     if key is None:
         raise RuntimeError(
             f"{TRUST_ANCHOR_HMAC_KEY_ENV} is required to create an external trust anchor"
@@ -539,6 +1173,181 @@ def trust_anchor_authentication_errors(payload: dict[str, Any], *, label: str) -
     return []
 
 
+def monotonic_anchor_versions_path(anchor_path: Path) -> Path:
+    return anchor_path.with_name(f"{anchor_path.name}.versions")
+
+
+def next_monotonic_anchor_fields(
+    anchor_path: Path,
+    *,
+    head_hash_field: str,
+) -> dict[str, Any]:
+    previous: dict[str, Any] | None = None
+    if anchor_path.is_file():
+        loaded = read_json_file(anchor_path)
+        if not isinstance(loaded, dict):
+            raise RuntimeError(f"monotonic anchor is not a JSON object: {anchor_path}")
+        errors = trust_anchor_authentication_errors(loaded, label="previous monotonic anchor")
+        if errors:
+            raise RuntimeError("; ".join(errors))
+        previous = loaded
+    revision = int(previous.get("revision") or 0) + 1 if previous else 1
+    previous_hash = previous.get(head_hash_field) if previous else None
+    if previous is not None and not isinstance(previous_hash, str):
+        raise RuntimeError("previous monotonic anchor has no semantic head hash")
+    return {
+        "workspace_uuid": workspace_project_uuid(),
+        "revision": revision,
+        "previous_head_sha256": previous_hash,
+        **trust_scope_payload(),
+    }
+
+
+def write_monotonic_anchor(
+    anchor_path: Path,
+    payload: dict[str, Any],
+    *,
+    head_hash_field: str,
+) -> None:
+    """Commit an authenticated content-addressed head, then its mutable pointer."""
+
+    current = read_json_file(anchor_path, default=None)
+    expected_previous = payload.get("previous_head_sha256")
+    if current is None:
+        if expected_previous is not None:
+            raise RuntimeError("monotonic anchor CAS failed: predecessor disappeared")
+    elif not isinstance(current, dict) or current.get(head_hash_field) != expected_previous:
+        raise RuntimeError("monotonic anchor CAS failed: predecessor changed")
+    elif errors := trust_anchor_authentication_errors(current, label="current monotonic anchor"):
+        raise RuntimeError("; ".join(errors))
+    payload_errors = trust_anchor_authentication_errors(payload, label="new monotonic anchor")
+    if payload_errors:
+        raise RuntimeError("; ".join(payload_errors))
+    if payload.get("workspace_uuid") != workspace_project_uuid():
+        raise RuntimeError("new monotonic anchor workspace UUID mismatch")
+    revision = payload.get("revision")
+    head_hash = payload.get(head_hash_field)
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise RuntimeError("monotonic anchor revision is invalid")
+    if not isinstance(head_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", head_hash):
+        raise RuntimeError("monotonic anchor head hash is invalid")
+    version_path = monotonic_anchor_versions_path(anchor_path) / (
+        f"{revision:020d}-{head_hash}.json"
+    )
+    # Retained heads are the append-only rollback witness.  Reusing a semantic
+    # filename with different bytes must fail instead of silently replacing the
+    # evidence that a later pointer is supposed to preserve.
+    write_immutable_json(version_path, payload)
+    observed = read_json_file(anchor_path, default=None)
+    if current is None:
+        if observed is not None:
+            raise RuntimeError("monotonic anchor CAS failed: predecessor appeared")
+    elif not isinstance(observed, dict) or observed.get(head_hash_field) != expected_previous:
+        raise RuntimeError("monotonic anchor CAS failed: predecessor changed")
+    atomic_write_json(anchor_path, payload)
+
+
+def monotonic_anchor_errors(
+    anchor_path: Path,
+    payload: dict[str, Any],
+    *,
+    label: str,
+    head_hash_field: str,
+    workspace_transition_validator: Callable[
+        [dict[str, Any], dict[str, Any]], list[str]
+    ]
+    | None = None,
+) -> list[str]:
+    """Detect pointer rollback against retained content-addressed local heads."""
+
+    if payload.get("revision") is None:
+        return []  # Authenticated schema-v1 evidence upgrades on its next write.
+    errors: list[str] = []
+    if payload.get("workspace_uuid") != workspace_project_uuid():
+        errors.append(f"{label} workspace UUID mismatch")
+    revision = payload.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        errors.append(f"{label} revision is invalid")
+    if payload.get("trust_scope") != "local-only":
+        errors.append(f"{label} trust scope is unsupported")
+    witness = payload.get("witness")
+    if not isinstance(witness, dict) or witness.get("verified") is not False:
+        errors.append(f"{label} contains an unsupported witness claim")
+    versions: list[dict[str, Any]] = []
+    for path in sorted(monotonic_anchor_versions_path(anchor_path).glob("*.json")):
+        try:
+            version = read_json_file(path)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"{label} version {path.name} is unreadable: {exc}")
+            continue
+        if not isinstance(version, dict):
+            errors.append(f"{label} version {path.name} is invalid")
+            continue
+        errors.extend(trust_anchor_authentication_errors(version, label=f"{label} version"))
+        version_revision = version.get("revision")
+        version_head = version.get(head_hash_field)
+        if (
+            isinstance(version_revision, bool)
+            or not isinstance(version_revision, int)
+            or version_revision < 1
+        ):
+            errors.append(f"{label} version {path.name} has an invalid revision")
+            continue
+        if not isinstance(version_head, str) or not re.fullmatch(r"[0-9a-f]{64}", version_head):
+            errors.append(f"{label} version {path.name} has an invalid semantic head")
+            continue
+        if path.name != f"{version_revision:020d}-{version_head}.json":
+            errors.append(f"{label} version filename does not bind its revision and head")
+        if not isinstance(version.get("workspace_uuid"), str) or not version.get("workspace_uuid"):
+            errors.append(f"{label} version {path.name} has no workspace UUID")
+        versions.append(version)
+    if not versions:
+        errors.append(f"{label} has a revision but no retained head versions")
+        return errors
+    versions.sort(key=lambda item: int(item["revision"]))
+    previous: dict[str, Any] | None = None
+    workspace_transition_count = 0
+    for version in versions:
+        if previous is None:
+            if version.get("revision") != 1:
+                errors.append(f"{label} retained revisions do not start at one")
+        else:
+            previous_revision = previous.get("revision")
+            current_revision = version.get("revision")
+            if (
+                isinstance(previous_revision, bool)
+                or not isinstance(previous_revision, int)
+                or isinstance(current_revision, bool)
+                or not isinstance(current_revision, int)
+                or current_revision != previous_revision + 1
+            ):
+                errors.append(f"{label} retained revisions are not contiguous")
+            if version.get("previous_head_sha256") != previous.get(head_hash_field):
+                errors.append(f"{label} retained predecessor hash mismatch")
+            previous_workspace = previous.get("workspace_uuid")
+            current_workspace = version.get("workspace_uuid")
+            if previous_workspace != current_workspace:
+                workspace_transition_count += 1
+                if workspace_transition_count > 1:
+                    errors.append(f"{label} contains more than one workspace transition")
+                if workspace_transition_validator is None:
+                    errors.append(f"{label} retained workspace UUID changed")
+                else:
+                    errors.extend(workspace_transition_validator(previous, version))
+            elif version.get("workspace_migration") is not None:
+                errors.append(f"{label} has migration metadata without a workspace transition")
+        previous = version
+    latest = versions[-1]
+    if (
+        payload.get("revision") != latest.get("revision")
+        or payload.get(head_hash_field) != latest.get(head_hash_field)
+    ):
+        errors.append(f"{label} pointer was rolled back behind its retained head")
+    elif payload != latest:
+        errors.append(f"{label} pointer differs from its retained head payload")
+    return errors
+
+
 def relative_path(path: Path) -> str:
     try:
         return str(path.resolve().relative_to(ROOT.resolve()))
@@ -568,6 +1377,34 @@ def atomic_write_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
         for row in rows
     )
     atomic_write_text(path, text)
+
+
+def write_immutable_text(path: Path, text: str) -> None:
+    """Create a content-addressed file, rejecting an altered prior generation."""
+
+    if path.exists():
+        if path.read_text(encoding="utf-8") != text:
+            raise RuntimeError(f"immutable generation artifact changed: {path}")
+        return
+    atomic_write_text(path, text)
+
+
+def write_immutable_json(path: Path, payload: Any) -> None:
+    write_immutable_text(
+        path,
+        json.dumps(payload, allow_nan=False, ensure_ascii=False, indent=2, sort_keys=True)
+        + "\n",
+    )
+
+
+def write_immutable_jsonl(path: Path, rows: Sequence[dict[str, Any]]) -> None:
+    write_immutable_text(
+        path,
+        "".join(
+            json.dumps(row, allow_nan=False, ensure_ascii=False, sort_keys=True) + "\n"
+            for row in rows
+        ),
+    )
 
 
 def strict_json_loads(text: str, *, source: str) -> Any:
@@ -642,8 +1479,10 @@ def build_cycle_history_anchor(history_root: Path, integrity: dict[str, Any]) ->
         raise ValueError("cannot anchor an invalid run-audit history")
     if integrity.get("legacy_record_count"):
         raise ValueError("cannot anchor legacy run-audit records without an explicit migration")
+    anchor_path = cycle_history_anchor_path(history_root)
     payload: dict[str, Any] = {
         "schema_version": HISTORY_ANCHOR_SCHEMA_VERSION,
+        **next_monotonic_anchor_fields(anchor_path, head_hash_field="anchor_sha256"),
         "history_root": relative_path(history_root),
         "entries": manifest,
         "entry_count": len(manifest),
@@ -659,8 +1498,394 @@ def build_cycle_history_anchor(history_root: Path, integrity: dict[str, Any]) ->
 
 def write_cycle_history_anchor(history_root: Path, integrity: dict[str, Any]) -> dict[str, Any]:
     payload = build_cycle_history_anchor(history_root, integrity)
-    atomic_write_json(cycle_history_anchor_path(history_root), payload)
+    write_monotonic_anchor(
+        cycle_history_anchor_path(history_root),
+        payload,
+        head_hash_field="anchor_sha256",
+    )
     return payload
+
+
+def global_cycle_history_anchor_path() -> Path:
+    return trust_anchor_path("run-audit-history-global", "all-dates")
+
+
+def global_cycle_history_manifest() -> list[dict[str, str]]:
+    history_root = RUN_AUDIT_ROOT / "history"
+    if not history_root.exists():
+        return []
+    return [
+        {
+            "path": path.relative_to(history_root).as_posix(),
+            "sha256": file_sha256(path),
+        }
+        for path in sorted(history_root.glob("*/*.json"))
+    ]
+
+
+def global_history_recovery_evidence_path(evidence_sha256: str) -> Path:
+    if not re.fullmatch(r"[0-9a-f]{64}", evidence_sha256):
+        raise ValueError("global history recovery evidence hash is invalid")
+    root, error = configured_trust_anchor_root()
+    if root is None:
+        raise RuntimeError(error or "external trust-anchor root is unavailable")
+    return (
+        root
+        / GLOBAL_HISTORY_RECOVERY_EVIDENCE_DIRECTORY
+        / f"global-run-audit-history-{evidence_sha256}.json"
+    )
+
+
+def global_history_recovery_plan_contract(
+    migration: dict[str, Any],
+) -> dict[str, Any]:
+    return {
+        "schema_version": GLOBAL_HISTORY_RECOVERY_PLAN_SCHEMA_VERSION,
+        **{
+            key: migration.get(key)
+            for key in sorted(GLOBAL_HISTORY_MIGRATION_KEYS - {"recovery_plan_sha256"})
+        },
+    }
+
+
+def parse_run_audit_entry_time(path_value: Any) -> datetime | None:
+    if not isinstance(path_value, str):
+        return None
+    matched = re.search(r"-RUN-(\d{8}T\d{6}(?:\d{1,6})?Z)\.json$", path_value)
+    if not matched:
+        return None
+    token = matched.group(1)
+    for pattern in ("%Y%m%dT%H%M%S%fZ", "%Y%m%dT%H%M%SZ"):
+        try:
+            return datetime.strptime(token, pattern).replace(tzinfo=UTC)
+        except ValueError:
+            continue
+    return None
+
+
+def parse_utc_timestamp(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.astimezone(UTC)
+
+
+def global_history_workspace_transition_errors(
+    previous: dict[str, Any],
+    current: dict[str, Any],
+) -> list[str]:
+    """Authorize only the one evidence-bound test-contamination recovery."""
+
+    errors: list[str] = []
+    migration = current.get("workspace_migration")
+    if not isinstance(migration, dict) or set(migration) != GLOBAL_HISTORY_MIGRATION_KEYS:
+        return ["global run-audit workspace migration metadata is missing or malformed"]
+    if migration.get("schema_version") != GLOBAL_HISTORY_MIGRATION_SCHEMA_VERSION:
+        errors.append("global run-audit workspace migration schema is unsupported")
+    if migration.get("kind") != GLOBAL_HISTORY_MIGRATION_KIND:
+        errors.append("global run-audit workspace migration kind is unsupported")
+    if previous.get("schema_version") != HISTORY_ANCHOR_SCHEMA_VERSION:
+        errors.append("global run-audit migration predecessor schema is unsupported")
+    if current.get("schema_version") != GLOBAL_HISTORY_ANCHOR_SCHEMA_VERSION:
+        errors.append("global run-audit migration target schema is unsupported")
+    if previous.get("revision") != 1 or current.get("revision") != 2:
+        errors.append("global run-audit recovery must be the revision-one to revision-two transition")
+
+    previous_entries = previous.get("entries")
+    current_entries = current.get("entries")
+    if not isinstance(previous_entries, list) or len(previous_entries) != 1:
+        errors.append("global run-audit recovery predecessor is not the single polluted entry")
+        previous_entries = []
+    if not isinstance(current_entries, list) or not current_entries:
+        errors.append("global run-audit recovery target manifest is empty or invalid")
+        current_entries = []
+    if any(entry in current_entries for entry in previous_entries):
+        errors.append("global run-audit recovery target still contains the polluted entry")
+    if previous.get("history_root") != current.get("history_root"):
+        errors.append("global run-audit recovery changed the history root")
+
+    expected_values = {
+        "source_revision": previous.get("revision"),
+        "source_anchor_sha256": previous.get("anchor_sha256"),
+        "source_workspace_uuid": previous.get("workspace_uuid"),
+        "source_entries_sha256": stable_hash(previous_entries),
+        "source_entry_count": len(previous_entries),
+        "target_workspace_uuid": current.get("workspace_uuid"),
+        "target_entries_sha256": stable_hash(current_entries),
+        "target_entry_count": len(current_entries),
+    }
+    for key, expected in expected_values.items():
+        if migration.get(key) != expected:
+            errors.append(f"global run-audit workspace migration {key} mismatch")
+    if current.get("previous_head_sha256") != previous.get("anchor_sha256"):
+        errors.append("global run-audit migration predecessor head mismatch")
+    if current.get("workspace_uuid") != workspace_project_uuid():
+        errors.append("global run-audit migration target is not the active workspace")
+
+    plan_hash = stable_hash(global_history_recovery_plan_contract(migration))
+    if migration.get("recovery_plan_sha256") != plan_hash:
+        errors.append("global run-audit recovery plan hash mismatch")
+
+    evidence_hash = migration.get("recovery_evidence_sha256")
+    evidence_path_value = migration.get("recovery_evidence_path")
+    evidence: dict[str, Any] | None = None
+    if not isinstance(evidence_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", evidence_hash):
+        errors.append("global run-audit recovery evidence hash is invalid")
+    if not isinstance(evidence_path_value, str):
+        errors.append("global run-audit recovery evidence path is invalid")
+    else:
+        try:
+            expected_path = global_history_recovery_evidence_path(str(evidence_hash))
+            root, root_error = configured_trust_anchor_root()
+            if root is None:
+                raise RuntimeError(root_error or "external trust-anchor root is unavailable")
+            candidate = (root / Path(evidence_path_value)).resolve()
+            candidate.relative_to((root / GLOBAL_HISTORY_RECOVERY_EVIDENCE_DIRECTORY).resolve())
+            if candidate != expected_path.resolve():
+                raise ValueError("content-addressed recovery evidence path mismatch")
+            loaded = read_json_file(candidate)
+            if not isinstance(loaded, dict):
+                raise ValueError("recovery evidence must be a JSON object")
+            evidence = loaded
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            errors.append(f"global run-audit recovery evidence is unavailable or invalid: {exc}")
+
+    if evidence is None:
+        return errors
+    if set(evidence) != GLOBAL_HISTORY_RECOVERY_EVIDENCE_KEYS:
+        errors.append("global run-audit recovery evidence fields are malformed")
+    if evidence.get("schema_version") != GLOBAL_HISTORY_RECOVERY_EVIDENCE_SCHEMA_VERSION:
+        errors.append("global run-audit recovery evidence schema is unsupported")
+    if evidence.get("kind") != GLOBAL_HISTORY_MIGRATION_KIND:
+        errors.append("global run-audit recovery evidence kind is unsupported")
+    if stable_hash(evidence) != evidence_hash:
+        errors.append("global run-audit recovery evidence content hash mismatch")
+
+    expected_cause = {
+        "classification": "unit_test_inherited_production_trust_configuration",
+        "test_file": GLOBAL_HISTORY_RECOVERY_TEST_FILE,
+        "test_case": GLOBAL_HISTORY_RECOVERY_TEST_CASE,
+    }
+    if evidence.get("cause") != expected_cause:
+        errors.append("global run-audit recovery cause is not the allowlisted test incident")
+    expected_source = {
+        "schema_version": previous.get("schema_version"),
+        "revision": previous.get("revision"),
+        "anchor_sha256": previous.get("anchor_sha256"),
+        "anchor_file_sha256": file_sha256(
+            monotonic_anchor_versions_path(global_cycle_history_anchor_path())
+            / f"{int(previous.get('revision') or 0):020d}-{previous.get('anchor_sha256')}.json"
+        ),
+        "workspace_uuid": previous.get("workspace_uuid"),
+        "hmac_key_id": previous.get("hmac_key_id"),
+        "entry_count": len(previous_entries),
+        "entries": previous_entries,
+    }
+    if evidence.get("source_anchor") != expected_source:
+        errors.append("global run-audit recovery source evidence mismatch")
+    expected_target = {
+        "history_root": current.get("history_root"),
+        "workspace_uuid": current.get("workspace_uuid"),
+        "entry_count": len(current_entries),
+        "entries_sha256": stable_hash(current_entries),
+        "entries": current_entries,
+    }
+    if evidence.get("target_history") != expected_target:
+        errors.append("global run-audit recovery target evidence mismatch")
+
+    daily = evidence.get("daily_anchors")
+    flattened: list[dict[str, Any]] = []
+    if not isinstance(daily, list) or not daily:
+        errors.append("global run-audit recovery daily-anchor evidence is empty or invalid")
+        daily = []
+    for item in daily:
+        item_entries = item.get("entries") if isinstance(item, dict) else None
+        if not isinstance(item_entries, list):
+            errors.append("global run-audit recovery daily-anchor entries are invalid")
+            continue
+        flattened.extend(item_entries)
+    if flattened != current_entries:
+        errors.append("global run-audit recovery daily anchors do not cover the target manifest")
+    if stable_hash(daily) != migration.get("daily_anchor_evidence_sha256"):
+        errors.append("global run-audit recovery daily-anchor evidence hash mismatch")
+
+    backup = evidence.get("backup")
+    required_backup_keys = {
+        "latest_path",
+        "latest_file_sha256",
+        "manifest_path",
+        "manifest_file_sha256",
+        "manifest_sha256",
+        "archive_sha256",
+        "created_at",
+        "verified",
+        "archive_integrity_verified",
+        "restore_verified",
+        "encrypted_container_authenticated",
+        "snapshot_profile",
+        "latest_metadata_authentication_key_id",
+        "manifest_metadata_authentication_key_id",
+        "entries",
+        "entries_sha256",
+    }
+    if not isinstance(backup, dict) or set(backup) != required_backup_keys:
+        errors.append("global run-audit recovery backup evidence is malformed")
+        backup = {}
+    for key in (
+        "verified",
+        "archive_integrity_verified",
+        "restore_verified",
+        "encrypted_container_authenticated",
+    ):
+        if backup.get(key) is not True:
+            errors.append(f"global run-audit recovery backup {key} is not true")
+    if backup.get("entries") != current_entries:
+        errors.append("global run-audit recovery backup manifest does not match the target history")
+    if backup.get("entries_sha256") != stable_hash(current_entries):
+        errors.append("global run-audit recovery backup entry manifest hash mismatch")
+    backup_bindings = {
+        "backup_latest_file_sha256": backup.get("latest_file_sha256"),
+        "backup_manifest_file_sha256": backup.get("manifest_file_sha256"),
+        "backup_manifest_sha256": backup.get("manifest_sha256"),
+        "backup_entry_manifest_sha256": backup.get("entries_sha256"),
+        "backup_archive_sha256": backup.get("archive_sha256"),
+        "backup_created_at": backup.get("created_at"),
+    }
+    for key, expected in backup_bindings.items():
+        if migration.get(key) != expected:
+            errors.append(f"global run-audit recovery {key} mismatch")
+    backup_time = parse_utc_timestamp(backup.get("created_at"))
+    source_times = [
+        parsed
+        for parsed in (parse_run_audit_entry_time(item.get("path")) for item in previous_entries)
+        if parsed is not None
+    ]
+    if backup_time is None or len(source_times) != len(previous_entries):
+        errors.append("global run-audit recovery chronology evidence is invalid")
+    elif any(backup_time >= source_time for source_time in source_times):
+        errors.append("global run-audit recovery backup does not predate the polluted entry")
+    return errors
+
+
+def audit_global_cycle_history(*, allow_append: bool = False) -> dict[str, Any]:
+    errors: list[str] = []
+    history_root = RUN_AUDIT_ROOT / "history"
+    for directory in sorted(path for path in history_root.glob("*") if path.is_dir()):
+        dated = audit_cycle_history(directory)
+        if not dated["passed"]:
+            errors.extend(f"{directory.name}: {error}" for error in dated["errors"])
+    entries = global_cycle_history_manifest()
+    try:
+        anchor_path = global_cycle_history_anchor_path()
+    except RuntimeError as exc:
+        return {
+            "passed": False,
+            "errors": [str(exc)],
+            "entries": entries,
+            "anchor_present": False,
+        }
+    anchor = read_json_file(anchor_path, default=None)
+    if anchor is None:
+        return {
+            "passed": not errors,
+            "errors": errors,
+            "entries": entries,
+            "anchor_present": False,
+            "migration_required": bool(entries),
+            "append_pending": False,
+        }
+    if not isinstance(anchor, dict):
+        errors.append("global run-audit history anchor is invalid")
+    else:
+        if anchor.get("schema_version") not in {
+            HISTORY_ANCHOR_SCHEMA_VERSION,
+            GLOBAL_HISTORY_ANCHOR_SCHEMA_VERSION,
+        }:
+            errors.append("global run-audit history anchor schema is unsupported")
+        if anchor.get("anchor_sha256") != history_anchor_hash(anchor):
+            errors.append("global run-audit history anchor hash mismatch")
+        errors.extend(
+            trust_anchor_authentication_errors(anchor, label="global run-audit history anchor")
+        )
+        errors.extend(
+            monotonic_anchor_errors(
+                anchor_path,
+                anchor,
+                label="global run-audit history anchor",
+                head_hash_field="anchor_sha256",
+                workspace_transition_validator=global_history_workspace_transition_errors,
+            )
+        )
+        previous_entries = anchor.get("entries")
+        if not isinstance(previous_entries, list):
+            errors.append("global run-audit history anchor entries are invalid")
+        elif previous_entries != entries:
+            valid_append = bool(
+                allow_append
+                and len(entries) > len(previous_entries)
+                and entries[: len(previous_entries)] == previous_entries
+            )
+            if not valid_append:
+                errors.append("global run-audit history was deleted, reordered, or mutated")
+    return {
+        "passed": not errors,
+        "errors": errors,
+        "entries": entries,
+        "anchor_present": isinstance(anchor, dict),
+        "migration_required": False,
+        "append_pending": bool(
+            isinstance(anchor, dict)
+            and isinstance(anchor.get("entries"), list)
+            and anchor.get("entries") != entries
+            and entries[: len(anchor.get("entries", []))] == anchor.get("entries")
+        ),
+    }
+
+
+def write_global_cycle_history_anchor(integrity: dict[str, Any]) -> dict[str, Any]:
+    if integrity.get("passed") is not True:
+        raise ValueError("cannot anchor invalid global run-audit history")
+    anchor_path = global_cycle_history_anchor_path()
+    core = {
+        "schema_version": GLOBAL_HISTORY_ANCHOR_SCHEMA_VERSION,
+        "history_root": relative_path(RUN_AUDIT_ROOT / "history"),
+        "entries": global_cycle_history_manifest(),
+    }
+    existing = read_json_file(anchor_path, default=None)
+    if isinstance(existing, dict):
+        authentication_errors = trust_anchor_authentication_errors(
+            existing, label="existing global run-audit history anchor"
+        )
+        if authentication_errors:
+            raise ValueError("; ".join(authentication_errors))
+        existing_workspace = existing.get("workspace_uuid")
+        if existing_workspace is not None and existing_workspace != workspace_project_uuid():
+            raise ValueError(
+                "global run-audit history anchor belongs to another workspace; "
+                "use the explicit recovery command"
+            )
+        existing_entries = existing.get("entries")
+        if not isinstance(existing_entries, list) or core["entries"][: len(existing_entries)] != existing_entries:
+            raise ValueError(
+                "global run-audit history is not an append of its existing anchor; "
+                "use the explicit recovery command"
+            )
+    if isinstance(existing, dict) and all(existing.get(key) == value for key, value in core.items()):
+        return existing
+    payload = {
+        **core,
+        "entry_count": len(core["entries"]),
+        **next_monotonic_anchor_fields(anchor_path, head_hash_field="anchor_sha256"),
+    }
+    payload["anchor_sha256"] = history_anchor_hash(payload)
+    signed = sign_trust_anchor(payload)
+    write_monotonic_anchor(anchor_path, signed, head_hash_field="anchor_sha256")
+    return signed
 
 
 def audit_cycle_history(
@@ -681,7 +1906,7 @@ def audit_cycle_history(
     trust_root, trust_root_error = configured_trust_anchor_root()
     if trust_root is None:
         errors.append(trust_root_error or "external trust-anchor root is unavailable")
-    if trust_anchor_hmac_key() is None:
+    if trust_anchor_hmac_key() is None and (history_root.exists() and any(history_root.glob("*.json"))):
         errors.append(
             f"run audit history cannot be verified: {TRUST_ANCHOR_HMAC_KEY_ENV} is not configured"
         )
@@ -738,7 +1963,10 @@ def audit_cycle_history(
                 errors.append("run audit history anchor must be a JSON object")
             else:
                 anchor = loaded_anchor
-                if anchor.get("schema_version") != HISTORY_ANCHOR_SCHEMA_VERSION:
+                if anchor.get("schema_version") not in {
+                    LEGACY_ANCHOR_SCHEMA_VERSION,
+                    HISTORY_ANCHOR_SCHEMA_VERSION,
+                }:
                     errors.append("unsupported run audit history anchor schema")
                 if anchor.get("history_root") != relative_path(history_root):
                     errors.append("run audit history anchor points to a different history root")
@@ -747,6 +1975,15 @@ def audit_cycle_history(
                 errors.extend(
                     trust_anchor_authentication_errors(anchor, label="run audit history anchor")
                 )
+                if anchor.get("schema_version") == HISTORY_ANCHOR_SCHEMA_VERSION:
+                    errors.extend(
+                        monotonic_anchor_errors(
+                            anchor_path,
+                            anchor,
+                            label="run audit history anchor",
+                            head_hash_field="anchor_sha256",
+                        )
+                    )
                 anchor_entries = anchor.get("entries")
                 if not isinstance(anchor_entries, list):
                     errors.append("run audit history anchor entries are invalid")
@@ -796,6 +2033,475 @@ def audit_cycle_history(
         "anchor_path": str(anchor_path) if anchor_path is not None else None,
         "anchor_present": anchor_present,
     }
+
+
+def load_disaster_recovery_module() -> Any:
+    script = BRIEFING_ROOT / "scripts" / "disaster_recovery.py"
+    spec = importlib.util.spec_from_file_location("atlas_disaster_recovery_verifier", script)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot load the disaster-recovery verifier")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def backup_global_history_entries(manifest: dict[str, Any]) -> list[dict[str, str]]:
+    prefix = "work/shared/atlas/run_audits/history/"
+    entries: list[dict[str, str]] = []
+    files = manifest.get("files")
+    if not isinstance(files, list):
+        raise ValueError("backup manifest files are missing")
+    for item in files:
+        if not isinstance(item, dict) or item.get("kind") != "workspace_file":
+            continue
+        path_value = str(item.get("path") or "").replace("\\", "/")
+        if not path_value.startswith(prefix) or not path_value.endswith(".json"):
+            continue
+        relative = path_value[len(prefix) :]
+        digest = item.get("sha256")
+        if not relative or not isinstance(digest, str) or not re.fullmatch(r"[0-9a-f]{64}", digest):
+            raise ValueError("backup run-audit history entry is malformed")
+        entries.append({"path": relative, "sha256": digest})
+    ordered = sorted(entries, key=lambda item: item["path"])
+    if len({item["path"] for item in ordered}) != len(ordered):
+        raise ValueError("backup run-audit history contains duplicate paths")
+    return ordered
+
+
+def metadata_authentication_key_id(payload: dict[str, Any], *, label: str) -> str:
+    authentication = payload.get("metadata_authentication")
+    key_id = authentication.get("key_id") if isinstance(authentication, dict) else None
+    if not isinstance(key_id, str) or not key_id:
+        raise ValueError(f"{label} has no metadata authentication key identifier")
+    return key_id
+
+
+def verify_global_history_recovery_backup(latest_path: Path) -> dict[str, Any]:
+    """Independently authenticate a restore-verified backup and freeze its history view."""
+
+    resolved_latest = latest_path.expanduser().resolve()
+    latest_before = resolved_latest.read_bytes()
+    latest = strict_json_loads(latest_before.decode("utf-8"), source=str(resolved_latest))
+    if not isinstance(latest, dict):
+        raise ValueError("backup latest metadata must be a JSON object")
+    manifest_path_value = latest.get("manifest_sidecar")
+    if not isinstance(manifest_path_value, str):
+        raise ValueError("backup latest metadata has no manifest sidecar")
+    manifest_path = Path(manifest_path_value).expanduser().resolve()
+    manifest_before = manifest_path.read_bytes()
+    manifest = strict_json_loads(manifest_before.decode("utf-8"), source=str(manifest_path))
+    if not isinstance(manifest, dict):
+        raise ValueError("backup manifest must be a JSON object")
+
+    verifier = load_disaster_recovery_module()
+    verification = verifier.verify_latest_snapshot(
+        root=ROOT,
+        config_path=IMPROVEMENT_TRACKING_CONFIG_PATH,
+        latest_path=resolved_latest,
+        quick=True,
+    )
+    if resolved_latest.read_bytes() != latest_before or manifest_path.read_bytes() != manifest_before:
+        raise RuntimeError("backup evidence changed during verification")
+    required_true = (
+        "verified",
+        "archive_integrity_verified",
+        "restore_verified",
+        "encrypted_container_authenticated",
+    )
+    for key in required_true:
+        if verification.get(key) is not True:
+            raise ValueError(f"authenticated recovery backup {key} is not true")
+    entries = backup_global_history_entries(manifest)
+    created_at = latest.get("created_at")
+    if parse_utc_timestamp(created_at) is None:
+        raise ValueError("authenticated recovery backup creation time is invalid")
+    return {
+        "latest_path": str(resolved_latest),
+        "latest_file_sha256": hashlib.sha256(latest_before).hexdigest(),
+        "manifest_path": str(manifest_path),
+        "manifest_file_sha256": hashlib.sha256(manifest_before).hexdigest(),
+        "manifest_sha256": verification.get("manifest_sha256"),
+        "archive_sha256": verification.get("archive_sha256"),
+        "created_at": created_at,
+        "verified": True,
+        "archive_integrity_verified": True,
+        "restore_verified": True,
+        "encrypted_container_authenticated": True,
+        "snapshot_profile": verification.get("snapshot_profile"),
+        "latest_metadata_authentication_key_id": metadata_authentication_key_id(
+            latest, label="backup latest metadata"
+        ),
+        "manifest_metadata_authentication_key_id": metadata_authentication_key_id(
+            manifest, label="backup manifest"
+        ),
+        "entries": entries,
+        "entries_sha256": stable_hash(entries),
+    }
+
+
+def build_daily_history_anchor_evidence() -> list[dict[str, Any]]:
+    history_root = RUN_AUDIT_ROOT / "history"
+    trust_root, trust_error = configured_trust_anchor_root()
+    if trust_root is None:
+        raise RuntimeError(trust_error or "external trust-anchor root is unavailable")
+    evidence: list[dict[str, Any]] = []
+    for directory in sorted(path for path in history_root.glob("*") if path.is_dir()):
+        integrity = audit_cycle_history(directory)
+        if not integrity.get("passed"):
+            raise ValueError(
+                f"dated run-audit history {directory.name} is invalid: "
+                + "; ".join(integrity.get("errors", []))
+            )
+        anchor_path_value = integrity.get("anchor_path")
+        if not isinstance(anchor_path_value, str):
+            raise ValueError(f"dated run-audit history {directory.name} has no anchor path")
+        anchor_path = Path(anchor_path_value).resolve()
+        anchor_path.relative_to(trust_root.resolve())
+        anchor = read_json_file(anchor_path)
+        if not isinstance(anchor, dict):
+            raise ValueError(f"dated run-audit history {directory.name} anchor is invalid")
+        authentication_errors = trust_anchor_authentication_errors(
+            anchor, label=f"dated run-audit history {directory.name} anchor"
+        )
+        if authentication_errors:
+            raise ValueError("; ".join(authentication_errors))
+        entries = [
+            {"path": f"{directory.name}/{item['name']}", "sha256": item["sha256"]}
+            for item in history_file_manifest(directory)
+        ]
+        evidence.append(
+            {
+                "date": directory.name,
+                "history_root": relative_path(directory),
+                "entries": entries,
+                "entry_count": len(entries),
+                "anchor_path": anchor_path.relative_to(trust_root).as_posix(),
+                "anchor_schema_version": anchor.get("schema_version"),
+                "anchor_sha256": anchor.get("anchor_sha256"),
+                "anchor_file_sha256": file_sha256(anchor_path),
+                "hmac_key_id": anchor.get("hmac_key_id"),
+                "first_audit_sha256": integrity.get("first_audit_sha256"),
+                "last_audit_sha256": integrity.get("last_audit_sha256"),
+            }
+        )
+    return evidence
+
+
+def validate_polluted_global_history_source(
+    anchor_path: Path,
+    source: dict[str, Any],
+    *,
+    expected_head_sha256: str,
+) -> None:
+    if source.get("schema_version") != HISTORY_ANCHOR_SCHEMA_VERSION:
+        raise ValueError("polluted global history predecessor schema is unsupported")
+    if source.get("revision") != 1 or source.get("previous_head_sha256") is not None:
+        raise ValueError("polluted global history predecessor is not revision one")
+    if source.get("anchor_sha256") != expected_head_sha256:
+        raise ValueError("global history recovery expected head does not match the pointer")
+    if source.get("anchor_sha256") != history_anchor_hash(source):
+        raise ValueError("polluted global history predecessor semantic hash mismatch")
+    authentication_errors = trust_anchor_authentication_errors(
+        source, label="polluted global run-audit history anchor"
+    )
+    if authentication_errors:
+        raise ValueError("; ".join(authentication_errors))
+    if source.get("workspace_uuid") == workspace_project_uuid():
+        raise ValueError("global history predecessor already belongs to the active workspace")
+    entries = source.get("entries")
+    if not isinstance(entries, list) or len(entries) != 1:
+        raise ValueError("global history recovery only accepts the single-entry test pollution incident")
+    entry = entries[0]
+    if (
+        not isinstance(entry, dict)
+        or set(entry) != {"path", "sha256"}
+        or parse_run_audit_entry_time(entry.get("path")) is None
+        or not isinstance(entry.get("sha256"), str)
+        or not re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])
+    ):
+        raise ValueError("polluted global history entry is malformed")
+    version_path = monotonic_anchor_versions_path(anchor_path) / (
+        f"{source['revision']:020d}-{source['anchor_sha256']}.json"
+    )
+    retained = read_json_file(version_path, default=None)
+    if retained != source:
+        raise ValueError("polluted global history predecessor is not retained immutably")
+    version_files = sorted(monotonic_anchor_versions_path(anchor_path).glob("*.json"))
+    if version_files != [version_path]:
+        raise ValueError("polluted global history predecessor has an unexpected version set")
+    if anchor_path.read_bytes() != version_path.read_bytes():
+        raise ValueError("polluted global history pointer differs from its retained version")
+
+
+def global_history_recovery_already_applied(
+    expected_head_sha256: str,
+    expected_plan_sha256: str | None,
+) -> dict[str, Any] | None:
+    anchor_path = global_cycle_history_anchor_path()
+    current = read_json_file(anchor_path, default=None)
+    if not isinstance(current, dict) or current.get("anchor_sha256") == expected_head_sha256:
+        return None
+    versions = [
+        read_json_file(path)
+        for path in sorted(monotonic_anchor_versions_path(anchor_path).glob("*.json"))
+    ]
+    migration_version = next(
+        (
+            version
+            for version in versions
+            if isinstance(version, dict)
+            and isinstance(version.get("workspace_migration"), dict)
+            and version["workspace_migration"].get("source_anchor_sha256")
+            == expected_head_sha256
+        ),
+        None,
+    )
+    if migration_version is None:
+        return None
+    integrity = audit_global_cycle_history()
+    if not integrity.get("passed"):
+        raise ValueError(
+            "existing global history recovery is invalid: "
+            + "; ".join(integrity.get("errors", []))
+        )
+    migration = migration_version["workspace_migration"]
+    plan_hash = migration.get("recovery_plan_sha256")
+    if expected_plan_sha256 is not None and plan_hash != expected_plan_sha256:
+        raise ValueError("existing global history recovery plan hash mismatch")
+    return {
+        "schema_version": GLOBAL_HISTORY_RECOVERY_PLAN_SCHEMA_VERSION,
+        "status": "already_applied",
+        "applied": False,
+        "anchor_path": str(anchor_path),
+        "source_anchor_sha256": expected_head_sha256,
+        "target_anchor_sha256": migration_version.get("anchor_sha256"),
+        "recovery_plan_sha256": plan_hash,
+        "recovery_evidence_path": migration.get("recovery_evidence_path"),
+        "revision": migration_version.get("revision"),
+    }
+
+
+def build_global_history_recovery_plan(
+    *,
+    expected_head_sha256: str,
+    backup_latest_path: Path,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_head_sha256):
+        raise ValueError("--expected-head-sha256 must be a lowercase SHA-256 digest")
+    anchor_path = global_cycle_history_anchor_path()
+    source = read_json_file(anchor_path, default=None)
+    if not isinstance(source, dict):
+        raise ValueError("global run-audit history anchor is missing or invalid")
+    validate_polluted_global_history_source(
+        anchor_path,
+        source,
+        expected_head_sha256=expected_head_sha256,
+    )
+    target_entries = global_cycle_history_manifest()
+    if not target_entries:
+        raise ValueError("active global run-audit history is empty")
+    source_entries = source["entries"]
+    if any(item in target_entries for item in source_entries):
+        raise ValueError("active history still contains the polluted predecessor entry")
+
+    daily_anchors = build_daily_history_anchor_evidence()
+    daily_entries = [entry for item in daily_anchors for entry in item["entries"]]
+    if daily_entries != target_entries:
+        raise ValueError("verified dated anchors do not exactly cover the active global history")
+    backup = verify_global_history_recovery_backup(backup_latest_path)
+    if backup.get("entries") != target_entries:
+        raise ValueError("authenticated recovery backup does not exactly match active history")
+    backup_time = parse_utc_timestamp(backup.get("created_at"))
+    source_times = [parse_run_audit_entry_time(item.get("path")) for item in source_entries]
+    if backup_time is None or any(item is None or backup_time >= item for item in source_times):
+        raise ValueError("authenticated recovery backup does not predate the polluted entry")
+
+    evidence = {
+        "schema_version": GLOBAL_HISTORY_RECOVERY_EVIDENCE_SCHEMA_VERSION,
+        "kind": GLOBAL_HISTORY_MIGRATION_KIND,
+        "cause": {
+            "classification": "unit_test_inherited_production_trust_configuration",
+            "test_file": GLOBAL_HISTORY_RECOVERY_TEST_FILE,
+            "test_case": GLOBAL_HISTORY_RECOVERY_TEST_CASE,
+        },
+        "source_anchor": {
+            "schema_version": source.get("schema_version"),
+            "revision": source.get("revision"),
+            "anchor_sha256": source.get("anchor_sha256"),
+            "anchor_file_sha256": file_sha256(anchor_path),
+            "workspace_uuid": source.get("workspace_uuid"),
+            "hmac_key_id": source.get("hmac_key_id"),
+            "entry_count": len(source_entries),
+            "entries": source_entries,
+        },
+        "target_history": {
+            "history_root": relative_path(RUN_AUDIT_ROOT / "history"),
+            "workspace_uuid": workspace_project_uuid(),
+            "entry_count": len(target_entries),
+            "entries_sha256": stable_hash(target_entries),
+            "entries": target_entries,
+        },
+        "daily_anchors": daily_anchors,
+        "backup": backup,
+    }
+    evidence_sha256 = stable_hash(evidence)
+    evidence_path = global_history_recovery_evidence_path(evidence_sha256)
+    trust_root, trust_error = configured_trust_anchor_root()
+    if trust_root is None:
+        raise RuntimeError(trust_error or "external trust-anchor root is unavailable")
+    evidence_relative = evidence_path.relative_to(trust_root).as_posix()
+    migration = {
+        "schema_version": GLOBAL_HISTORY_MIGRATION_SCHEMA_VERSION,
+        "kind": GLOBAL_HISTORY_MIGRATION_KIND,
+        "source_revision": source.get("revision"),
+        "source_anchor_sha256": source.get("anchor_sha256"),
+        "source_workspace_uuid": source.get("workspace_uuid"),
+        "source_entries_sha256": stable_hash(source_entries),
+        "source_entry_count": len(source_entries),
+        "target_workspace_uuid": workspace_project_uuid(),
+        "target_entries_sha256": stable_hash(target_entries),
+        "target_entry_count": len(target_entries),
+        "daily_anchor_evidence_sha256": stable_hash(daily_anchors),
+        "backup_latest_file_sha256": backup.get("latest_file_sha256"),
+        "backup_manifest_file_sha256": backup.get("manifest_file_sha256"),
+        "backup_manifest_sha256": backup.get("manifest_sha256"),
+        "backup_entry_manifest_sha256": backup.get("entries_sha256"),
+        "backup_archive_sha256": backup.get("archive_sha256"),
+        "backup_created_at": backup.get("created_at"),
+        "recovery_evidence_path": evidence_relative,
+        "recovery_evidence_sha256": evidence_sha256,
+        "recovery_plan_sha256": None,
+    }
+    migration["recovery_plan_sha256"] = stable_hash(
+        global_history_recovery_plan_contract(migration)
+    )
+    target_payload: dict[str, Any] = {
+        "schema_version": GLOBAL_HISTORY_ANCHOR_SCHEMA_VERSION,
+        "history_root": relative_path(RUN_AUDIT_ROOT / "history"),
+        "entries": target_entries,
+        "entry_count": len(target_entries),
+        "workspace_uuid": workspace_project_uuid(),
+        "revision": 2,
+        "previous_head_sha256": source.get("anchor_sha256"),
+        **trust_scope_payload(),
+        "workspace_migration": migration,
+    }
+    target_payload["anchor_sha256"] = history_anchor_hash(target_payload)
+    return {
+        "schema_version": GLOBAL_HISTORY_RECOVERY_PLAN_SCHEMA_VERSION,
+        "status": "ready",
+        "applied": False,
+        "anchor_path": str(anchor_path),
+        "source_anchor_sha256": source.get("anchor_sha256"),
+        "source_workspace_uuid": source.get("workspace_uuid"),
+        "source_entry_count": len(source_entries),
+        "target_anchor_sha256": target_payload["anchor_sha256"],
+        "target_workspace_uuid": target_payload["workspace_uuid"],
+        "target_entry_count": len(target_entries),
+        "target_entries_sha256": stable_hash(target_entries),
+        "daily_anchor_evidence_sha256": migration["daily_anchor_evidence_sha256"],
+        "backup_manifest_sha256": migration["backup_manifest_sha256"],
+        "backup_created_at": migration["backup_created_at"],
+        "recovery_evidence_path": evidence_relative,
+        "recovery_evidence_sha256": evidence_sha256,
+        "recovery_plan_sha256": migration["recovery_plan_sha256"],
+        "_evidence": evidence,
+        "_target_payload": target_payload,
+    }
+
+
+def public_global_history_recovery_result(result: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in result.items() if not key.startswith("_")}
+
+
+def apply_global_history_recovery(
+    *,
+    expected_head_sha256: str,
+    expected_plan_sha256: str,
+    backup_latest_path: Path,
+) -> dict[str, Any]:
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_plan_sha256):
+        raise ValueError("--expected-plan-sha256 must be a lowercase SHA-256 digest")
+    already_applied = global_history_recovery_already_applied(
+        expected_head_sha256,
+        expected_plan_sha256,
+    )
+    if already_applied is not None:
+        return already_applied
+    plan = build_global_history_recovery_plan(
+        expected_head_sha256=expected_head_sha256,
+        backup_latest_path=backup_latest_path,
+    )
+    if plan["recovery_plan_sha256"] != expected_plan_sha256:
+        raise ValueError("global history recovery plan changed; refusing apply")
+    anchor_path = Path(plan["anchor_path"])
+    current = read_json_file(anchor_path, default=None)
+    if not isinstance(current, dict) or current.get("anchor_sha256") != expected_head_sha256:
+        raise RuntimeError("global history recovery CAS failed: predecessor changed")
+    evidence_path = global_history_recovery_evidence_path(plan["recovery_evidence_sha256"])
+    write_immutable_json(evidence_path, plan["_evidence"])
+    signed_target = sign_trust_anchor(plan["_target_payload"])
+    write_monotonic_anchor(anchor_path, signed_target, head_hash_field="anchor_sha256")
+    integrity = audit_global_cycle_history()
+    if not integrity.get("passed"):
+        raise RuntimeError(
+            "global history recovery post-write verification failed: "
+            + "; ".join(integrity.get("errors", []))
+        )
+    result = public_global_history_recovery_result(plan)
+    result.update(
+        {
+            "status": "applied",
+            "applied": True,
+            "revision": signed_target.get("revision"),
+        }
+    )
+    return result
+
+
+def command_recover_global_history_anchor(args: argparse.Namespace) -> int:
+    try:
+        if args.apply:
+            if not args.acknowledge_cross_workspace_recovery:
+                raise ValueError("--apply requires --acknowledge-cross-workspace-recovery")
+            if not args.expected_plan_sha256:
+                raise ValueError("--apply requires --expected-plan-sha256 from a dry run")
+            with cycle_lock("global-history-anchor-recovery"):
+                result = apply_global_history_recovery(
+                    expected_head_sha256=args.expected_head_sha256,
+                    expected_plan_sha256=args.expected_plan_sha256,
+                    backup_latest_path=args.backup_latest,
+                )
+        else:
+            already_applied = global_history_recovery_already_applied(
+                args.expected_head_sha256,
+                args.expected_plan_sha256,
+            )
+            result = already_applied or build_global_history_recovery_plan(
+                expected_head_sha256=args.expected_head_sha256,
+                backup_latest_path=args.backup_latest,
+            )
+            result = public_global_history_recovery_result(result)
+            if result.get("status") == "ready":
+                result["status"] = "dry_run"
+    except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+        print(
+            json.dumps(
+                {
+                    "schema_version": GLOBAL_HISTORY_RECOVERY_PLAN_SCHEMA_VERSION,
+                    "status": "blocked",
+                    "applied": False,
+                    "error_type": type(exc).__name__,
+                    "error": str(exc),
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 2
+    print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+    return 0
 
 
 def read_jsonl_file(path: Path) -> list[dict[str, Any]]:
@@ -965,6 +2671,99 @@ def discover_briefing_temp_files(kind: str) -> list[Path]:
     )
 
 
+def load_locked_paper_execution_snapshot() -> dict[str, Any]:
+    """Obtain the paper layer's authoritative cross-account read snapshot."""
+
+    script = BRIEFING_ROOT / "scripts" / "paper_trading.py"
+    completed = capture_command(
+        [sys.executable, str(script), "snapshot", "--account", "ALL"],
+        cwd=ROOT,
+        timeout=120,
+    )
+    if completed.returncode != 0:
+        detail = completed.stderr.strip() or "snapshot command failed"
+        raise RuntimeError(f"locked paper-trading snapshot unavailable: {detail}")
+    payload = strict_json_loads(completed.stdout, source="paper-trading locked snapshot")
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1:
+        raise ValueError("paper-trading locked snapshot schema is invalid")
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, list) or not all(isinstance(item, dict) for item in accounts):
+        raise ValueError("paper-trading locked snapshot accounts are invalid")
+    expected = stable_hash({"accounts": accounts})
+    if payload.get("generation_sha256") != expected:
+        raise ValueError("paper-trading locked snapshot generation hash mismatch")
+    return payload
+
+
+def prediction_integrity_snapshot() -> dict[str, Any]:
+    """Read prediction semantics and stable identities for reference validation."""
+
+    rows = read_jsonl_file(PREDICTION_LEDGER_PATH)
+    row_hashes = [stable_hash(row) for row in rows]
+    originals: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    for line_number, row in enumerate(rows, 1):
+        prediction_id = row.get("prediction_id")
+        if not isinstance(prediction_id, str) or not prediction_id.strip():
+            errors.append(f"prediction ledger line {line_number}: prediction_id is missing")
+            continue
+        if isinstance(row.get("review"), dict):
+            continue
+        if prediction_id in originals:
+            errors.append(f"prediction ledger has duplicate original prediction_id {prediction_id}")
+            continue
+        originals[prediction_id] = row
+    return {
+        "path": relative_path(PREDICTION_LEDGER_PATH),
+        "present": PREDICTION_LEDGER_PATH.is_file(),
+        "row_count": len(rows),
+        "row_hashes": row_hashes,
+        "semantic_hash": stable_hash(rows),
+        "originals": originals,
+        "errors": errors,
+    }
+
+
+def prediction_reference_required_from_date() -> str:
+    config = read_json_file(PAPER_TRADING_CONFIG_PATH, default={})
+    contract = config.get("order_contract", {}) if isinstance(config, dict) else {}
+    boundary = (
+        contract.get("prediction_reference_required_from_date")
+        if isinstance(contract, dict)
+        else None
+    )
+    if not isinstance(boundary, str) or not is_iso_date(boundary):
+        return "9999-12-31"
+    return boundary
+
+
+def read_current_canonical_state() -> dict[str, Any]:
+    """Read state from the committed generation head, falling back to schema-v1 projection."""
+
+    head = read_json_file(VIRTUAL_LEDGER_HEAD_PATH, default=None)
+    if isinstance(head, dict):
+        declared_hash = head.get("head_sha256")
+        unsigned = {key: value for key, value in head.items() if key != "head_sha256"}
+        if declared_hash != stable_hash(unsigned):
+            raise ValueError("canonical generation head hash mismatch")
+        state_value = head.get("state_path")
+        if not isinstance(state_value, str):
+            raise ValueError("canonical generation head has no state path")
+        state_path = (ROOT / state_value).resolve()
+        try:
+            state_path.relative_to(VIRTUAL_LEDGER_GENERATIONS_ROOT.resolve())
+        except ValueError as exc:
+            raise ValueError("canonical generation state escapes its authority root") from exc
+        if not state_path.is_file() or file_sha256(state_path) != head.get("state_sha256"):
+            raise ValueError("canonical generation state hash mismatch")
+        state = read_json_file(state_path)
+        if not isinstance(state, dict):
+            raise ValueError("canonical generation state must be a JSON object")
+        return state
+    state = read_json_file(VIRTUAL_LEDGER_STATE_PATH, default={})
+    return state if isinstance(state, dict) else {}
+
+
 def virtual_ledger_source_files() -> list[Path]:
     files = [
         BRIEFING_ROOT / "data" / "paper_trades_us.jsonl",
@@ -985,6 +2784,7 @@ def virtual_ledger_source_files() -> list[Path]:
 def build_cycle_fingerprint(date: str) -> dict[str, Any]:
     files = [
         OUTPUTS_ROOT / f"每日全球晨间简报-{date}.md",
+        BRIEFING_ROOT / "data" / "predictions.jsonl",
         BRIEFING_ROOT / "data" / f"macro_signals-{date}.jsonl",
         TRADING_ROOT / "data" / "macro_signals" / f"macro_signals-{date}.jsonl",
         SITE_ROOT / "app" / "briefing.generated.json",
@@ -1359,13 +3159,18 @@ def canonicalize_temp_order_intent(
     return event
 
 
-def load_virtual_account_snapshots(*, source_errors: list[str] | None = None) -> dict[str, Any]:
+def load_virtual_account_snapshots(
+    *,
+    paper_snapshot: dict[str, Any] | None = None,
+    source_errors: list[str] | None = None,
+) -> dict[str, Any]:
+    if paper_snapshot is None:
+        paper_snapshot = load_locked_paper_execution_snapshot()
     accounts: dict[str, Any] = {}
-    for account, path in {
-        "US": BRIEFING_ROOT / "data" / "paper_portfolio_us.json",
-        "CHINA": BRIEFING_ROOT / "data" / "paper_portfolio_china.json",
-    }.items():
-        payload = read_json_file(path, default=None)
+    for snapshot in paper_snapshot.get("accounts", []):
+        account = str(snapshot.get("account") or snapshot.get("market_scope") or "").upper()
+        path = Path(str(snapshot.get("portfolio_path") or ""))
+        payload = snapshot.get("state")
         if isinstance(payload, dict):
             safety_errors = raw_virtual_source_safety_errors(payload, path, "document")
             if safety_errors:
@@ -1373,7 +3178,11 @@ def load_virtual_account_snapshots(*, source_errors: list[str] | None = None) ->
                     raise ValueError("; ".join(safety_errors))
                 source_errors.extend(safety_errors)
                 continue
-            account_id = str(payload.get("account_id") or f"global-briefing-{account.lower()}-paper-trading")
+            account_id = str(
+                payload.get("account_id")
+                or snapshot.get("account_id")
+                or f"global-briefing-{account.lower()}-paper-trading"
+            )
             accounts[account_id] = {
                 "source_system": "global-briefing",
                 "source_path": relative_path(path),
@@ -1443,20 +3252,39 @@ def build_virtual_ledger_anchor(
     events: Sequence[dict[str, Any]],
     account_state: dict[str, Any],
     state_payload: dict[str, Any],
+    *,
+    generation_id: str,
+    generation_ledger_path: Path,
+    generation_state_path: Path,
 ) -> dict[str, Any]:
     """Build a cross-directory baseline for the committed canonical ledger."""
-    if not VIRTUAL_LEDGER_PATH.exists():
-        raise FileNotFoundError(f"cannot anchor missing canonical ledger: {VIRTUAL_LEDGER_PATH}")
-    payload: dict[str, Any] = {
+    if not generation_ledger_path.exists():
+        raise FileNotFoundError(f"cannot anchor missing canonical ledger: {generation_ledger_path}")
+    anchor_path = virtual_ledger_anchor_path()
+    core: dict[str, Any] = {
         "schema_version": LEDGER_ANCHOR_SCHEMA_VERSION,
         "ledger_id": LEDGER_ID,
         "canonical_ledger_path": relative_path(VIRTUAL_LEDGER_PATH),
-        "canonical_ledger_sha256": file_sha256(VIRTUAL_LEDGER_PATH),
+        "canonical_ledger_sha256": file_sha256(generation_ledger_path),
+        "generation_id": generation_id,
+        "generation_ledger_path": relative_path(generation_ledger_path),
+        "generation_state_path": relative_path(generation_state_path),
+        "generation_state_sha256": file_sha256(generation_state_path),
         "event_hash": stable_hash(list(events)),
         "account_hash": stable_hash(account_state),
-        "content_hash": stable_hash({"events": list(events), "accounts": account_state}),
+        "content_hash": state_payload.get("content_hash"),
         "event_count": len(events),
         "state_content_hash": state_payload.get("content_hash"),
+        "paper_generation_sha256": state_payload.get("paper_generation_sha256"),
+        "prediction_semantic_hash": state_payload.get("prediction_semantic_hash"),
+    }
+    existing = read_json_file(anchor_path, default=None)
+    if isinstance(existing, dict) and existing.get("schema_version") == LEDGER_ANCHOR_SCHEMA_VERSION:
+        if all(existing.get(key) == value for key, value in core.items()):
+            return existing
+    payload = {
+        **core,
+        **next_monotonic_anchor_fields(anchor_path, head_hash_field="anchor_sha256"),
     }
     payload["anchor_sha256"] = ledger_anchor_hash(payload)
     return sign_trust_anchor(payload)
@@ -1465,6 +3293,9 @@ def build_virtual_ledger_anchor(
 def audit_ledger_continuity(
     events: Sequence[dict[str, Any]],
     account_state: dict[str, Any] | None = None,
+    *,
+    predictions: dict[str, Any] | None = None,
+    paper_generation_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Fail closed when a committed ledger or its historical source is altered.
 
@@ -1478,10 +3309,6 @@ def audit_ledger_continuity(
     trust_root, trust_root_error = configured_trust_anchor_root()
     if trust_root is None:
         blocking.append(trust_root_error or "external trust-anchor root is unavailable")
-    if trust_anchor_hmac_key() is None:
-        blocking.append(
-            f"canonical ledger cannot be verified: {TRUST_ANCHOR_HMAC_KEY_ENV} is not configured"
-        )
     try:
         anchor_path: Path | None = virtual_ledger_anchor_path()
     except RuntimeError as exc:
@@ -1508,6 +3335,10 @@ def audit_ledger_continuity(
         or anchor_present
         or cycle_state_has_ledger
     )
+    if trust_anchor_hmac_key() is None and baseline_evidence_present:
+        blocking.append(
+            f"canonical ledger cannot be verified: {TRUST_ANCHOR_HMAC_KEY_ENV} is not configured"
+        )
 
     state: dict[str, Any] | None = None
     if state_present:
@@ -1532,7 +3363,10 @@ def audit_ledger_continuity(
                 blocking.append("canonical ledger anchor must be a JSON object")
             else:
                 anchor = loaded_anchor
-                if anchor.get("schema_version") != LEDGER_ANCHOR_SCHEMA_VERSION:
+                if anchor.get("schema_version") not in {
+                    LEGACY_ANCHOR_SCHEMA_VERSION,
+                    LEDGER_ANCHOR_SCHEMA_VERSION,
+                }:
                     blocking.append("unsupported canonical ledger anchor schema")
                 if anchor.get("anchor_sha256") != ledger_anchor_hash(anchor):
                     blocking.append("canonical ledger anchor hash mismatch")
@@ -1543,8 +3377,49 @@ def audit_ledger_continuity(
                 blocking.extend(
                     trust_anchor_authentication_errors(anchor, label="canonical ledger anchor")
                 )
+                if anchor.get("schema_version") == LEDGER_ANCHOR_SCHEMA_VERSION:
+                    blocking.extend(
+                        monotonic_anchor_errors(
+                            anchor_path,
+                            anchor,
+                            label="canonical ledger anchor",
+                            head_hash_field="anchor_sha256",
+                        )
+                    )
 
-    if not VIRTUAL_LEDGER_PATH.exists():
+    baseline_ledger_path = VIRTUAL_LEDGER_PATH
+    baseline_state_path = VIRTUAL_LEDGER_STATE_PATH
+    if isinstance(anchor, dict) and anchor.get("schema_version") == LEDGER_ANCHOR_SCHEMA_VERSION:
+        generation_ledger = anchor.get("generation_ledger_path")
+        generation_state = anchor.get("generation_state_path")
+        if isinstance(generation_ledger, str) and isinstance(generation_state, str):
+            candidate_ledger = (ROOT / generation_ledger).resolve()
+            candidate_state = (ROOT / generation_state).resolve()
+            try:
+                candidate_ledger.relative_to(VIRTUAL_LEDGER_GENERATIONS_ROOT.resolve())
+                candidate_state.relative_to(VIRTUAL_LEDGER_GENERATIONS_ROOT.resolve())
+            except ValueError:
+                blocking.append("canonical ledger generation path escapes its authority root")
+            else:
+                baseline_ledger_path = candidate_ledger
+                baseline_state_path = candidate_state
+                if baseline_state_path.is_file():
+                    try:
+                        loaded_state = read_json_file(baseline_state_path)
+                    except (OSError, ValueError, json.JSONDecodeError) as exc:
+                        blocking.append(
+                            f"cannot verify canonical generation state: {type(exc).__name__}: {exc}"
+                        )
+                    else:
+                        if isinstance(loaded_state, dict):
+                            state = loaded_state
+                            state_present = True
+                        else:
+                            blocking.append("canonical generation state must be a JSON object")
+                else:
+                    blocking.append("canonical ledger generation state is missing")
+
+    if not baseline_ledger_path.exists():
         if baseline_evidence_present:
             blocking.append("canonical ledger is missing while persistent baseline evidence exists")
         return {
@@ -1561,7 +3436,7 @@ def audit_ledger_continuity(
             "blocking_reasons": blocking,
         }
     try:
-        previous_events = read_jsonl_file(VIRTUAL_LEDGER_PATH)
+        previous_events = read_jsonl_file(baseline_ledger_path)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         blocking.append(f"cannot verify previous canonical ledger: {type(exc).__name__}: {exc}")
         return {
@@ -1582,7 +3457,7 @@ def audit_ledger_continuity(
     if not anchor:
         blocking.append("canonical ledger exists without an externally authenticated trust anchor")
     previous_hash = stable_hash(previous_events)
-    previous_ledger_sha256 = file_sha256(VIRTUAL_LEDGER_PATH)
+    previous_ledger_sha256 = file_sha256(baseline_ledger_path)
     state_accounts: dict[str, Any] | None = None
     if state:
         if state.get("ledger_id") != LEDGER_ID:
@@ -1598,11 +3473,32 @@ def audit_ledger_continuity(
             blocking.append("canonical ledger state accounts are invalid")
         else:
             state_accounts = raw_state_accounts
-            state_content_hash = stable_hash(
-                {"events": previous_events, "accounts": state_accounts}
-            )
+            state_content_payload: dict[str, Any] = {
+                "events": previous_events,
+                "accounts": state_accounts,
+            }
+            if state.get("paper_generation_sha256") is not None:
+                state_content_payload["paper_generation_sha256"] = state.get(
+                    "paper_generation_sha256"
+                )
+            if state.get("prediction_semantic_hash") is not None:
+                state_content_payload["prediction_semantic_hash"] = state.get(
+                    "prediction_semantic_hash"
+                )
+            state_content_hash = stable_hash(state_content_payload)
             if state.get("content_hash") != state_content_hash:
                 blocking.append("canonical ledger state content hash mismatch")
+        previous_prediction_rows = state.get("prediction_row_hashes")
+        if previous_prediction_rows is not None:
+            current_prediction_rows = (
+                predictions.get("row_hashes") if isinstance(predictions, dict) else None
+            )
+            if not isinstance(previous_prediction_rows, list) or not isinstance(
+                current_prediction_rows, list
+            ):
+                blocking.append("canonical ledger prediction continuity metadata is invalid")
+            elif current_prediction_rows[: len(previous_prediction_rows)] != previous_prediction_rows:
+                blocking.append("prediction ledger history was deleted, reordered, or mutated")
     if anchor:
         if anchor.get("event_count") != len(previous_events):
             blocking.append("canonical ledger anchor event count mismatch")
@@ -1617,6 +3513,14 @@ def audit_ledger_continuity(
                 blocking.append("canonical ledger anchor content hash mismatch")
             if anchor.get("account_hash") != stable_hash(state_accounts):
                 blocking.append("canonical ledger anchor account hash mismatch")
+            anchor_prediction_hash = anchor.get("prediction_semantic_hash")
+            state_prediction_hash = state.get("prediction_semantic_hash")
+            if anchor_prediction_hash is not None and anchor_prediction_hash != state_prediction_hash:
+                blocking.append("canonical ledger anchor prediction hash mismatch")
+            anchor_generation = anchor.get("paper_generation_sha256")
+            state_generation = state.get("paper_generation_sha256")
+            if anchor_generation is not None and anchor_generation != state_generation:
+                blocking.append("canonical ledger anchor paper generation mismatch")
     previous_by_locator = {event_source_locator(event): event for event in previous_events}
     current_by_locator = {event_source_locator(event): event for event in events}
     if len(previous_by_locator) != len(previous_events):
@@ -1738,8 +3642,19 @@ def audit_virtual_execution_ledger(
     warnings: Sequence[str] = (),
     source_expectations: Sequence[dict[str, Any]] = (),
     source_errors: Sequence[str] = (),
+    predictions: dict[str, Any] | None = None,
+    paper_generation_sha256: str | None = None,
 ) -> dict[str, Any]:
     blocking: list[str] = list(source_errors)
+    prediction_snapshot = predictions or {
+        "errors": ["prediction integrity snapshot is unavailable"],
+        "originals": {},
+        "semantic_hash": None,
+        "row_count": 0,
+    }
+    blocking.extend(str(error) for error in prediction_snapshot.get("errors", []))
+    prediction_boundary = prediction_reference_required_from_date()
+    originals = prediction_snapshot.get("originals", {})
     ids = [str(event.get("ledger_event_id", "")) for event in events]
     if len(ids) != len(set(ids)):
         blocking.append("duplicate ledger_event_id detected")
@@ -1830,6 +3745,21 @@ def audit_virtual_execution_ledger(
                     f"{event_id}: order intent requires a positive price and "
                     "positive quantity or notional"
                 )
+        if (
+            event.get("source_system") == "global-briefing"
+            and event_type in {"virtual_trade", "virtual_hold", "virtual_order_intent"}
+            and is_iso_date(event.get("date"))
+            and str(event.get("date")) >= prediction_boundary
+        ):
+            prediction_id = event.get("prediction_id")
+            if not isinstance(prediction_id, str) or not prediction_id.strip():
+                blocking.append(
+                    f"{event_id}: prediction_id is required from {prediction_boundary}"
+                )
+            elif not isinstance(originals, dict) or prediction_id not in originals:
+                blocking.append(
+                    f"{event_id}: prediction_id {prediction_id} has no original prediction record"
+                )
         forbidden = sorted(nested_forbidden_keys(event))
         if forbidden:
             blocking.append(f"{event_id}: forbidden broker/live keys {forbidden}")
@@ -1862,7 +3792,12 @@ def audit_virtual_execution_ledger(
                 blocking.append(f"account snapshot was not loaded: {expectation.get('path')}")
     reconciliation = reconcile_virtual_accounts(events, account_state)
     blocking.extend(reconciliation["blocking_reasons"])
-    continuity = audit_ledger_continuity(events, account_state)
+    continuity = audit_ledger_continuity(
+        events,
+        account_state,
+        predictions=prediction_snapshot,
+        paper_generation_sha256=paper_generation_sha256,
+    )
     blocking.extend(continuity["blocking_reasons"])
     audit_content = {
         "ledger_id": LEDGER_ID,
@@ -1871,6 +3806,8 @@ def audit_virtual_execution_ledger(
         "warnings": list(warnings),
         "event_hash": stable_hash(list(events)),
         "account_hash": stable_hash(account_state),
+        "paper_generation_sha256": paper_generation_sha256,
+        "prediction_semantic_hash": prediction_snapshot.get("semantic_hash"),
     }
     audit_content_hash = stable_hash(audit_content)
     payload = {
@@ -1890,6 +3827,16 @@ def audit_virtual_execution_ledger(
         "source_expectations": list(source_expectations),
         "reconciliation": reconciliation,
         "continuity": continuity,
+        "prediction_integrity": {
+            "path": prediction_snapshot.get("path"),
+            "row_count": prediction_snapshot.get("row_count"),
+            "semantic_hash": prediction_snapshot.get("semantic_hash"),
+            "reference_required_from_date": prediction_boundary,
+        },
+        "paper_snapshot": {
+            "generation_sha256": paper_generation_sha256,
+            "locked_cross_account": bool(paper_generation_sha256),
+        },
         "legacy_sources_read_only": [
             relative_path(BRIEFING_ROOT / "data" / "paper_trades_us.jsonl"),
             relative_path(BRIEFING_ROOT / "data" / "paper_trades_china.jsonl"),
@@ -1914,26 +3861,40 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
     events: list[dict[str, Any]] = []
     warnings: list[str] = []
     source_errors: list[str] = []
+    if (
+        write_files
+        and TRUST_ANCHOR_HMAC_KEY_ENV in os.environ
+        and not str(os.environ.get(TRUST_ANCHOR_HMAC_KEY_ENV) or "").strip()
+    ):
+        source_errors.append(
+            f"canonical ledger cannot be verified: {TRUST_ANCHOR_HMAC_KEY_ENV} is not configured"
+        )
     source_expectations: list[dict[str, Any]] = []
     executed_orders_by_id: dict[str, list[dict[str, Any]]] = {}
-    for source_ledger, path in {
-        "global_briefing_paper_us": BRIEFING_ROOT / "data" / "paper_trades_us.jsonl",
-        "global_briefing_paper_china": BRIEFING_ROOT / "data" / "paper_trades_china.jsonl",
-    }.items():
+    paper_snapshot = load_locked_paper_execution_snapshot()
+    paper_generation_sha256 = str(paper_snapshot["generation_sha256"])
+    paper_sources: list[tuple[str, Path, list[dict[str, Any]]]] = []
+    for snapshot in paper_snapshot["accounts"]:
+        account = str(snapshot.get("account") or snapshot.get("market_scope") or "").upper()
+        source_ledger = f"global_briefing_paper_{account.lower()}"
+        path = Path(str(snapshot.get("trades_path") or ""))
+        rows = snapshot.get("trades")
+        if not path.is_absolute() or not isinstance(rows, list) or not all(
+            isinstance(row, dict) for row in rows
+        ):
+            source_errors.append(f"locked paper snapshot is malformed for account {account or '?'}")
+            continue
+        paper_sources.append((source_ledger, path, rows))
+    for source_ledger, path, rows in paper_sources:
         expectation = {
             "kind": "event_ledger",
             "source_ledger": source_ledger,
             "path": relative_path(path),
             "required": True,
-            "present": path.exists(),
-            "expected_event_count": None,
+            "present": True,
+            "expected_event_count": len(rows),
         }
         source_expectations.append(expectation)
-        if not path.exists():
-            warnings.append(f"missing source ledger: {relative_path(path)}")
-            continue
-        rows = read_jsonl_file(path)
-        expectation["expected_event_count"] = len(rows)
         for line_number, row in enumerate(rows, 1):
             safety_errors = raw_virtual_source_safety_errors(row, path, f"line {line_number}")
             if safety_errors:
@@ -2038,17 +3999,18 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
             str(event.get("ledger_event_id", "")),
         ),
     )
-    account_state = load_virtual_account_snapshots(source_errors=source_errors)
-    for path in (
-        BRIEFING_ROOT / "data" / "paper_portfolio_us.json",
-        BRIEFING_ROOT / "data" / "paper_portfolio_china.json",
-    ):
+    account_state = load_virtual_account_snapshots(
+        paper_snapshot=paper_snapshot,
+        source_errors=source_errors,
+    )
+    for snapshot in paper_snapshot["accounts"]:
+        path = Path(str(snapshot.get("portfolio_path") or ""))
         source_expectations.append(
             {
                 "kind": "account_snapshot",
                 "path": relative_path(path),
                 "required": True,
-                "present": path.exists(),
+                "present": True,
                 "expected_event_count": None,
             }
         )
@@ -2063,8 +4025,16 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
                 "expected_event_count": None,
             }
         )
-    content_hash = stable_hash({"events": events, "accounts": account_state})
-    previous_state = read_json_file(VIRTUAL_LEDGER_STATE_PATH, default={})
+    predictions = prediction_integrity_snapshot()
+    content_hash = stable_hash(
+        {
+            "events": events,
+            "accounts": account_state,
+            "paper_generation_sha256": paper_generation_sha256,
+            "prediction_semantic_hash": predictions["semantic_hash"],
+        }
+    )
+    previous_state = read_current_canonical_state()
     generated_at = utc_now()
     if isinstance(previous_state, dict) and previous_state.get("content_hash") == content_hash:
         generated_at = str(previous_state.get("generated_at") or generated_at)
@@ -2084,6 +4054,10 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         "accounts": account_state,
         "event_count": len(events),
         "event_hash": stable_hash(events),
+        "paper_generation_sha256": paper_generation_sha256,
+        "prediction_ledger_path": predictions["path"],
+        "prediction_row_hashes": predictions["row_hashes"],
+        "prediction_semantic_hash": predictions["semantic_hash"],
         "anchor_path": relative_path(anchor_path) if anchor_path is not None else None,
     }
     audit = audit_virtual_execution_ledger(
@@ -2092,17 +4066,43 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         warnings=warnings,
         source_expectations=source_expectations,
         source_errors=source_errors,
+        predictions=predictions,
+        paper_generation_sha256=paper_generation_sha256,
     )
     write_performed = bool(write_files and audit["overall_passed"])
     ledger_anchor: dict[str, Any] | None = None
+    generation_id: str | None = None
     if write_performed:
-        atomic_write_jsonl(VIRTUAL_LEDGER_PATH, events)
-        state_payload["canonical_ledger_sha256"] = file_sha256(VIRTUAL_LEDGER_PATH)
-        atomic_write_json(VIRTUAL_LEDGER_STATE_PATH, state_payload)
-        ledger_anchor = build_virtual_ledger_anchor(events, account_state, state_payload)
+        generation_id = content_hash
+        generation_root = VIRTUAL_LEDGER_GENERATIONS_ROOT / generation_id
+        generation_ledger_path = generation_root / "ledger.jsonl"
+        generation_state_path = generation_root / "state.json"
+        generation_audit_path = generation_root / "audit.json"
+        generation_audit_markdown_path = generation_root / "audit.md"
+        write_immutable_jsonl(generation_ledger_path, events)
+        state_payload["canonical_ledger_sha256"] = file_sha256(generation_ledger_path)
+        state_payload["generation_id"] = generation_id
+        write_immutable_json(generation_state_path, state_payload)
+        ledger_anchor = build_virtual_ledger_anchor(
+            events,
+            account_state,
+            state_payload,
+            generation_id=generation_id,
+            generation_ledger_path=generation_ledger_path,
+            generation_state_path=generation_state_path,
+        )
         if anchor_path is None:
             raise RuntimeError("cannot write canonical ledger without an external trust anchor path")
-        atomic_write_json(anchor_path, ledger_anchor)
+        current_anchor = read_json_file(anchor_path, default=None)
+        if not (
+            isinstance(current_anchor, dict)
+            and current_anchor.get("anchor_sha256") == ledger_anchor.get("anchor_sha256")
+        ):
+            write_monotonic_anchor(
+                anchor_path,
+                ledger_anchor,
+                head_hash_field="anchor_sha256",
+            )
         # Re-audit against the just-established canonical baseline so the first
         # successful write and every idempotent replay produce identical audit bytes.
         audit = audit_virtual_execution_ledger(
@@ -2111,12 +4111,47 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
             warnings=warnings,
             source_expectations=source_expectations,
             source_errors=source_errors,
+            predictions=predictions,
+            paper_generation_sha256=paper_generation_sha256,
         )
-        atomic_write_json(VIRTUAL_LEDGER_AUDIT_PATH, audit)
+        if not audit.get("overall_passed"):
+            raise RuntimeError(
+                "canonical generation failed its post-anchor audit: "
+                + "; ".join(audit.get("blocking_reasons", []))
+            )
+        audit_markdown = build_virtual_ledger_audit_markdown(audit)
+        write_immutable_json(generation_audit_path, audit)
+        write_immutable_text(generation_audit_markdown_path, audit_markdown)
+        generation_head = {
+            "schema_version": 1,
+            "ledger_id": LEDGER_ID,
+            "generation_id": generation_id,
+            "ledger_path": relative_path(generation_ledger_path),
+            "ledger_sha256": file_sha256(generation_ledger_path),
+            "state_path": relative_path(generation_state_path),
+            "state_sha256": file_sha256(generation_state_path),
+            "audit_path": relative_path(generation_audit_path),
+            "audit_sha256": file_sha256(generation_audit_path),
+            "anchor_sha256": ledger_anchor.get("anchor_sha256"),
+            "content_hash": content_hash,
+        }
+        generation_head["head_sha256"] = stable_hash(generation_head)
+        atomic_write_json(VIRTUAL_LEDGER_HEAD_PATH, generation_head)
+        # Backward-compatible projections are repaired only after the single
+        # authoritative head points at a fully verified immutable generation.
         atomic_write_text(
-            VIRTUAL_LEDGER_AUDIT_PATH.with_suffix(".md"),
-            build_virtual_ledger_audit_markdown(audit),
+            VIRTUAL_LEDGER_PATH,
+            generation_ledger_path.read_text(encoding="utf-8"),
         )
+        atomic_write_text(
+            VIRTUAL_LEDGER_STATE_PATH,
+            generation_state_path.read_text(encoding="utf-8"),
+        )
+        atomic_write_text(
+            VIRTUAL_LEDGER_AUDIT_PATH,
+            generation_audit_path.read_text(encoding="utf-8"),
+        )
+        atomic_write_text(VIRTUAL_LEDGER_AUDIT_PATH.with_suffix(".md"), audit_markdown)
     return {
         "ledger_path": str(VIRTUAL_LEDGER_PATH),
         "state_path": str(VIRTUAL_LEDGER_STATE_PATH),
@@ -2124,6 +4159,10 @@ def build_virtual_execution_ledger(*, write_files: bool = True) -> dict[str, Any
         "event_count": len(events),
         "account_count": len(account_state),
         "content_hash": content_hash,
+        "paper_generation_sha256": paper_generation_sha256,
+        "prediction_semantic_hash": predictions["semantic_hash"],
+        "generation_id": generation_id,
+        "generation_head_path": str(VIRTUAL_LEDGER_HEAD_PATH),
         "write_requested": write_files,
         "write_performed": write_performed,
         "events": events,
@@ -2315,7 +4354,7 @@ def build_cycle_audit_markdown(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def doctor_checks() -> list[Check]:
+def doctor_checks(*, probe_repository_remotes: bool = True) -> list[Check]:
     checks: list[Check] = []
     checks.append(
         Check(
@@ -2367,12 +4406,22 @@ def doctor_checks() -> list[Check]:
     for name, path in required_paths.items():
         checks.append(Check(name, "ok" if path.exists() else "error", str(path.relative_to(ROOT))))
 
+    repository_names = [
+        ("root", ROOT),
+        ("trading-core", TRADING_ROOT),
+        ("ATLAS site", SITE_ROOT),
+    ]
+    repository_provenance = collect_repository_provenance(
+        repository_names,
+        probe_remotes=probe_repository_remotes,
+    )
     checks.extend(
-        [
-            component_repository_check("root", ROOT),
-            component_repository_check("trading-core", TRADING_ROOT),
-            component_repository_check("ATLAS site", SITE_ROOT),
-        ]
+        repository_check_from_provenance(name, payload)
+        for (name, _path), payload in zip(
+            repository_names,
+            repository_provenance,
+            strict=True,
+        )
     )
 
     missing_modules = [
@@ -2629,22 +4678,37 @@ def command_improvements(args: argparse.Namespace) -> int:
 
 def command_backup(args: argparse.Namespace) -> int:
     command = [sys.executable, str(BRIEFING_ROOT / "scripts" / "disaster_recovery.py"), "--date", args.date]
+    full = bool(getattr(args, "full", False))
+    if full:
+        command.append("--full")
     if args.json:
         command.append("--json")
-    return run_command(command)
+    return run_command(command, timeout=2 * 60 * 60 if full else COMMAND_TIMEOUT_SECONDS)
 
 
-def verify_existing_backup(*, timeout_seconds: float = 300.0) -> dict[str, Any]:
-    """Ask the independent DR implementation to authenticate and restore-check latest.json."""
+def verify_existing_backup(
+    *,
+    timeout_seconds: float = 300.0,
+    quick: bool = True,
+) -> dict[str, Any]:
+    """Ask the DR implementation to authenticate the exact latest archive.
+
+    The daily bootstrap uses the authenticated quick path because the snapshot's
+    full restore drill already ran at creation.  Operators can still request the
+    heavyweight path explicitly for periodic recovery exercises.
+    """
 
     try:
+        command = [
+            sys.executable,
+            str(BRIEFING_ROOT / "scripts" / "disaster_recovery.py"),
+            "--verify-existing",
+            "--json",
+        ]
+        if quick:
+            command.append("--quick")
         completed = subprocess.run(
-            [
-                sys.executable,
-                str(BRIEFING_ROOT / "scripts" / "disaster_recovery.py"),
-                "--verify-existing",
-                "--json",
-            ],
+            command,
             cwd=ROOT,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
@@ -2774,6 +4838,41 @@ def _gate_count(
     return value
 
 
+def _daily_backup_baseline_reasons(
+    payload: dict[str, Any],
+    *,
+    maximum_age_hours: float | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    if payload.get("snapshot_profile", "full") != "daily":
+        return []
+    baseline = payload.get("full_snapshot")
+    if not isinstance(baseline, dict):
+        return ["daily backup is not bound to a full recovery baseline"]
+    reasons: list[str] = []
+    for field in ("archive_sha256", "manifest_sha256"):
+        if not re.fullmatch(r"[0-9a-f]{64}", str(baseline.get(field) or "")):
+            reasons.append(f"daily backup full baseline {field} is invalid")
+    if baseline.get("restore_verified") is not True:
+        reasons.append("daily backup full baseline was not restore-verified")
+    try:
+        datetime.strptime(str(baseline.get("date")), "%Y-%m-%d")
+        created = datetime.fromisoformat(str(baseline.get("created_at")).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            raise ValueError
+    except (TypeError, ValueError):
+        reasons.append("daily backup full baseline timestamp is invalid")
+    else:
+        if maximum_age_hours is not None:
+            age_hours = (
+                ((now or datetime.now(UTC)).astimezone(UTC) - created.astimezone(UTC)).total_seconds()
+                / 3600
+            )
+            if age_hours < 0 or age_hours > maximum_age_hours:
+                reasons.append("daily backup full baseline is outside the configured freshness window")
+    return reasons
+
+
 def publication_backup_bootstrap_readiness(
     *,
     now: datetime | None = None,
@@ -2810,7 +4909,11 @@ def publication_backup_bootstrap_readiness(
         reasons.append("disaster recovery is not enabled")
         recovery = {}
     try:
-        maximum_age_hours = float(recovery.get("maximum_backup_age_hours") or 24)
+        maximum_age_hours = float(
+            recovery.get("bootstrap_maximum_backup_age_hours")
+            or recovery.get("maximum_backup_age_hours")
+            or 24
+        )
     except (TypeError, ValueError):
         maximum_age_hours = 24.0
         reasons.append("maximum backup age is invalid")
@@ -2847,6 +4950,20 @@ def publication_backup_bootstrap_readiness(
     ]
     if failed_fields:
         reasons.append("existing backup lacks required controls: " + ", ".join(failed_fields))
+    try:
+        full_snapshot_maximum_age_hours = float(
+            recovery.get("full_snapshot_maximum_age_hours") or maximum_age_hours
+        )
+    except (TypeError, ValueError):
+        full_snapshot_maximum_age_hours = maximum_age_hours
+        reasons.append("full snapshot maximum age is invalid")
+    reasons.extend(
+        _daily_backup_baseline_reasons(
+            backup,
+            maximum_age_hours=full_snapshot_maximum_age_hours,
+            now=now,
+        )
+    )
 
     authentication = backup.get("metadata_authentication")
     if (
@@ -2896,7 +5013,7 @@ def publication_backup_bootstrap_readiness(
     evidence["archive_present"] = archive_path.is_file() if archive_path.is_absolute() else False
     evidence["archive_hash_verified"] = archive_ok
     evidence["date"] = backup.get("date")
-    independent_verification = verify_existing_backup()
+    independent_verification = verify_existing_backup(quick=True)
     evidence["independent_restore_verification"] = {
         "verified": independent_verification.get("verified") is True,
         "archive_sha256": independent_verification.get("archive_sha256"),
@@ -2912,6 +5029,56 @@ def publication_backup_bootstrap_readiness(
         "reasons": list(dict.fromkeys(reasons)),
         "evidence": evidence,
     }
+
+
+def configured_blocking_alert_severities() -> set[str]:
+    config = read_json_file(IMPROVEMENT_TRACKING_CONFIG_PATH, default={})
+    configured = config.get("blocking_severities") if isinstance(config, dict) else None
+    if not isinstance(configured, list) or not configured:
+        return {"critical", "high"}
+    severities = {
+        str(value).strip().lower()
+        for value in configured
+        if isinstance(value, str) and value.strip()
+    }
+    return severities or {"critical", "high"}
+
+
+def alert_artifact_is_nonblocking(alerts: Any) -> bool:
+    """Accept only well-formed alert artifacts with no configured blocking finding."""
+
+    if not isinstance(alerts, dict):
+        return False
+    status = str(alerts.get("status") or "")
+    if status == "healthy":
+        return True
+    if status != "attention_required":
+        return False
+    findings = alerts.get("findings")
+    finding_count = alerts.get("finding_count")
+    if (
+        not isinstance(findings, list)
+        or not findings
+        or isinstance(finding_count, bool)
+        or not isinstance(finding_count, int)
+        or finding_count != len(findings)
+    ):
+        return False
+    blocking = configured_blocking_alert_severities()
+    allowed_severities = {"critical", "high", "medium", "low"}
+    for finding in findings:
+        if not isinstance(finding, dict):
+            return False
+        severity = str(finding.get("severity") or "").strip().lower()
+        if (
+            not str(finding.get("id") or "").strip()
+            or not str(finding.get("status") or "").strip()
+            or not str(finding.get("summary") or "").strip()
+            or severity not in allowed_severities
+            or severity in blocking
+        ):
+            return False
+    return True
 
 
 def publication_gate_artifact_readiness(date: str) -> dict[str, Any]:
@@ -3043,7 +5210,7 @@ def publication_gate_artifact_readiness(date: str) -> dict[str, Any]:
     alerts = load("alerts")
     if alerts is not None:
         check = checks["alerts"]
-        if alerts.get("status") != "healthy":
+        if not alert_artifact_is_nonblocking(alerts):
             reason = "date-aligned alerts are missing or still require attention"
             check["blockers"].append(reason)
             blockers.append(reason)
@@ -3070,6 +5237,9 @@ def publication_gate_artifact_readiness(date: str) -> dict[str, Any]:
                 "date-aligned encrypted external backup and restore verification did not pass: "
                 + ", ".join(failed_requirements)
             )
+            check["blockers"].append(reason)
+            blockers.append(reason)
+        for reason in _daily_backup_baseline_reasons(backup):
             check["blockers"].append(reason)
             blockers.append(reason)
 
@@ -3385,6 +5555,31 @@ def run_post_gate_publication(
                         date=date,
                         apply_safe=True,
                         deep=True,
+                        strict=True,
+                        status=False,
+                        json=False,
+                    ),
+                ),
+                (
+                    "alerts",
+                    command_alerts,
+                    argparse.Namespace(
+                        date=date,
+                        process_due=False,
+                        alert_id=None,
+                        json=False,
+                        ack_by=None,
+                        retry=False,
+                        receipt_destination=None,
+                        receipt_id=None,
+                    ),
+                ),
+                (
+                    "improvements",
+                    command_improvements,
+                    argparse.Namespace(
+                        date=date,
+                        apply_safe=True,
                         strict=True,
                         status=False,
                         json=False,
@@ -3823,10 +6018,14 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
     # Phase B rather than unexpectedly creating alerts or external backups.
     skip_publication = bool(getattr(args, "skip_publication", True))
     publication_requested = bool(not args.dry_run and not skip_publication)
+    full_tests_requested = bool(getattr(args, "full_tests", False))
+    release_provenance_required = bool(full_tests_requested or publication_requested)
     publication_audit = publication_orchestration_path(date)
 
     try:
-        checks = doctor_checks()
+        checks = doctor_checks(
+            probe_repository_remotes=release_provenance_required,
+        )
     except Exception as exc:
         checks = [Check("doctor", "error", f"{type(exc).__name__}: {exc}")]
     doctor_blocking = [item for item in checks if item.required and item.status == "error"]
@@ -3932,11 +6131,11 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         blocking.append("replay/shadow validation gate failed")
 
     tests_rc: int | None = None
-    full_tests_requested = bool(getattr(args, "full_tests", False))
     if args.skip_tests:
         stages.append({"name": "targeted_integration_tests", "status": "skipped", "detail": {"skip_tests": True, "full_suite": False}})
         blocking.append("targeted integration tests were skipped")
     else:
+        briefing_test_input = build_briefing_test_input_fingerprint(ROOT, date)
         test_args = argparse.Namespace(
             skip_site=args.skip_site,
             skip_trading_core=args.skip_trading_core,
@@ -3947,6 +6146,7 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         except Exception as exc:
             tests_rc = 1
             blocking.append(f"continuous tests raised {type(exc).__name__}: {exc}")
+        briefing_test_completed_at = utc_now()
         test_scope = {
             "kind": "full_regression_suite" if full_tests_requested else "targeted_integration_suite",
             "full_suite": full_tests_requested,
@@ -3955,11 +6155,45 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
             "trading_core_selected_file_count": 0 if args.skip_trading_core else None if full_tests_requested else 8,
             "site_test_included": not args.skip_site,
         }
-        stages.append({"name": "targeted_integration_tests", "status": "passed" if tests_rc == 0 else "failed", "detail": {"returncode": tests_rc, "scope": test_scope}})
+        stages.append({
+            "name": "targeted_integration_tests",
+            "status": "passed" if tests_rc == 0 else "failed",
+            "detail": {
+                "returncode": tests_rc,
+                "scope": test_scope,
+                "briefing_test_evidence": {
+                    "schema_version": 1,
+                    "suite": "python_unittest_discovery",
+                    "discovery_root": "work/global-briefing/tests",
+                    "pattern": "test_*.py",
+                    "completed_at": briefing_test_completed_at,
+                    "returncode": tests_rc,
+                    "passed": tests_rc == 0,
+                    "input": briefing_test_input,
+                },
+            },
+        })
         if tests_rc != 0:
             blocking.append(f"targeted integration tests failed with returncode {tests_rc}")
 
     history_root = RUN_AUDIT_ROOT / "history" / date
+    global_history_integrity_before = audit_global_cycle_history(allow_append=True)
+    if global_history_integrity_before.get("anchor_present") is not True:
+        blocking.append(
+            "global run audit history has no external anchor; explicit bootstrap is required"
+        )
+    elif (
+        global_history_integrity_before.get("passed")
+        and not args.dry_run
+        and global_history_integrity_before.get("append_pending")
+    ):
+        write_global_cycle_history_anchor(global_history_integrity_before)
+        global_history_integrity_before = audit_global_cycle_history()
+    if not global_history_integrity_before.get("passed"):
+        blocking.extend(
+            f"global run audit history integrity: {error}"
+            for error in global_history_integrity_before.get("errors", [])
+        )
     history_integrity_before = audit_cycle_history(history_root)
     if not history_integrity_before["passed"]:
         blocking.extend(f"run audit history integrity: {error}" for error in history_integrity_before["errors"])
@@ -3967,7 +6201,12 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
     # the recovery boundary after an interrupted prior write: an operator must
     # restore its externally authenticated checkpoint rather than burying the
     # problem under another record.
-    history_write_allowed = bool(not args.dry_run and history_integrity_before["passed"])
+    history_write_allowed = bool(
+        not args.dry_run
+        and history_integrity_before["passed"]
+        and global_history_integrity_before.get("passed") is True
+        and global_history_integrity_before.get("anchor_present") is True
+    )
 
     ledger_write_allowed = bool(
         not args.dry_run
@@ -4002,8 +6241,62 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
     })
 
     fingerprint_after = build_cycle_fingerprint(date)
-    workspace_lock = build_workspace_lock()
+    workspace_lock = build_workspace_lock(
+        probe_remotes=release_provenance_required,
+    )
     workspace_lock_content_sha256 = str(workspace_lock.get("content_sha256") or "")
+    release_evidence_path = getattr(args, "release_evidence", None)
+    requested_repository = str(getattr(args, "release_repository", None) or "").strip()
+    origin_repository = github_repository_from_origin() if release_evidence_path else None
+    expected_repository = origin_repository or requested_repository
+    expected_source_ref = RELEASE_EVIDENCE_SOURCE_REF
+    release_evidence: dict[str, Any] = {
+        "requested": bool(release_evidence_path),
+        "verified": False,
+        "artifact_path": str(Path(release_evidence_path).expanduser().resolve())
+        if release_evidence_path
+        else None,
+        "artifact_sha256": None,
+        "artifact_bytes": None,
+        "repository": expected_repository or None,
+        "source_ref": expected_source_ref,
+        "workflow": RELEASE_EVIDENCE_WORKFLOW,
+        "run_id": None,
+        "run_attempt": None,
+        "verification_count": 0,
+        "errors": [],
+    }
+    if release_evidence_path:
+        if origin_repository and requested_repository and (
+            origin_repository.casefold() != requested_repository.casefold()
+        ):
+            release_evidence["errors"].append(
+                "configured release repository does not match the root origin"
+            )
+        elif not expected_repository:
+            release_evidence["errors"].append(
+                "GitHub repository could not be inferred; use --release-repository OWNER/REPO"
+            )
+        else:
+            release_evidence = verify_release_evidence(
+                Path(release_evidence_path),
+                workspace_lock=workspace_lock,
+                expected_repository=expected_repository,
+                expected_source_ref=expected_source_ref,
+            )
+    stages.append(
+        {
+            "name": "external_release_attestation",
+            "status": (
+                "passed"
+                if release_evidence.get("verified") is True
+                else "failed"
+                if release_evidence_path
+                else "not_requested"
+            ),
+            "detail": release_evidence,
+        }
+    )
     previous_state = read_json_file(CYCLE_STATE_PATH, default={})
     previous_key = previous_state.get("idempotency_key") if isinstance(previous_state, dict) else None
     previous_workspace_lock_sha256 = (
@@ -4021,6 +6314,8 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         "full_tests": full_tests_requested,
         "skip_publication": skip_publication,
         "post_gate_publication_requested": publication_requested,
+        "release_evidence_requested": bool(release_evidence_path),
+        "release_evidence_sha256": release_evidence.get("artifact_sha256"),
     }
     idempotency_key = stable_hash(
         {
@@ -4057,6 +6352,7 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
         and ledger_result.get("write_performed") is True
         and release_required_stages_passed
         and workspace_lock["release_reproducible"]
+        and release_evidence.get("verified") is True
     )
 
     audit_payload = {
@@ -4079,6 +6375,7 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
             "canonical_ledger_write_performed": ledger_result.get("write_performed") is True,
             "required_stages": list(RELEASE_REQUIRED_STAGES),
             "required_stages_passed": release_required_stages_passed,
+            "external_attestation": release_evidence,
         },
         "research_promotion_passed": research_promotion_passed,
         "publication": {
@@ -4135,6 +6432,7 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
             "real_broker_orders_allowed": False,
         },
         "history_integrity_before": history_integrity_before,
+        "global_history_integrity_before": global_history_integrity_before,
         "workspace_lock": workspace_lock,
     }
     audit_payload["audit_chain"] = {
@@ -4176,6 +6474,23 @@ def _command_cycle_locked(args: argparse.Namespace) -> int:
                 raise RuntimeError(
                     "run audit history anchor verification failed: "
                     + "; ".join(history_integrity_after["errors"])
+                )
+            global_history_pending = audit_global_cycle_history(allow_append=True)
+            if not global_history_pending["passed"]:
+                raise RuntimeError(
+                    "global run audit history verification failed: "
+                    + "; ".join(global_history_pending["errors"])
+                )
+            if global_history_pending.get("anchor_present") is not True:
+                raise RuntimeError(
+                    "global run audit history has no external anchor; explicit bootstrap is required"
+                )
+            write_global_cycle_history_anchor(global_history_pending)
+            global_history_after = audit_global_cycle_history()
+            if not global_history_after["passed"]:
+                raise RuntimeError(
+                    "global run audit history anchor verification failed: "
+                    + "; ".join(global_history_after["errors"])
                 )
             history_committed = True
         except Exception as exc:
@@ -4323,40 +6638,46 @@ def npm_command() -> str:
     return shutil.which(candidate) or candidate
 
 
-def command_test(args: argparse.Namespace) -> int:
+def build_test_plan(args: argparse.Namespace) -> list[TestGate]:
+    plan: list[TestGate] = []
     root_tests = ROOT / "tests"
-    if root_tests.exists():
-        atlas_tests = [
-            sys.executable,
-            "-m",
-            "unittest",
-            "discover",
-            str(root_tests),
-            "-p",
-            "test_*.py",
-        ]
-        if run_command(atlas_tests) != 0:
-            return 1
+    plan.append(
+        TestGate(
+            "atlas-control-plane",
+            (
+                sys.executable,
+                "-m",
+                "unittest",
+                "discover",
+                str(root_tests),
+                "-p",
+                "test_*.py",
+            ),
+        )
+    )
 
-    adapter_tests = [
-        sys.executable,
-        "-m",
-        "unittest",
-        "discover",
-        str(BRIEFING_ROOT / "tests"),
-        "-p",
-        "test_*.py",
-    ]
-    if run_command(adapter_tests) != 0:
-        return 1
+    plan.append(
+        TestGate(
+            "global-briefing",
+            (
+                sys.executable,
+                "-m",
+                "unittest",
+                "discover",
+                str(BRIEFING_ROOT / "tests"),
+                "-p",
+                "test_*.py",
+            ),
+        )
+    )
 
     if not args.skip_trading_core:
         if getattr(args, "full", False):
-            core_tests = [
+            core_tests = (
                 sys.executable,
                 "-m",
                 "trading_core.testing.full_test_matrix",
-            ]
+            )
         else:
             core_tests = [sys.executable, "-m", "pytest"]
             core_tests.extend(
@@ -4372,18 +6693,144 @@ def command_test(args: argparse.Namespace) -> int:
                 ]
             )
         core_timeout = 45 * 60 if getattr(args, "full", False) else COMMAND_TIMEOUT_SECONDS
-        if run_command(
-            core_tests,
-            cwd=TRADING_ROOT,
-            trading_core=True,
-            timeout=core_timeout,
-        ) != 0:
-            return 1
+        plan.append(
+            TestGate(
+                "trading-core",
+                tuple(core_tests),
+                cwd=TRADING_ROOT,
+                trading_core=True,
+                timeout=core_timeout,
+            )
+        )
 
     if not args.skip_site:
-        if run_command([npm_command(), "test"], cwd=SITE_ROOT) != 0:
-            return 1
-    return 0
+        full_suite = bool(getattr(args, "full", False))
+        plan.append(
+            TestGate(
+                "atlas-site",
+                (npm_command(), "run", "quality") if full_suite else (npm_command(), "test"),
+                cwd=SITE_ROOT,
+            )
+        )
+        if full_suite:
+            plan.append(
+                TestGate(
+                    "atlas-site-security-policy",
+                    (npm_command(), "run", "audit:policy"),
+                    cwd=SITE_ROOT,
+                )
+            )
+    return plan
+
+
+def validate_required_test_sources() -> list[str]:
+    errors: list[str] = []
+    for name, directory in (
+        ("atlas-control-plane", ROOT / "tests"),
+        ("global-briefing", BRIEFING_ROOT / "tests"),
+    ):
+        if not directory.is_dir():
+            errors.append(f"{name} test directory is missing: {directory}")
+            continue
+        test_files = [
+            path
+            for path in directory.glob("test_*.py")
+            if path.is_file() and path.stat().st_size > 0
+        ]
+        if not test_files:
+            errors.append(f"{name} test discovery would be empty: {directory}")
+    return errors
+
+
+def write_subprocess_output(stream: Any, value: str) -> None:
+    if not value:
+        return
+    text = value if value.endswith("\n") else value + "\n"
+    try:
+        stream.write(text)
+    except UnicodeEncodeError:
+        encoding = getattr(stream, "encoding", None) or "utf-8"
+        replacement = text.encode(encoding, errors="replace")
+        buffer = getattr(stream, "buffer", None)
+        if buffer is not None:
+            buffer.write(replacement)
+        else:
+            stream.write(replacement.decode(encoding, errors="replace"))
+    stream.flush()
+
+
+def run_daily_test_plan(plan: Sequence[TestGate]) -> int:
+    """Run independent daily gates concurrently and emit deterministic logs."""
+
+    if not plan:
+        print("daily test plan is empty", file=sys.stderr)
+        return 1
+
+    def execute(gate: TestGate) -> tuple[subprocess.CompletedProcess[str], float]:
+        started = time.monotonic()
+        try:
+            result = capture_command(
+                list(gate.command),
+                cwd=gate.cwd,
+                trading_core=gate.trading_core,
+                timeout=gate.timeout,
+            )
+        except Exception as exc:
+            result = subprocess.CompletedProcess(
+                list(gate.command),
+                1,
+                stdout="",
+                stderr=f"test gate raised {type(exc).__name__}: {exc}\n",
+            )
+        return result, time.monotonic() - started
+
+    started = time.monotonic()
+    workers = min(4, len(plan))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="atlas-test") as pool:
+        futures = [pool.submit(execute, gate) for gate in plan]
+        results = [future.result() for future in futures]
+
+    passed = True
+    for gate, (result, duration) in zip(plan, results, strict=True):
+        print(f"\n> [{gate.name}] {' '.join(gate.command)}", flush=True)
+        if result.stdout:
+            write_subprocess_output(sys.stdout, result.stdout)
+        if result.stderr:
+            write_subprocess_output(sys.stderr, result.stderr)
+        status = "passed" if result.returncode == 0 else "failed"
+        print(
+            f"[atlas-test] {gate.name}: {status} rc={result.returncode} "
+            f"duration={duration:.3f}s",
+            flush=True,
+        )
+        passed = passed and result.returncode == 0
+    print(
+        f"[atlas-test] parallel_total={time.monotonic() - started:.3f}s workers={workers}",
+        flush=True,
+    )
+    return 0 if passed else 1
+
+
+def command_test(args: argparse.Namespace) -> int:
+    source_errors = validate_required_test_sources()
+    if source_errors:
+        for error in source_errors:
+            print(error, file=sys.stderr)
+        return 1
+    plan = build_test_plan(args)
+    if getattr(args, "full", False):
+        # The full trading-core matrix already manages its own bounded shards and
+        # can emit large logs. Keep this release/CI path streamed and sequential.
+        for gate in plan:
+            if run_command(
+                list(gate.command),
+                cwd=gate.cwd,
+                trading_core=gate.trading_core,
+                timeout=gate.timeout,
+            ) != 0:
+                return 1
+        return 0
+    return run_daily_test_plan(plan)
 
 
 def command_build_site(_args: argparse.Namespace) -> int:
@@ -4436,6 +6883,11 @@ def build_parser() -> argparse.ArgumentParser:
     backup = subparsers.add_parser("backup", help="Create and restore-verify an external disaster-recovery snapshot.")
     backup.add_argument("--date", type=valid_iso_date, required=True)
     backup.add_argument("--json", action="store_true")
+    backup.add_argument(
+        "--full",
+        action="store_true",
+        help="Create the periodic full-history snapshot; daily runs use the smaller publication checkpoint.",
+    )
     backup.set_defaults(handler=command_backup)
 
     alerts = subparsers.add_parser("alerts", help="Prepare the audited Codex task-inbox alert payload.")
@@ -4484,7 +6936,20 @@ def build_parser() -> argparse.ArgumentParser:
     cycle.add_argument("--skip-tests", action="store_true", help="Skip the continuous test gate.")
     cycle.add_argument("--skip-site", action="store_true", help="Skip site tests inside the continuous test gate.")
     cycle.add_argument("--skip-trading-core", action="store_true", help="Skip trading-core tests inside the continuous test gate.")
-    cycle.add_argument("--full-tests", action="store_true", help="Run the complete regression suite and record release-candidate evidence.")
+    cycle.add_argument(
+        "--full-tests",
+        action="store_true",
+        help="Run the complete regression suite; release status also requires signed external CI evidence.",
+    )
+    cycle.add_argument(
+        "--release-evidence",
+        type=Path,
+        help="Path to the GitHub-attested atlas-release-evidence.json artifact.",
+    )
+    cycle.add_argument(
+        "--release-repository",
+        help="Expected OWNER/REPO when it cannot be inferred from the root origin.",
+    )
     cycle.add_argument(
         "--skip-publication",
         action="store_true",
@@ -4494,6 +6959,40 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     cycle.set_defaults(handler=command_cycle)
+
+    recover_global_history = subparsers.add_parser(
+        "recover-global-history-anchor",
+        help=(
+            "Plan or explicitly apply the one-time, append-only recovery of a "
+            "test-polluted global run-audit anchor."
+        ),
+    )
+    recover_global_history.add_argument(
+        "--expected-head-sha256",
+        required=True,
+        help="Exact signed polluted predecessor head; lowercase SHA-256.",
+    )
+    recover_global_history.add_argument(
+        "--backup-latest",
+        type=Path,
+        default=ATLAS_RUNTIME_ROOT / "backups" / "latest.json",
+        help="Authenticated restore-verified latest.json used to corroborate the real history.",
+    )
+    recover_global_history.add_argument(
+        "--expected-plan-sha256",
+        help="Exact plan hash emitted by the dry run; mandatory with --apply.",
+    )
+    recover_global_history.add_argument(
+        "--apply",
+        action="store_true",
+        help="Apply revision two. Without this flag the command is strictly read-only.",
+    )
+    recover_global_history.add_argument(
+        "--acknowledge-cross-workspace-recovery",
+        action="store_true",
+        help="Explicit acknowledgement required with --apply.",
+    )
+    recover_global_history.set_defaults(handler=command_recover_global_history_anchor)
 
     tests = subparsers.add_parser("test", help="Run the cross-project integration test suite.")
     tests.add_argument("--skip-site", action="store_true")
